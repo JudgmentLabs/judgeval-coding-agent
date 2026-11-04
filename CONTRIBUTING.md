@@ -4,7 +4,7 @@ You can contribute in these ways:
 
 - File [bug reports](https://github.com/JudgmentLabs/judgeval-coding-agent/issues/new?template=bug_report.md) and [feature requests](https://github.com/JudgmentLabs/judgeval-coding-agent/issues/new?template=feature_request.md).
 - Open a [pull request](https://github.com/JudgmentLabs/judgeval-coding-agent/pulls) with a fix or an improvement to the docs.
-- Tell people about Judgment, and let us know.
+- Tell people about Judgment.
 
 ## Make a change
 
@@ -29,5 +29,7 @@ Maintainers release by setting one version in every manifest, then merging to `m
 ```bash
 sh scripts/version.sh <version>
 ```
+
+Claude Code offers an update only when the version changes. Codex and Pi follow `main`. CI fails when the manifests disagree. It warns when a Codex or Claude Code hook definition changes, because Codex users must trust a changed hook again.
 
 [![Contributors](https://contributors-img.web.app/image?repo=JudgmentLabs/judgeval-coding-agent)](https://github.com/JudgmentLabs/judgeval-coding-agent/graphs/contributors)

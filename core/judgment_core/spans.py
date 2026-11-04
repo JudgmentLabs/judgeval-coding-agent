@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 from judgment_core import __version__
@@ -634,7 +635,9 @@ def build_request(
     if not session_id or not turn_id:
         return None
     environment = str(first.get("environment") or "production")
-    project_root = str(first.get("project_root") or first.get("cwd") or "")
+    # Only the folder's name leaves the machine. The full path, and the home folder's name, hold the user's account name.
+    folder = Path(str(first.get("cwd") or first.get("project_root") or ""))
+    workspace = "" if any(event.get("capture") == "metadata" for event in usable) or folder == Path.home() else folder.name
     harness_version = ""
     for event in usable:
         if event.get("harness_version"):
@@ -1032,7 +1035,7 @@ def build_request(
                     # Plain text: the trace list and judges read the root's input and output as written.
                     ("judgment.input", prompt),
                     ("judgment.output", final),
-                    ("agent.cwd", project_root),
+                    ("agent.workspace_name", workspace),
                 ]
             ),
         )
