@@ -1,0 +1,24 @@
+{
+  "name": "judgment-tracing",
+  "displayName": "Judgment Tracing",
+  "version": "0.2.1",
+  "description": "Send Cursor agent sessions to Judgment.",
+  "author": {
+    "name": "Judgment Labs",
+    "email": "support@judgmentlabs.ai",
+    "url": "https://judgmentlabs.ai"
+  },
+  "homepage": "https://judgmentlabs.ai",
+  "repository": "https://github.com/JudgmentLabs/judgeval-coding-agent",
+  "license": "Apache-2.0",
+  "logo": "assets/logo.svg",
+  "keywords": [
+    "judgment",
+    "judgeval",
+    "tracing",
+    "observability",
+    "opentelemetry",
+    "coding-agent"
+  ],
+  "category": "integrations"
+}

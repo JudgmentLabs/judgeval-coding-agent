@@ -1,0 +1,5 @@
+#!/bin/sh
+BIN=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ROOT=$(CDPATH= cd -- "$BIN/.." && pwd)
+export PYTHONPATH="$ROOT/core${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m judgment_core.cli "$@"

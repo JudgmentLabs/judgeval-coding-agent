@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "judgment",
+  "displayName": "Judgment Tracing",
+  "description": "Send Claude Code sessions to Judgment.",
+  "version": "0.2.1",
+  "author": {
+    "name": "Judgment Labs",
+    "email": "support@judgmentlabs.ai",
+    "url": "https://judgmentlabs.ai"
+  },
+  "homepage": "https://judgmentlabs.ai",
+  "repository": "https://github.com/JudgmentLabs/judgeval-coding-agent",
+  "license": "Apache-2.0",
+  "keywords": [
+    "judgment",
+    "judgeval",
+    "tracing",
+    "observability",
+    "opentelemetry",
+    "coding-agent"
+  ]
+}

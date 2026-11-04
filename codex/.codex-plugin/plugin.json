@@ -1,0 +1,33 @@
+{
+  "name": "judgment-tracing",
+  "version": "0.2.1",
+  "description": "Send Codex sessions to Judgment.",
+  "author": {
+    "name": "Judgment Labs",
+    "email": "support@judgmentlabs.ai",
+    "url": "https://judgmentlabs.ai"
+  },
+  "homepage": "https://judgmentlabs.ai",
+  "repository": "https://github.com/JudgmentLabs/judgeval-coding-agent",
+  "license": "Apache-2.0",
+  "keywords": [
+    "judgment",
+    "judgeval",
+    "tracing",
+    "observability",
+    "opentelemetry",
+    "coding-agent"
+  ],
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "Judgment Tracing",
+    "shortDescription": "Send Codex sessions to Judgment as traces.",
+    "longDescription": "Turns each Codex turn into a Judgment trace, with the prompt, model calls, and tool calls. Tracing stays off until a project opts in.",
+    "developerName": "Judgment Labs",
+    "category": "Productivity",
+    "websiteURL": "https://judgmentlabs.ai",
+    "brandColor": "#FF4B2E",
+    "logo": "./assets/logo.svg",
+    "composerIcon": "./assets/composer-icon.svg"
+  }
+}

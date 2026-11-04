@@ -1,0 +1,24 @@
+name: check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  vendor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Vendored core matches core/
+        run: sh scripts/sync-core.sh --check
+      - name: Every plugin has the same version
+        run: sh scripts/version.sh
+      - name: Hook definitions unchanged
+        if: github.event_name == 'pull_request'
+        # Codex skips a changed hook until the user approves it again, with no notice in headless runs.
+        run: |
+          for file in $(git diff --name-only "origin/${{ github.base_ref }}...HEAD" -- codex/hooks/hooks.json claude-code/hooks/hooks.json); do
+            echo "::warning file=$file::$file changed. Codex users must approve the changed hooks again before they run."
+          done

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🤔 Questions or discussions
+    url: https://github.com/orgs/JudgmentLabs/discussions
+    about: Please use discussions for questions
+  - name: 📖 Judgment documentation
+    url: https://docs.judgmentlabs.ai/documentation
+    about: Guides for tracing, judges, and the Judgment platform

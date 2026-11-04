@@ -1,0 +1,16 @@
+{
+  "name": "judgment-tracing",
+  "description": "Send coding-agent sessions to Judgment.",
+  "owner": {
+    "name": "Judgment Labs",
+    "email": "support@judgmentlabs.ai"
+  },
+  "plugins": [
+    {
+      "name": "judgment-tracing",
+      "source": "./claude-code",
+      "description": "Send Claude Code sessions to Judgment.",
+      "version": "0.2.1"
+    }
+  ]
+}

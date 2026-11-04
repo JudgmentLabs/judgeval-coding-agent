@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "\"$CURSOR_PLUGIN_ROOT\"/vendor/judgment-core/bin/judgment-hook --map \"$CURSOR_PLUGIN_ROOT\"/hooks/map.jq --event sessionStart --block cursor"
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "/bin/sh -c 'for r in \"$CURSOR_PLUGIN_ROOT\" \"$JUDGMENT_PLUGIN_ROOT\"; do [ -x \"$r/vendor/judgment-core/bin/judgment-hook\" ] && exec \"$r/vendor/judgment-core/bin/judgment-hook\" --map \"$r/hooks/map.jq\" --event sessionEnd --block cursor; done'"
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "/bin/sh -c 'for r in \"$CURSOR_PLUGIN_ROOT\" \"$JUDGMENT_PLUGIN_ROOT\"; do [ -x \"$r/vendor/judgment-core/bin/judgment-hook\" ] && exec \"$r/vendor/judgment-core/bin/judgment-hook\" --map \"$r/hooks/map.jq\" --event beforeSubmitPrompt --block cursor; done'"
+      }
+    ],
+    "afterAgentResponse": [
+      {
+        "command": "/bin/sh -c 'for r in \"$CURSOR_PLUGIN_ROOT\" \"$JUDGMENT_PLUGIN_ROOT\"; do [ -x \"$r/vendor/judgment-core/bin/judgment-hook\" ] && exec \"$r/vendor/judgment-core/bin/judgment-hook\" --map \"$r/hooks/map.jq\" --event afterAgentResponse --block cursor; done'"
+      }
+    ],
+    "afterAgentThought": [
+      {
+        "command": "/bin/sh -c 'for r in \"$CURSOR_PLUGIN_ROOT\" \"$JUDGMENT_PLUGIN_ROOT\"; do [ -x \"$r/vendor/judgment-core/bin/judgment-hook\" ] && exec \"$r/vendor/judgment-core/bin/judgment-hook\" --map \"$r/hooks/map.jq\" --event afterAgentThought --block cursor; done'"
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "/bin/sh -c 'for r in \"$CURSOR_PLUGIN_ROOT\" \"$JUDGMENT_PLUGIN_ROOT\"; do [ -x \"$r/vendor/judgment-core/bin/judgment-hook\" ] && exec \"$r/vendor/judgment-core/bin/judgment-hook\" --map \"$r/hooks/map.jq\" --event preToolUse --block cursor; done; echo \"{\\\"permission\\\":\\\"allow\\\"}\"'"
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "/bin/sh -c 'for r in \"$CURSOR_PLUGIN_ROOT\" \"$JUDGMENT_PLUGIN_ROOT\"; do [ -x \"$r/vendor/judgment-core/bin/judgment-hook\" ] && exec \"$r/vendor/judgment-core/bin/judgment-hook\" --map \"$r/hooks/map.jq\" --event postToolUse --block cursor; done'"
+      }
+    ],
+    "postToolUseFailure": [
+      {
+        "command": "/bin/sh -c 'for r in \"$CURSOR_PLUGIN_ROOT\" \"$JUDGMENT_PLUGIN_ROOT\"; do [ -x \"$r/vendor/judgment-core/bin/judgment-hook\" ] && exec \"$r/vendor/judgment-core/bin/judgment-hook\" --map \"$r/hooks/map.jq\" --event postToolUseFailure --block cursor; done'"
+      }
+    ],
+    "subagentStart": [
+      {
+        "command": "/bin/sh -c 'for r in \"$CURSOR_PLUGIN_ROOT\" \"$JUDGMENT_PLUGIN_ROOT\"; do [ -x \"$r/vendor/judgment-core/bin/judgment-hook\" ] && exec \"$r/vendor/judgment-core/bin/judgment-hook\" --map \"$r/hooks/map.jq\" --event subagentStart --block cursor; done; echo \"{\\\"permission\\\":\\\"allow\\\"}\"'"
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "/bin/sh -c 'for r in \"$CURSOR_PLUGIN_ROOT\" \"$JUDGMENT_PLUGIN_ROOT\"; do [ -x \"$r/vendor/judgment-core/bin/judgment-hook\" ] && exec \"$r/vendor/judgment-core/bin/judgment-hook\" --map \"$r/hooks/map.jq\" --event subagentStop --block cursor; done'"
+      }
+    ],
+    "stop": [
+      {
+        "command": "/bin/sh -c 'for r in \"$CURSOR_PLUGIN_ROOT\" \"$JUDGMENT_PLUGIN_ROOT\"; do [ -x \"$r/vendor/judgment-core/bin/judgment-hook\" ] && exec \"$r/vendor/judgment-core/bin/judgment-hook\" --map \"$r/hooks/map.jq\" --event stop --block cursor; done'"
+      }
+    ]
+  }
+}

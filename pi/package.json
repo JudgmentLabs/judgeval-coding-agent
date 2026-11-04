@@ -1,0 +1,18 @@
+{
+  "name": "@judgmentlabs/tracing-pi",
+  "version": "0.2.1",
+  "private": true,
+  "license": "Apache-2.0",
+  "homepage": "https://judgmentlabs.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JudgmentLabs/judgeval-coding-agent.git",
+    "directory": "pi"
+  },
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}

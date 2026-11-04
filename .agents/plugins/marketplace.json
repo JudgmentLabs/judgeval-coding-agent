@@ -1,0 +1,20 @@
+{
+  "name": "judgment-tracing",
+  "interface": {
+    "displayName": "Judgment"
+  },
+  "plugins": [
+    {
+      "name": "judgment-tracing",
+      "source": {
+        "source": "local",
+        "path": "./codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+---
+name: off
+description: Turn Judgment tracing off for this Claude Code session only.
+disable-model-invocation: true
+---
+
+The Judgment tracing hook records this command and does not send it to the model.

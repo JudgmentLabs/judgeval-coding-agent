@@ -1,0 +1,114 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$PLUGIN_ROOT\"/vendor/judgment-core/bin/judgment-hook --map \"$PLUGIN_ROOT\"/hooks/map.jq --event SessionStart --block codex",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$PLUGIN_ROOT\"/vendor/judgment-core/bin/judgment-hook --map \"$PLUGIN_ROOT\"/hooks/map.jq --event UserPromptSubmit --block codex",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$PLUGIN_ROOT\"/vendor/judgment-core/bin/judgment-hook --map \"$PLUGIN_ROOT\"/hooks/map.jq --event PreToolUse --block codex",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$PLUGIN_ROOT\"/vendor/judgment-core/bin/judgment-hook --map \"$PLUGIN_ROOT\"/hooks/map.jq --event PostToolUse --block codex",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreModelRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$PLUGIN_ROOT\"/vendor/judgment-core/bin/judgment-hook --map \"$PLUGIN_ROOT\"/hooks/map.jq --event PreModelRequest --block codex",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostModelRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$PLUGIN_ROOT\"/vendor/judgment-core/bin/judgment-hook --map \"$PLUGIN_ROOT\"/hooks/map.jq --event PostModelRequest --block codex",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$PLUGIN_ROOT\"/vendor/judgment-core/bin/judgment-hook --map \"$PLUGIN_ROOT\"/hooks/map.jq --event Stop --block codex",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$PLUGIN_ROOT\"/vendor/judgment-core/bin/judgment-hook --map \"$PLUGIN_ROOT\"/hooks/map.jq --event SubagentStart --block codex",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$PLUGIN_ROOT\"/vendor/judgment-core/bin/judgment-hook --map \"$PLUGIN_ROOT\"/hooks/map.jq --event SubagentStop --block codex",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$PLUGIN_ROOT\"/vendor/judgment-core/bin/judgment-hook --map \"$PLUGIN_ROOT\"/hooks/map.jq --event SessionEnd --block codex",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}
