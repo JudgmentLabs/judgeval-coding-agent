@@ -3,7 +3,7 @@
   "name": "judgment",
   "displayName": "Judgment Tracing",
   "description": "Send Claude Code sessions to Judgment.",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "author": {
     "name": "Judgment Labs",
     "email": "support@judgmentlabs.ai",
