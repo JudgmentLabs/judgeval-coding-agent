@@ -12,6 +12,26 @@ Every span carries `judgment.session_id` and `gen_ai.conversation.id`. Judgment 
 
 The root also carries `agent.workspace_name`, the name of the folder the agent runs in. It's the last part of the path only. It's left out when that folder is your home folder, and when `capture` is `metadata`.
 
+## Redaction
+
+With `capture` set to `sanitized`, the default, the root span records what was redacted. The attributes never hold a secret, or a hash, prefix, or length of one.
+
+| Attribute | Type | Value |
+| --- | --- | --- |
+| `judgment.redacted` | bool | `true` when anything in the turn was redacted or the turn was blanked. |
+| `judgment.redaction_count` | int | How many redactions the turn's text holds. |
+| `judgment.redactions` | string | JSON list of `{"rule", "field", "count"}`, such as `{"rule":"github_token","field":"tool_output","count":2}`. `rule` is a pattern id, `env:<NAME>` for an environment variable's value, or `custom` for a `redactPatterns` rule. `field` is the event field the text was in: `prompt`, `output`, `tool_input`, `tool_output`, `tool_results`, `tool_calls`, and so on. Left out when the count is 0. |
+| `judgment.redacted_reason` | string | `sensitive_path` when the turn was blanked. |
+| `judgment.redacted_rule` | string | The rule that blanked it, such as `dotenv`, `credentials_file`, `env_dump`, or `custom_path`. |
+| `judgment.redacted_trigger` | string | The path that blanked it, such as `.env` or `~/.aws/credentials`, with the home folder as `~` and any secret in it redacted. For a command, `cmd:<rule>`, such as `cmd:env_dump`. |
+| `judgment.redaction_error` | bool | A rule failed, such as an invalid `redactPatterns` regex, so the affected events were sent without text. |
+
+A child span whose input or output holds placeholders carries its own `judgment.redaction_count`, the number of `[REDACTED:` placeholders in that span's text.
+
+A blanked turn has the same spans, span ids, token counts, cost, and timing as it would unblanked, and every `judgment.input` and `judgment.output` is empty. A model span's `judgment.llm.tool_calls` keeps only each call's id and name. A blanked turn is never sent as context in a later turn's model input, and the next turn is not blanked.
+
+With `capture` set to `full` the root has none of these attributes. With `metadata` it has `judgment.redacted` and `judgment.redaction_count`.
+
 ## Spans
 
 | Span | `judgment.span_kind` | `judgment.input` | `judgment.output` |
@@ -64,5 +84,7 @@ Each turn records the project ID, the API URL, and a fingerprint of the API key 
 A turn recorded under a different key stays queued until a sender with that key runs. One sender runs at a time. While it runs, one more sender per key waits for it, so a busy sender for one key never strands another key's turn.
 
 A turn waits for its subagents to finish, for up to 10 minutes. A turn that never ends, because the agent was killed mid-turn, is sent as it stands after a day with no new events.
+
+Secrets are redacted twice: by the hook, before an event reaches the queue, and by the sender, after it reads transcript text. Both use the rules in `core/bin/redact-rules.json`. A turn that touched a sensitive file is saved blank before it is sent, so its text does not stay on disk.
 
 A turn being sent stays on disk until the send succeeds, so a crash or a failed send retries the whole turn on the next run. A large turn goes out in several compressed requests, with the root last. A turn the server rejects as invalid or too large is skipped and noted in `flush.log`, so it never holds back later turns.

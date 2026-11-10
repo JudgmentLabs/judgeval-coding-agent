@@ -1,0 +1,367 @@
+{
+  "_comment": [
+    "Secret redaction rules, shared by core/bin/prepare.jq (the hook) and judgment_core/redact.py (the sender).",
+    "Regexes use what Oniguruma and Python re agree on: (?<p>...) is the one named group, and the text it holds is kept;",
+    "no ^ or $; [0-9] and [A-Za-z], not \\d and \\w; no (?i), because Oniguruma compiles it slowly and jq compiles a regex on every call.",
+    "Words are spelled lower, UPPER, and Capitalized instead.",
+    "needs: a rule can match only text holding one of these literals. Both layers skip the regex otherwise. tests/test_redact.py checks it."
+  ],
+  "version": 1,
+  "patterns": [
+    {
+      "id": "private_key",
+      "needs": [
+        "PRIVATE KEY"
+      ],
+      "re": "-----BEGIN[A-Z0-9 ]{0,30}PRIVATE KEY(?: BLOCK)?-----(?:[\\s\\S]*?-----END[A-Z0-9 ]{0,30}PRIVATE KEY(?: BLOCK)?-----|[A-Za-z0-9+/=\\s\\\\:,-]*)"
+    },
+    {
+      "id": "jwt",
+      "needs": [
+        "eyJ"
+      ],
+      "re": "(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\\.eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]*"
+    },
+    {
+      "id": "anthropic_key",
+      "needs": [
+        "sk-ant-"
+      ],
+      "re": "(?<![A-Za-z0-9_-])sk-ant-[A-Za-z0-9_-]{20,}"
+    },
+    {
+      "id": "openai_key",
+      "needs": [
+        "sk-"
+      ],
+      "re": "(?<![A-Za-z0-9_-])sk-(?:proj-|svcacct-|admin-)?(?=[A-Za-z0-9_-]*?[A-Za-z0-9_]{16})[A-Za-z0-9_-]{20,}"
+    },
+    {
+      "id": "aws_access_key_id",
+      "needs": [
+        "AKIA",
+        "ASIA",
+        "ABIA",
+        "ACCA"
+      ],
+      "re": "(?<![A-Za-z0-9])(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}(?![0-9A-Za-z])"
+    },
+    {
+      "id": "github_token",
+      "needs": [
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_"
+      ],
+      "re": "(?<![A-Za-z0-9_])gh[pousr]_[A-Za-z0-9]{36,}"
+    },
+    {
+      "id": "github_pat",
+      "needs": [
+        "github_pat_"
+      ],
+      "re": "(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{22,}"
+    },
+    {
+      "id": "slack_token",
+      "needs": [
+        "xoxa-",
+        "xoxb-",
+        "xoxp-",
+        "xoxr-",
+        "xoxs-",
+        "xoxe-"
+      ],
+      "re": "(?<![A-Za-z0-9_-])xox[abprse]-(?=[A-Za-z0-9-]*[0-9])[A-Za-z0-9-]{10,}"
+    },
+    {
+      "id": "slack_webhook",
+      "needs": [
+        "hooks.slack.com/services/"
+      ],
+      "re": "(?<p>hooks\\.slack\\.com/services/)[A-Za-z0-9/_-]{20,}"
+    },
+    {
+      "id": "google_api_key",
+      "needs": [
+        "AIza"
+      ],
+      "re": "(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"
+    },
+    {
+      "id": "stripe_key",
+      "needs": [
+        "sk_live_",
+        "sk_test_",
+        "rk_live_",
+        "rk_test_"
+      ],
+      "re": "(?<![A-Za-z0-9_])(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}"
+    },
+    {
+      "id": "url_password",
+      "needs": [
+        "://"
+      ],
+      "re": "(?<p>(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{1,20}://[^\\s/:@'\\\"<>\\[\\]]{1,128}:)(?!\\[REDACTED|\\$\\{|\\$[A-Za-z_(]|<|\\{\\{|%|\\*+@|x+@|(?:password|PASSWORD|Password|pass|PASS|Pass|passwd|PASSWD|Passwd|pwd|PWD|Pwd|secret|SECRET|Secret|changeme|CHANGEME|Changeme)@)[^\\s/@'\\\"<>]{3,256}(?=@)"
+    },
+    {
+      "id": "authorization_header",
+      "needs": [
+        "uthorization",
+        "UTHORIZATION",
+        "-key",
+        "-Key",
+        "-KEY",
+        "-token",
+        "-Token",
+        "-TOKEN"
+      ],
+      "re": "(?<p>(?<![A-Za-z0-9_-])(?:(?:proxy|PROXY|Proxy)-(?:authorization|AUTHORIZATION|Authorization)|(?:authorization|AUTHORIZATION|Authorization)|(?:x|X)-(?:api|API|Api)-(?:key|KEY|Key)|(?:api|API|Api)-(?:key|KEY|Key)|(?:x|X)-(?:auth|AUTH|Auth)-(?:token|TOKEN|Token))\\\\?[\\\"']?\\s{0,5}[:=]\\s{0,5}\\\\?[\\\"']?(?:(?:basic|BASIC|Basic|bearer|BEARER|Bearer|token|TOKEN|Token|digest|DIGEST|Digest|bot|BOT|Bot|apikey|APIKEY|Apikey)\\s+)?)(?!\\$|<|\\{\\{|%)(?=[A-Za-z._~+/=-]*[0-9+/=])[A-Za-z0-9._~+/=-]{12,}"
+    },
+    {
+      "id": "bearer_token",
+      "needs": [
+        "bearer",
+        "BEARER",
+        "Bearer"
+      ],
+      "re": "(?<p>(?<![A-Za-z0-9_-])(?:bearer|BEARER|Bearer)\\s+)(?!\\$|<|\\{\\{|%)(?=[A-Za-z._~+/=-]*[0-9])[A-Za-z0-9._~+/=-]{16,}"
+    },
+    {
+      "id": "secret_assignment",
+      "needs": [
+        "key",
+        "KEY",
+        "Key",
+        "secret",
+        "SECRET",
+        "Secret",
+        "token",
+        "TOKEN",
+        "Token",
+        "password",
+        "PASSWORD",
+        "Password",
+        "passwd",
+        "PASSWD",
+        "Passwd",
+        "passphrase",
+        "PASSPHRASE",
+        "Passphrase",
+        "credential",
+        "CREDENTIAL",
+        "Credential"
+      ],
+      "re": "(?<p>(?:(?:api|API|Api)[_-]?(?:key|KEY|Key)|(?:secret|SECRET|Secret)[_-]?(?:key|KEY|Key)|(?:client|CLIENT|Client)[_-]?(?:secret|SECRET|Secret)|(?:secret|SECRET|Secret)|(?:access|ACCESS|Access)[_-]?(?:key|KEY|Key)|(?:private|PRIVATE|Private)[_-]?(?:key|KEY|Key)|(?:auth|AUTH|Auth)[_-]?(?:token|TOKEN|Token)|(?:access|ACCESS|Access)[_-]?(?:token|TOKEN|Token)|(?:refresh|REFRESH|Refresh)[_-]?(?:token|TOKEN|Token)|(?:session|SESSION|Session)[_-]?(?:token|TOKEN|Token)|(?:token|TOKEN|Token)|(?:password|PASSWORD|Password)|(?:passwd|PASSWD|Passwd)|(?:passphrase|PASSPHRASE|Passphrase)|(?:credentials|CREDENTIALS|Credentials)|(?:credential|CREDENTIAL|Credential))\\\\?[\\\"']?\\s{0,5}(?::=|=>|[:=])\\s{0,5}\\\\?[\\\"']?)(?!\\\\?[\\\"']?(?:xxx|XXX|Xxx|\\*\\*\\*|\\.\\.\\.|changeme|CHANGEME|Changeme|change_me|CHANGE_ME|Change_me|change-me|CHANGE-ME|Change-me|your_|YOUR_|Your_|your-|YOUR-|Your-|example|EXAMPLE|Example|placeholder|PLACEHOLDER|Placeholder|dummy|DUMMY|Dummy|redacted|REDACTED|Redacted|sample|SAMPLE|Sample|null\\b|NULL\\B|Null\\b|none\\b|NONE\\B|None\\b|undefined\\b|UNDEFINED\\B|Undefined\\b|true\\b|TRUE\\B|True\\b|false\\b|FALSE\\B|False\\b|process\\.env|PROCESS\\.ENV|Process\\.env|os\\.environ|OS\\.ENVIRON|Os\\.environ|os\\.getenv|OS\\.GETENV|Os\\.getenv|env\\.|ENV\\.|Env\\.|env\\[|ENV\\[|Env\\[|getenv|GETENV|Getenv|secrets\\.|SECRETS\\.|Secrets\\.|vault:|VAULT:|Vault:|arn:|ARN:|Arn:))(?![$<{%\\[(/~.])(?=[A-Za-z0-9_\\-+/=.~!@#%^*]*[0-9])(?=[A-Za-z0-9_\\-+/=.~!@#%^*]*[A-Za-z])[A-Za-z0-9_\\-+/=.~!@#%^*]{8,256}(?=[\\\"'`\\s,;)}\\]&<>|\\\\]|$)"
+    }
+  ],
+  "env": {
+    "_comment": [
+      "The value of each environment variable whose name looks secret is replaced literally wherever it appears.",
+      "re runs over the environment as NAME=VALUE lines, each ending in a newline, and captures name and value.",
+      "A name matches when it is JUDGMENT_API_KEY, or holds KEY, TOKEN, SECRET, PASSWORD, PASSWD, CREDENTIAL, PRIVATE, or AUTH",
+      "(not as part of AUTHOR, KEYBOARD, KEYMAP, KEYCHAIN, MONKEY, TURKEY) and does not end in a suffix such as _PATH or _URL.",
+      "The value must be 8 or more characters, and not a path, only digits, or one lowercase word."
+    ],
+    "needs": [
+      "key",
+      "KEY",
+      "Key",
+      "token",
+      "TOKEN",
+      "Token",
+      "secret",
+      "SECRET",
+      "Secret",
+      "password",
+      "PASSWORD",
+      "Password",
+      "passwd",
+      "PASSWD",
+      "Passwd",
+      "credential",
+      "CREDENTIAL",
+      "Credential",
+      "private",
+      "PRIVATE",
+      "Private",
+      "auth",
+      "AUTH",
+      "Auth"
+    ],
+    "re": "(?<![^\\n])(?<name>JUDGMENT_API_KEY(?==)|(?=[^\\n=]*?(?:token|TOKEN|Token|secret|SECRET|Secret|password|PASSWORD|Password|passwd|PASSWD|Passwd|credential|CREDENTIAL|Credential|private|PRIVATE|Private|auth(?!or(?!iz))|AUTH(?!OR(?!IZ))|Auth(?!or(?!iz))|(?<![Mm][Oo][Nn])(?<![Tt][Uu][Rr])(?:key|KEY|Key)(?![Bb][Oo][Aa][Rr][Dd]|[Mm][Aa][Pp]|[Cc][Hh][Aa][Ii][Nn])))(?![^\\n=]*(?:_PATH|_path|_FILE|_file|_DIR|_dir|_SOCK|_sock|_SOCKET|_socket|_HOST|_host|_PORT|_port|_URL|_url|_URI|_uri|_ID|_id|_MODE|_mode|_TYPE|_type|_NAME|_name|_USER|_user|_USERNAME|_username|_ENABLED|_enabled|_DISABLED|_disabled|_TIMEOUT|_timeout|_TOKENS|_tokens|_LIMIT|_limit|_REGION|_region)=)[^\\n=]+(?==(?!/)(?![0-9]*\\n)(?![a-z]*\\n)))=(?<value>[^\\n]{8,})"
+  },
+  "sensitive": {
+    "_comment": [
+      "A tool call that reads one of these paths, or dumps the environment, blanks its whole turn.",
+      "texts_re runs over each tool input's compact JSON and finds path and command values; string_re splits a list of them.",
+      "Path rules see one word of those values per line. Command rules see the values, one per line."
+    ],
+    "texts_re": "(?<!\\\\)\"(?:file_path|filePath|path|paths|file|files|filename|notebook_path|target_file|target_notebook|absolute_path|relative_path|source|destination|command|cmd|commands|script)\":(?:\"(?<s>(?:[^\"\\\\]|\\\\.)*)\"|\\[(?<a>(?:\"(?:[^\"\\\\]|\\\\.)*\",?)*)\\])",
+    "string_re": "\"(?<s>(?:[^\"\\\\]|\\\\.)*)\"",
+    "token_re": "[^\\s\\\"'`;|&<>()=]+",
+    "mention_re": "(?<![^\\s(])@[^\\s,;)]+",
+    "paths": [
+      {
+        "id": "dotenv",
+        "needs": [
+          ".env"
+        ],
+        "re": "(?<![^\\n/])\\.env(?:rc)?(?:[.*](?!(?:example|sample|template|dist|defaults?|schema)(?![^\\n]))[A-Za-z0-9_.*-]*)?(?![^\\n])"
+      },
+      {
+        "id": "ssh_private_key",
+        "needs": [
+          "id_rsa",
+          "id_dsa",
+          "id_ecdsa",
+          "id_ed25519"
+        ],
+        "re": "(?<![^\\n/])id_(?:rsa|dsa|ecdsa|ed25519)(?:_sk)?(?![^\\n])"
+      },
+      {
+        "id": "key_file",
+        "needs": [
+          ".pem",
+          ".key",
+          ".p12",
+          ".pfx",
+          ".jks",
+          ".keystore",
+          ".ppk"
+        ],
+        "re": "(?<![^\\n/])[^\\n/]*[A-Za-z0-9_-]\\.(?:pem|key|p12|pfx|jks|keystore|ppk)(?![^\\n])"
+      },
+      {
+        "id": "credentials_file",
+        "needs": [
+          "credentials"
+        ],
+        "re": "(?:(?<=/)credentials|(?<![^\\n/])[A-Za-z0-9_.-]*credentials\\.(?:json|ya?ml|toml|ini|csv|xml|db))(?![^\\n])"
+      },
+      {
+        "id": "secret_file",
+        "needs": [
+          "secret",
+          "SECRET",
+          "Secret"
+        ],
+        "re": "(?<![^\\n/])(?=[^\\n/]*\\.)(?![^\\n/]*\\.(?:py|pyi|js|mjs|cjs|ts|tsx|jsx|go|rs|java|kt|rb|php|cs|c|h|cc|cpp|hpp|swift|scala|sh|bash|zsh|ps1|md|mdx|rst|html|css|scss|sql|proto|lock|map|snap|svg|png|jpg|ipynb)(?![^\\n]))[^\\n/]*(?:secret|SECRET|Secret)[^\\n/]*(?![^\\n])"
+      },
+      {
+        "id": "auth_file",
+        "needs": [
+          "netrc",
+          "npmrc",
+          "pypirc",
+          "git-credentials",
+          "pgpass",
+          "htpasswd",
+          "dockercfg",
+          "auth.json",
+          ".boto",
+          "s3cfg",
+          "vault-token",
+          "config"
+        ],
+        "re": "(?:(?<![^\\n/])(?:\\.netrc|_netrc|\\.npmrc|\\.pypirc|\\.git-credentials|\\.pgpass|\\.htpasswd|\\.dockercfg|auth\\.json|\\.boto|\\.s3cfg|\\.vault-token)|(?<=\\.docker/)config\\.json|(?<=\\.kube/)config)(?![^\\n])"
+      },
+      {
+        "id": "proc_environ",
+        "needs": [
+          "/environ"
+        ],
+        "re": "(?<![^\\n])/proc/[^\\n/]+/environ(?![^\\n])"
+      }
+    ],
+    "commands": [
+      {
+        "id": "env_dump",
+        "needs": [
+          "env",
+          "set",
+          "export",
+          "declare",
+          "typeset"
+        ],
+        "re": "(?<![^\\n;&|(`])\\s*(?:sudo\\s+)?(?:env|printenv|set|export|export\\s+-p|declare\\s+-[a-z]*[px][a-z]*|typeset\\s+-[a-z]*x[a-z]*)\\s*(?![^\\n;&|)>`])"
+      },
+      {
+        "id": "printenv",
+        "needs": [
+          "printenv"
+        ],
+        "re": "(?<![A-Za-z0-9_-])printenv(?![A-Za-z0-9_-])"
+      },
+      {
+        "id": "secret_cli",
+        "needs": [
+          "gh",
+          "aws",
+          "git",
+          "gcloud",
+          "security",
+          "op",
+          "vault",
+          "kubectl"
+        ],
+        "re": "(?<![A-Za-z0-9_-])(?:gh\\s+auth\\s+token|aws\\s+configure\\s+(?:get|export-credentials)|git\\s+credential\\s+fill|gcloud\\s+auth\\s+(?:application-default\\s+)?print-(?:access|identity)-token|security\\s+find-(?:generic|internet)-password|op\\s+read|vault\\s+(?:read|kv\\s+get)|kubectl\\s+(?:get|describe|edit)\\s+secrets?)(?![A-Za-z0-9_-])"
+      }
+    ]
+  },
+  "keep_fields": [
+    "v",
+    "kind",
+    "name",
+    "harness",
+    "harness_version",
+    "event",
+    "session_id",
+    "turn_id",
+    "message_id",
+    "ts",
+    "start_ts",
+    "end_ts",
+    "duration_ms",
+    "cwd",
+    "project_root",
+    "environment",
+    "capture",
+    "model",
+    "provider",
+    "usage",
+    "interrupted",
+    "hidden",
+    "agent_id",
+    "agent_type",
+    "agent_name",
+    "bind_agent",
+    "bind_task",
+    "background",
+    "task_pending",
+    "tool_name",
+    "tool_call_id",
+    "parent_call_id",
+    "is_error",
+    "export_fp",
+    "export_project",
+    "export_url",
+    "export_org",
+    "redactions",
+    "redaction_error",
+    "sensitive",
+    "sensitive_rule",
+    "sensitive_trigger",
+    "_id",
+    "transcript_path",
+    "agent_transcript_path"
+  ],
+  "transport_fields": [
+    "transcript_path",
+    "agent_transcript_path",
+    "_id"
+  ]
+}

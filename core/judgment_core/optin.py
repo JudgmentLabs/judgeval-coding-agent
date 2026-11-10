@@ -34,24 +34,50 @@ def find_optin(start: str | Path) -> tuple[Path, Path] | None:
         current = current.parent
 
 
+# Capture modes, strictest last. "sanitized" sends the text with secrets redacted; "full" sends it raw.
+CAPTURE_MODES = ("full", "sanitized", "metadata")
+
+
+def resolve_capture(data: dict) -> str:
+    """The one capture table. core/bin/prepare.jq judgment_prepare has the same table; tests check both.
+
+    An explicit ``capture`` wins. Without one, ``"redact": false`` means raw text, and anything
+    else, including a missing or unknown value, means sanitized.
+    """
+    capture = data.get("capture")
+    if capture in CAPTURE_MODES:
+        return capture
+    if data.get("redact") is False:
+        return "full"
+    return "sanitized"
+
+
+def _strings(value: object) -> list[str]:
+    return [item for item in value if isinstance(item, str) and item] if isinstance(value, list) else []
+
+
+_CLOSED = {"enabled": False, "capture": "sanitized", "sessionDefault": "on", "environment": "production", "redactPatterns": [], "redactPaths": []}
+
+
 def load_project(path: Path) -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"enabled": False, "capture": "full", "sessionDefault": "on", "environment": "production"}
+        return dict(_CLOSED)
     if not isinstance(data, dict):
-        return {"enabled": False, "capture": "full", "sessionDefault": "on", "environment": "production"}
+        return dict(_CLOSED)
     enabled = data.get("enabled", True)
-    capture = data.get("capture", "full")
     session_default = data.get("sessionDefault", "on")
     environment = data.get("environment") or "production"
     if not isinstance(environment, str) or not environment.strip():
         environment = "production"
     return {
         "enabled": enabled is not False,
-        "capture": "metadata" if capture == "metadata" else "full",
+        "capture": resolve_capture(data),
         "sessionDefault": "off" if session_default == "off" else "on",
         "environment": environment.strip(),
+        "redactPatterns": _strings(data.get("redactPatterns")),
+        "redactPaths": _strings(data.get("redactPaths")),
     }
 
 

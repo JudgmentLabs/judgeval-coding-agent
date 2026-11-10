@@ -118,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     enable = sub.add_parser("enable")
-    enable.add_argument("--capture", choices=("full", "metadata"), default="full")
+    enable.add_argument("--capture", choices=("sanitized", "full", "metadata"), default="sanitized")
     enable.add_argument("--session-default", choices=("on", "off"), default="on")
     enable.set_defaults(func=cmd_enable)
 

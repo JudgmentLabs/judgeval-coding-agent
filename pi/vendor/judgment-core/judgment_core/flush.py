@@ -7,6 +7,11 @@ Persistent state is the fold's small routing table (``fold.json``) and one
 record per turn (``index.json``): its file, whether it is waiting to be
 sent, the last ``judgment.update_id`` sent, and a short summary for later
 turns' history.
+
+Each turn's events pass through plain stages: inbox -> fold -> turn file -> enrich (transcript
+text) -> capture policy (metadata strips text; sanitized redacts it, and blanks the whole turn
+when a tool call touched a sensitive file) -> spans -> post. The turn file and the index keep
+only what the policy allows, so no secret the rules know stays on disk after a send.
 """
 
 from __future__ import annotations
@@ -22,12 +27,13 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from judgment_core import redact
 from judgment_core.assemble import Fold, turn_key
 from judgment_core.claude_transcript import enrich_claude_events
 from judgment_core.codex_transcript import enrich_codex_events
 from judgment_core.cursor_transcript import enrich_cursor_events
 from judgment_core.config import DEFAULT_API_URL, load_credentials, traces_url
-from judgment_core.optin import safe_id, state_dir, tracing_forced_off
+from judgment_core.optin import load_project, safe_id, state_dir, tracing_forced_off
 from judgment_core.spans import build_request, turn_summary
 
 ATTEMPTS = 3
@@ -207,8 +213,9 @@ def _inbox(state: Path) -> list[tuple[Path, dict, list]]:
     return found
 
 
-def ingest(state: Path) -> dict[str, dict]:
+def ingest(state: Path, env: dict | None = None) -> dict[str, dict]:
     """Fold new inbox events into turns. Return the turn index."""
+    legacy = _Redactor(env)
     index = _load_json(state / "index.json")
     fold = Fold(_load_json(state / "fold.json"))
     fold.sent = {key for key, item in index.items() if item.get("update_id") is not None}
@@ -221,6 +228,9 @@ def ingest(state: Path) -> dict[str, dict]:
             consumed.append(path)
             continue
         fold.s["inbox"]["last"] = order
+        if "capture" not in event and event.get("kind") != "command":
+            # An older build wrote this event without redacting it. Redact it before it is stored.
+            event = legacy.redact(event)
         children = set(fold.s["child"])
         try:
             routed, ready, extra = fold.step(event)
@@ -315,31 +325,69 @@ def _destination(events: list[dict], env: dict | None) -> tuple[str, dict[str, s
     return "send", {"JUDGMENT_API_KEY": key, "JUDGMENT_PROJECT_ID": project, "JUDGMENT_API_URL": url or DEFAULT_API_URL, "JUDGMENT_ORG_ID": org}
 
 
-# Metadata capture keeps names, models, tokens, cost, timing, and ids. Any other field can hold text.
-_METADATA_FIELDS = frozenset(
-    {
-        "v", "harness", "harness_version", "event", "session_id", "turn_id", "message_id",
-        "ts", "start_ts", "end_ts", "duration_ms",
-        "cwd", "project_root", "environment", "capture",
-        "model", "provider", "usage", "interrupted",
-        "agent_id", "agent_type", "agent_name", "bind_agent", "background", "task_pending",
-        "tool_name", "tool_call_id", "parent_call_id", "is_error",
-        "export_fp", "export_project", "export_url", "export_org",
-    }
-)
-
-
+# Metadata capture keeps names, models, tokens, cost, timing, and ids. The list is in core/bin/redact-rules.json.
 def _metadata_only(event: dict) -> dict:
     """The event without its text. Transcript enrichment has already run, so this is what gets sent and kept."""
-    kept = {key: value for key, value in event.items() if key in _METADATA_FIELDS}
-    calls = event.get("tool_calls")
-    if isinstance(calls, list):
-        kept["tool_calls"] = [
-            {"id": call.get("id") or call.get("tool_call_id") or "", "name": call.get("name") or call.get("tool_name") or "tool"}
-            for call in calls
-            if isinstance(call, dict)
-        ]
-    return kept
+    return redact.strip_text(event, redact.metadata_fields())
+
+
+def turn_capture(events: list[dict]) -> str:
+    """The strictest capture any event was recorded under. An event with no stamp, from an older build, is sanitized."""
+    modes = {event.get("capture") for event in events}
+    if "metadata" in modes:
+        return "metadata"
+    if modes == {"full"}:
+        return "full"
+    return "sanitized"
+
+
+class _Redactor:
+    """The rules for each project's turns, and the secret values in this process's environment."""
+
+    def __init__(self, env: dict | None = None):
+        self.env = os.environ if env is None else env
+        self._secrets: list[tuple[str, str]] | None = None
+        self._rules: dict[str, redact.Ruleset] = {}
+
+    @property
+    def secrets(self) -> list[tuple[str, str]]:
+        if self._secrets is None:
+            self._secrets = redact.env_secrets(self.env, load_credentials(self.env).get("JUDGMENT_API_KEY", ""))
+        return self._secrets
+
+    @property
+    def home(self) -> str:
+        return str(self.env.get("HOME") or "")
+
+    def rules(self, events: list[dict]) -> redact.Ruleset:
+        root = next((str(event.get("project_root")) for event in events if event.get("project_root")), "")
+        if root not in self._rules:
+            self._rules[root] = redact.ruleset(load_project(Path(root) / ".judgment" / "tracing.json") if root else {})
+        return self._rules[root]
+
+    def redact(self, event: dict) -> dict:
+        return redact.redact_event(event, self.rules([event]), self.secrets)
+
+    def text(self, value: str, rs: redact.Ruleset) -> str:
+        return redact.redact_string(value, rs, self.secrets)[0]
+
+
+def _sanitize(state: Path, key: str, item: dict, events: list[dict], prepared: list[dict], redactor: _Redactor) -> tuple[list[dict], dict | None]:
+    """Redact the enriched turn, and find whether it touched a sensitive file. A blanked turn stays blanked.
+
+    The turn file is rewritten when this changes what it holds, so the redacted or blanked
+    version is all that stays on disk.
+    """
+    rs = redactor.rules(events)
+    prepared = [redact.redact_event(event, rs, redactor.secrets) for event in prepared]
+    blank = item.get("blanked") or redact.first_sensitive(prepared, rs, redactor.secrets, redactor.home)
+    stored = [redact.redact_event(event, rs, redactor.secrets) for event in events]
+    if blank:
+        item["blanked"] = blank
+        stored = [redact.strip_text(event) for event in stored]
+    if stored != events:
+        _private_write(_turn_file(state, key), "".join(json.dumps(event, ensure_ascii=False, default=str) + "\n" for event in stored))
+    return prepared, blank
 
 
 def _enrich(events: list[dict]) -> list[dict]:
@@ -386,7 +434,7 @@ def _history(index: dict, key: str, dest: str) -> list[dict]:
     earlier = [
         item["summary"]
         for other, item in index.items()
-        if other != key and other.startswith(prefix) and item.get("summary") and item.get("dest") == dest
+        if other != key and other.startswith(prefix) and item.get("summary") and not item.get("blanked") and item.get("dest") == dest
     ]
     return sorted((turn for turn in earlier if int(turn.get("start") or 0) < start), key=lambda turn: int(turn.get("start") or 0))
 
@@ -421,7 +469,8 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
     state = state or state_dir(env)
     _private_state(state)
     _drop_export_refs(state)
-    index = ingest(state)
+    index = ingest(state, env)
+    redactor = _Redactor(env)
     now = int(time.time() * 1000)
     for item in index.values():
         if not item.get("ready") and item.get("update_id") is None and now - int(item.get("stored_at") or now) > STALE_MS:
@@ -449,9 +498,19 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
             continue
         try:
             prepared = _enrich(events)
-            metadata = any(event.get("capture") == "metadata" for event in prepared)
-            if metadata:
+            # Transcript events carry no stamp. The hook's events say how the turn was recorded.
+            capture = turn_capture(events)
+            blank = None
+            redaction = None
+            rs = redactor.rules(events)
+            if capture == "metadata":
                 prepared = [_metadata_only(event) for event in prepared]
+                redaction = redact.turn_redaction(prepared)
+            elif capture == "sanitized":
+                prepared, blank = _sanitize(state, key, item, events, prepared, redactor)
+                redaction = redact.turn_redaction(prepared, blank)
+            # A blanked or metadata turn is no later turn's context.
+            quiet = capture == "metadata" or bool(blank)
             summary = turn_summary(prepared)
             if summary:
                 item["start"] = summary["start"]
@@ -459,8 +518,11 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
             # Earlier turns may hold text from before the project switched to metadata.
             assert creds is not None
             dest = f"{creds['JUDGMENT_API_URL']} {creds['JUDGMENT_ORG_ID']} {creds['JUDGMENT_PROJECT_ID']}"
-            history = [] if metadata else _history(index, key, dest)
-            payload = build_request(prepared, update_id=update_id, history=history)
+            history = [] if quiet else _history(index, key, dest)
+            if capture != "full":
+                # Summaries stored by an older build were never redacted.
+                history = [{**turn, "prompt": redactor.text(str(turn.get("prompt") or ""), rs), "answer": redactor.text(str(turn.get("answer") or ""), rs)} for turn in history]
+            payload = build_request(prepared, update_id=update_id, history=history, redaction=redaction)
         except (OSError, ValueError) as exc:
             # A ValueError's message can quote the transcript value it choked on.
             _log(state, f"skip a turn: {type(exc).__name__}")
@@ -503,7 +565,7 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
             return -1
         item["update_id"] = 0 if update_id is None else update_id
         item["ready"] = False
-        item["summary"] = None if metadata else summary
+        item["summary"] = None if quiet else summary
         item["dest"] = dest
         _private_write(state / "index.json", json.dumps(index))
         sent += 1

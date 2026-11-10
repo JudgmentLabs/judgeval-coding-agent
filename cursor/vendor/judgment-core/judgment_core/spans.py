@@ -618,13 +618,68 @@ def _conversation(role: str, text: str) -> str:
     return _messages_json([message])
 
 
+_TEXT_KEYS = ("judgment.input", "judgment.output")
+_PLACEHOLDER = "[REDACTED:"
+
+
+def _blank_calls(value: str) -> str:
+    """Tool calls with their arguments gone: only each call's id and name."""
+    try:
+        calls = json.loads(value)
+    except ValueError:
+        return "[]"
+    if not isinstance(calls, list):
+        return "[]"
+    return json.dumps([{"id": call.get("id", ""), "name": call.get("name", "tool")} for call in calls if isinstance(call, dict)])
+
+
+def _apply_redaction(spans: list[dict], root: dict, redaction: dict) -> None:
+    """Record the turn's redactions on its root. A blanked turn loses every span's text, and keeps every span.
+
+    Spans are built from the unblanked events and blanked here, so span count, ids, tokens, cost,
+    and timing match the same turn sent unblanked.
+    """
+    blanked = bool(redaction.get("blanked"))
+    for span in spans:
+        attrs = span["attributes"]
+        if blanked:
+            for attr in attrs:
+                if attr["key"] in _TEXT_KEYS:
+                    attr["value"] = {"stringValue": ""}
+                elif attr["key"] == "judgment.llm.tool_calls":
+                    attr["value"] = {"stringValue": _blank_calls(attr["value"].get("stringValue", ""))}
+        elif span is not root:
+            found = sum(str(attr["value"].get("stringValue", "")).count(_PLACEHOLDER) for attr in attrs if attr["key"] in _TEXT_KEYS)
+            if found:
+                attrs.append(_attr("judgment.redaction_count", found))
+    items = redaction.get("items") or []
+    pairs: list[tuple[str, Any]] = [
+        ("judgment.redacted", blanked or int(redaction.get("count") or 0) > 0),
+        ("judgment.redaction_count", int(redaction.get("count") or 0)),
+        ("judgment.redactions", json.dumps(items, separators=(",", ":")) if items else None),
+    ]
+    if blanked:
+        pairs += [
+            ("judgment.redacted_reason", str(redaction.get("reason") or "")),
+            ("judgment.redacted_rule", str(redaction.get("rule") or "")),
+            ("judgment.redacted_trigger", str(redaction.get("trigger") or "")),
+        ]
+    if redaction.get("error"):
+        pairs.append(("judgment.redaction_error", True))
+    root["attributes"].extend(_attrs(pairs))
+
+
 def build_request(
     events: list[dict],
     *,
     update_id: int | None = None,
     history: list[dict] | None = None,
+    redaction: dict | None = None,
 ) -> dict | None:
-    """``history`` is the session's earlier turns, oldest first, as ``turn_summary`` returns them."""
+    """``history`` is the session's earlier turns, oldest first, as ``turn_summary`` returns them.
+
+    ``redaction`` is ``redact.turn_redaction``'s record, or None for raw (``capture: full``) text.
+    """
     usable = _usable(events)
     if not usable:
         return None
@@ -1043,6 +1098,8 @@ def build_request(
 
     if not spans:
         return None
+    if redaction is not None:
+        _apply_redaction(spans, spans[-1], redaction)
     _contain(spans)
     _stamp_session(spans, session_id, update_id)
 

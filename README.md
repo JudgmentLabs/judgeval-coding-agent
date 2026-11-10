@@ -29,7 +29,7 @@ Tracing stays off until a project opts in. A hook writes each event to a local q
 
 ## Install
 
-The plugins run on macOS and Linux. The hooks need `jq` and `python3` (3.9 or later) on `PATH`. Without either one, the hooks still return and nothing is traced.
+The plugins run on macOS and Linux. The hooks need `jq` and `python3` (3.9 or later) on `PATH`. Without either one, the hooks still return and nothing is traced. Pi without `jq` records each event's ids and timing, and none of its text.
 
 1. Save your credentials in `~/.config/judgment/credentials`, then run `chmod 600` on that file. See [Credentials](#credentials) for every field.
 
@@ -64,7 +64,7 @@ Tracing is on in a directory when `.judgment/tracing.json` is in it or in a pare
 ```json
 {
   "enabled": true,
-  "capture": "full",
+  "capture": "sanitized",
   "sessionDefault": "on"
 }
 ```
@@ -72,8 +72,10 @@ Tracing is on in a directory when `.judgment/tracing.json` is in it or in a pare
 | Field | Values | What it does |
 | --- | --- | --- |
 | `enabled` | `true`, `false` | `false` turns the file off without deleting it. |
-| `capture` | `full`, `metadata` | `full` sends prompt, response, and tool text. `metadata` sends only names, models, token counts, cost, timing, and ids. [What gets sent](#what-gets-sent) has the details. |
+| `capture` | `sanitized`, `full`, `metadata` | `sanitized`, the default, sends prompt, response, and tool text with secrets redacted. `full` sends the text raw. `metadata` sends only names, models, token counts, cost, timing, and ids. [What gets sent](#what-gets-sent) has the details. |
 | `sessionDefault` | `on`, `off` | `off` leaves each new session untraced until you turn that session on. |
+| `redactPatterns` | regexes | More text to redact, as `[REDACTED:custom]`. |
+| `redactPaths` | globs | More files whose turns are blanked, such as `"secrets/*"`. `*` matches any characters, `/` included. |
 
 `sessionDefault` set to `off` is how a long traced session and a side chat share one project. The side chat stays quiet until you turn it on.
 
@@ -126,11 +128,24 @@ Each trace carries the following:
 
 - The agent's name and version, the model names, token counts, cost, timing, and session and turn ids.
 - The tool names, and the name of the folder the agent runs in. The full path stays on your machine, because it holds your account name. The name is left out when the agent runs in your home folder.
-- With `capture` set to `full`, the text: prompts, answers, reasoning, every model call's messages, tool arguments and results, and subagent tasks.
+- With `capture` set to `sanitized` or `full`, the text: prompts, answers, reasoning, every model call's messages, tool arguments and results, and subagent tasks.
+
+### Secrets are redacted by default
+
+With `capture` set to `sanitized`, the default, secrets are removed from the text twice: by the hook, before an event is written to the local queue, and again by the sender, after it reads text from the agent's transcript. Everything else is sent as it is.
+
+- **Known secrets** become `[REDACTED:<type>]`: OpenAI and Anthropic `sk-` keys, AWS access key ids, GitHub tokens, Slack tokens and webhooks, Google API keys, Stripe keys, JWTs, `Bearer` and `Authorization` values, private key blocks, passwords in URLs, and values assigned to names such as `password`, `api_key`, `secret`, or `token`. A value must look like a credential: `${TOKEN}`, `os.environ["API_KEY"]`, `<your-key>`, and `changeme` stay as they are.
+- **Your environment's secrets**: the value of every environment variable whose name holds `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL`, `PRIVATE`, or `AUTH`, and your Judgment API key, becomes `[REDACTED:env:<NAME>]` wherever it appears.
+- **Sensitive files**: a turn whose tool call reads or names `.env` or `.env.*`, `.envrc`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, an SSH private key, a `credentials` file such as `~/.aws/credentials`, `.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`, `auth.json`, a file with `secret` in its name, or that dumps the environment with `env`, `printenv`, `set`, or `export -p`, is sent blank. Its spans, ids, token counts, cost, and timing stay. Its text does not. `.env.example`, `.env.sample`, and `.env.template` are not sensitive, and neither are source files such as `secret_manager.py`.
+
+Each redaction is recorded on the turn's root span: which rule, in which field, how many times, and for a blank turn, the path or command that caused it. The secret itself, and any hash of it, is never recorded. [Trace format](docs/trace-format.md#redaction) lists the attributes. Add your own rules with `redactPatterns` and `redactPaths`. Rules you add cannot turn the built-in ones off. If a rule fails, the event's text is dropped instead of sent.
+
+> [!WARNING]
+> `"capture": "full"`, or `"redact": false` without a `capture`, turns redaction off. Prompts, tool output, and file contents are then sent exactly as the agent saw them, secrets included. Use it only in a project with no secrets.
 
 With `capture` set to `metadata`, the plugin keeps names, models, token counts, cost, timing, and ids. It drops the text and the folder name from the local queue, the spans, and the saved session history. That includes text read back from the agent's transcript.
 
-Your API key is never sent anywhere but Judgment, and never saved with a turn. Each turn records a fingerprint of the key, so it goes only to the project it was recorded for. The local queue lives in `~/.local/state/judgment` (`$XDG_STATE_HOME/judgment` when that is set), readable only by your user.
+Your API key is never sent anywhere but Judgment, and never saved with a turn. Each turn records a fingerprint of the key, so it goes only to the project it was recorded for. The local queue lives in `~/.local/state/judgment` (`$XDG_STATE_HOME/judgment` when that is set), readable only by your user. It holds the text as redacted, and a blank turn is saved blank.
 
 [Trace format](docs/trace-format.md) lists every span and attribute, and how turns are queued and sent.
 

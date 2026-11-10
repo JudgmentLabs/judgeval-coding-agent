@@ -197,11 +197,20 @@ record() {
   n=$((n + 1))
 }
 
-if [ "$RAW" -eq 1 ]; then
+# jq reads the payload from a here-document, one fork fewer than a pipe, and the key from its
+# environment, never from argv, so redaction can replace the key's value wherever it appears.
+prepare() {
+  JUDGMENT_API_KEY=${JUDGMENT_API_KEY:-} jq -L "$HERE_HOOK" -c --slurpfile cfg "$opt" --arg mode "$mode" --arg root "$root" --arg model "" "$@" <<JUDGMENT_PAYLOAD
+$payload
+JUDGMENT_PAYLOAD
+}
+
+if [ "$RAW" -eq 1 ] && ! command -v jq >/dev/null 2>&1; then
+  # Without jq nothing can redact. Record the event's ids and times, and none of its text.
   compact=$(tr -d '[:space:]' < "$opt")
   case $compact in
     '{'*'}') ;;
-    *) exit 0 ;;  # empty or cut off: never fall back to full capture
+    *) exit 0 ;;  # empty or cut off: no opt-in
   esac
   case $compact in
     *'"enabled":false'*) exit 0 ;;
@@ -211,30 +220,34 @@ if [ "$RAW" -eq 1 ]; then
     *) mode=on ;;
   esac
   [ "$mode" = "on" ] || exit 0
-  case $compact in
-    *'"capture":"metadata"'*)
-      command -v jq >/dev/null 2>&1 || exit 0
-      payload=$(printf '%s' "$payload" | jq -L "$HERE_HOOK" -c --slurpfile cfg "$opt" --arg mode "$mode" --arg root "$root" --arg model "" \
-        'include "prepare"; judgment_prepare($cfg[0]; $mode; $root; $model)') || exit 0
-      ;;
-    *)
-      environment=production
-      case $compact in
-        *'"environment":"'*) environment=${compact#*'"environment":"'}; environment=${environment%%\"*} ;;
-      esac
-      judgment_json_escape "$root"
-      payload="${payload%\}},\"project_root\":\"$JR\",\"environment\":\"$environment\"}"
-      ;;
-  esac
-  record "$payload"
+  judgment_json_escape "$root"
+  line="{\"v\":1,\"capture\":\"sanitized\",\"redaction_error\":true,\"project_root\":\"$JR\",\"environment\":\"production\""
+  for field in harness event session_id turn_id agent_id agent_type tool_name tool_call_id model provider; do
+    judgment_field "$payload" "$field" || continue
+    case $JR in
+      *[!A-Za-z0-9._:@/+\ -]*) continue ;;
+    esac
+    line="$line,\"$field\":\"$JR\""
+  done
+  for field in ts start_ts end_ts; do
+    case $payload in
+      *"\"$field\":"[0-9]*) value=${payload#*"\"$field\":"} ;;
+      *"\"$field\": "[0-9]*) value=${payload#*"\"$field\": "} ;;
+      *) continue ;;
+    esac
+    value=${value%%[!0-9]*}
+    [ -n "$value" ] && line="$line,\"$field\":$value"
+  done
+  record "$line}"
+elif [ "$RAW" -eq 1 ]; then
+  mapped=$(prepare 'include "prepare"; judgment_prepare($cfg[0]; $mode; $root; $model)') || exit 0
+  [ -n "$mapped" ] && record "$mapped"
 else
   command -v jq >/dev/null 2>&1 || exit 0
   if [ -n "$MAP" ]; then
-    mapped=$(printf '%s' "$payload" | jq -L "$HERE_HOOK" -c --arg event "$EVENT_NAME" --slurpfile cfg "$opt" \
-      --arg mode "$mode" --arg root "$root" --arg model "" -f "$MAP") || exit 0
+    mapped=$(prepare --arg event "$EVENT_NAME" -f "$MAP") || exit 0
   else
-    mapped=$(printf '%s' "$payload" | jq -L "$HERE_HOOK" -c --slurpfile cfg "$opt" --arg mode "$mode" --arg root "$root" --arg model "" \
-      'include "prepare"; judgment_prepare($cfg[0]; $mode; $root; $model)') || exit 0
+    mapped=$(prepare 'include "prepare"; judgment_prepare($cfg[0]; $mode; $root; $model)') || exit 0
   fi
   while IFS= read -r line; do
     [ -n "$line" ] && record "$line"
@@ -249,6 +262,19 @@ PYTHONPATH="$CORE${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONPATH
 if command -v setsid >/dev/null 2>&1; then
   setsid python3 -m judgment_core.flush >>"$STATE/flush.log" 2>&1 </dev/null &
+  sender=$!
+  # An agent can kill this process group the moment the hook returns. Return only once the sender
+  # is in its own session: builtin reads of /proc, no fork, and never more than a few ms.
+  if read -r own < "/proc/$$/stat" 2>/dev/null; then
+    set -- ${own##*) }
+    own=$4
+    tries=0
+    while [ "$tries" -lt 300 ] && read -r stat < "/proc/$sender/stat" 2>/dev/null; do
+      set -- ${stat##*) }
+      [ "$4" = "$own" ] || break
+      tries=$((tries + 1))
+    done
+  fi
 else
   python3 -m judgment_core.flush >>"$STATE/flush.log" 2>&1 </dev/null &
 fi
