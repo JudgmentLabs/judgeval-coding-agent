@@ -518,8 +518,12 @@
         "msg"
       ],
       "wrap": "INFO payload={} elapsed_ms=12",
-      "expect": "known_gap",
-      "source": "round 5 finding 6, adversarial, non-blocking"
+      "expect": "redacted",
+      "source": "round 5 finding 6, adversarial, non-blocking",
+      "keep": [
+        "bob",
+        "elapsed_ms=12"
+      ]
     },
     {
       "id": "r6.1-codex-patch-dotenv-hook",
