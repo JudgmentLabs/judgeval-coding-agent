@@ -17,6 +17,7 @@ import json
 import subprocess
 import time
 import unittest
+from typing import Callable
 
 from support import CORE, clean_env
 
@@ -160,6 +161,91 @@ class LatencyTests(unittest.TestCase):
             for result in (py, js):
                 self.assertTrue(result.get("redaction_error"))
                 self.assertNotIn("tool_output", result)
+
+
+def growth_cases() -> list[tuple[str, Callable[[int], str]]]:
+    """Pathological text for every built-in rule, at any size: what made a rule backtrack before (round 8 finding d), runs of
+    the characters the rules stop at, and each rule's needed literal before an operator."""
+    done = redact.compiled()
+    rules = done["patterns"] + [done["names"]["assignment"], done["names"]["field"]] + done["sensitive"]["paths"] + done["sensitive"]["commands"]
+    cases = [
+        ("finding d: quote pairs after a value", lambda n: 'f(password="pw") ' + "''" * (n // 2) + ' "'),
+        ("double quotes", lambda n: '"' * n),
+        ("single quotes", lambda n: "'" * n),
+        ("escaped quotes", lambda n: fill('\\"', n)),
+        ("password=", lambda n: fill("password=", n)),
+        ('"password": "', lambda n: fill('"password": "', n)),
+        (":= runs", lambda n: fill(":=", n)),
+        (": runs", lambda n: ":" * n),
+        ("= runs", lambda n: "=" * n),
+        ("token-like run", lambda n: fill("Ab3", n)),
+        ("one long word after a name", lambda n: "token=" + fill("Ab3", n)),
+        ("path components", lambda n: fill("a/", n) + ".env"),
+        ("commands", lambda n: fill("; gh auth token -x", n)),
+    ]
+    for rule in rules:
+        need = (rule.get("needs") or ["key"])[0]
+        cases += [(f"{rule['id']}: {need!r}=", lambda n, need=need: fill(need + "=", n)), (f"{rule['id']}: {need!r}: ", lambda n, need=need: fill(need + ": ", n))]
+    return cases
+
+
+GROWTH_SIZE = 100_000
+GROWTH_RATIO = 3  # time at twice the size, as a multiple of the time at the size: about 2 for linear work, 4 for quadratic
+PY_SLACK_MS, JQ_SLACK_MS = 40, 150  # noise allowed on top of the ratio: a short run is all startup and timer jitter
+PY_MAX_MS, JQ_MAX_MS = 4000, 6000  # at twice the size, a generous absolute bound
+
+
+class LinearGrowthTests(unittest.TestCase):
+    """Every built-in rule does linear work in both layers: on pathological text, twice the text takes about twice the time,
+    and never more than a generous absolute bound. The round 8 finding d string is checked at n=5000 on its own as well.
+    Project regexes (redactPatterns, redactCommands, redactPaths globs) are the user's: a slow one is a known limit."""
+
+    def py_ms(self, text: str, rs, secrets, runs: int = 1) -> float:
+        best = None
+        for _ in range(runs):
+            started = time.perf_counter()
+            for event in events(text):
+                redact.sanitize_event(event, rs, secrets)
+                redact.redact_event(event, rs, secrets)
+                redact.first_sensitive([event], rs, secrets)
+            elapsed = (time.perf_counter() - started) * 1000
+            best = elapsed if best is None else min(best, elapsed)
+        return best
+
+    def jq_ms(self, text: str, runs: int = 1) -> float:
+        data = "\n".join(json.dumps(event) for event in events(text))
+        best = None
+        for _ in range(runs):
+            elapsed, result = jq_once(data)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            best = elapsed if best is None else min(best, elapsed)
+        return best
+
+    def check(self, measure, slack: float, most: float) -> list:
+        slow = []
+        for name, make in growth_cases():
+            small, large = measure(make(GROWTH_SIZE)), measure(make(2 * GROWTH_SIZE))
+            if large > GROWTH_RATIO * small + slack or large > most:
+                # A busy machine can slow one run: measure again, best of three, before calling it slow.
+                small, large = measure(make(GROWTH_SIZE), 3), measure(make(2 * GROWTH_SIZE), 3)
+            if large > GROWTH_RATIO * small + slack or large > most:
+                slow.append((name, round(small), round(large)))
+        return slow
+
+    def test_python(self):
+        rs, secrets = redact.ruleset(), redact.env_secrets(ENV)
+        self.assertEqual(self.check(lambda text, runs=1: self.py_ms(text, rs, secrets, runs), PY_SLACK_MS, PY_MAX_MS), [])
+
+    def test_jq(self):
+        self.assertEqual(self.check(self.jq_ms, JQ_SLACK_MS, JQ_MAX_MS), [])
+
+    def test_finding_d_at_5000(self):
+        text = 'f(password="pw") ' + "''" * 5000 + ' "'
+        rs = redact.ruleset()
+        self.assertLess(self.py_ms(text, rs, []), 1000)
+        self.assertLess(self.jq_ms(text), 2000)
+        out = redact.sanitize_event(events(text)[0], rs, [])
+        self.assertEqual(out["tool_output"], text.replace('"pw"', '"[REDACTED:secret_assignment]"'))
 
 
 if __name__ == "__main__":
