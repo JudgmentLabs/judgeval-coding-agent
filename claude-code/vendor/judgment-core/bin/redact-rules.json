@@ -29,7 +29,13 @@
       "            with its, keywords) are skipped, and the command word and its arguments are read whole (sh_word).",
       "  Impossible: a command position inside an inert token. A text the grammar cannot read (a quote in an irregular",
       "  place) is read as code, so its words can only count, never hide.",
-      "sh_args reads each argument whole: a lookahead captures it and \\\\k<aw> matches it, so the engine never gives part back."
+      "sh_args reads each argument whole: a lookahead captures it and \\\\k<aw> matches it, so the engine never gives part back.",
+      "sh_envarg: one argument of env before its command (shell_options.env): a short cluster, ending in an option that takes",
+      "the rest of the cluster or the next word; a lone - or --; a long option with its argument (--unset NAME, --chdir=DIR);",
+      "another long option (--null, --block-signal=INT); or an assignment. -S/--split-string's argument is the command line",
+      "env runs: it counts as no command only when it runs env or printenv itself, or nothing (sh_splitdump).",
+      "sh_opts: up to 4 options (with an argument each, as --opt=arg or -o arg) between a command's words, then the blank before",
+      "the next word: kubectl -n prod get secret, aws --profile p configure get."
     ],
     "secret_name": "(?:api|API|Api)[_-]?(?:key|KEY|Key)|(?:secret|SECRET|Secret)[_-]?(?:key|KEY|Key)|(?:client|CLIENT|Client)[_-]?(?:secret|SECRET|Secret)|(?:secret|SECRET|Secret)|(?:access|ACCESS|Access)[_-]?(?:key|KEY|Key)|(?:private|PRIVATE|Private)[_-]?(?:key|KEY|Key)|(?:auth|AUTH|Auth)[_-]?(?:token|TOKEN|Token)|(?:access|ACCESS|Access)[_-]?(?:token|TOKEN|Token)|(?:refresh|REFRESH|Refresh)[_-]?(?:token|TOKEN|Token)|(?:session|SESSION|Session)[_-]?(?:token|TOKEN|Token)|(?:token|TOKEN|Token)|(?:password|PASSWORD|Password)|(?:passwd|PASSWD|Passwd)|(?:passphrase|PASSPHRASE|Passphrase)|(?:credentials|CREDENTIALS|Credentials)|(?:credential|CREDENTIAL|Credential)",
     "secret_value": "(?!\\\\?[\\\"']?(?:xxx|XXX|Xxx|\\*\\*\\*|\\.\\.\\.|changeme|CHANGEME|Changeme|change_me|CHANGE_ME|Change_me|change-me|CHANGE-ME|Change-me|your_|YOUR_|Your_|your-|YOUR-|Your-|example|EXAMPLE|Example|placeholder|PLACEHOLDER|Placeholder|dummy|DUMMY|Dummy|redacted|REDACTED|Redacted|sample|SAMPLE|Sample|null\\b|NULL\\B|Null\\b|none\\b|NONE\\B|None\\b|undefined\\b|UNDEFINED\\B|Undefined\\b|true\\b|TRUE\\B|True\\b|false\\b|FALSE\\B|False\\b|process\\.env|PROCESS\\.ENV|Process\\.env|os\\.environ|OS\\.ENVIRON|Os\\.environ|os\\.getenv|OS\\.GETENV|Os\\.getenv|env\\.|ENV\\.|Env\\.|env\\[|ENV\\[|Env\\[|getenv|GETENV|Getenv|secrets\\.|SECRETS\\.|Secrets\\.|vault:|VAULT:|Vault:|arn:|ARN:|Arn:))(?![A-Za-z_][A-Za-z0-9_]{0,63}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,63}){1,16}(?![A-Za-z0-9_\\-+/.~!@#%^*]))(?![A-Za-z_]{1,64}_?[vV][0-9]{1,3}(?![A-Za-z0-9_\\-+/.~!@#%^*]))(?![A-Z][A-Z0-9]{0,63}(?:_[A-Z0-9]{1,63}){1,8}(?![A-Za-z0-9_\\-+/.~!@#%^*]))(?![A-Z]{2,64}[0-9]{1,4}(?![A-Za-z0-9_\\-+/.~!@#%^*]))(?![$<{%\\[(/~.])(?=[A-Za-z0-9_\\-+/.~!@#%^*]{0,255}[0-9])(?=[A-Za-z0-9_\\-+/.~!@#%^*]{0,255}[A-Za-z])[A-Za-z0-9_\\-+/.~!@#%^*]{8,}={0,3}(?=[\\\"'`\\s,;)}\\]&<>|\\\\]|$)",
@@ -180,15 +186,73 @@
       ")?"
     ],
     "sh_envarg": [
-      "(?:-[uC][^\\S\\n]+(?!-)",
+      "(?:-",
+      {
+        "gen": "env_short_flag"
+      },
+      "{0,8}(?:",
+      {
+        "gen": "env_short_arg"
+      },
+      "(?:[^\\S\\n]+)?",
       {
         "def": "sh_word"
       },
-      "|-(?![uC](?![A-Za-z0-9]))[A-Za-z0-9]{1,8}|--(?!(?:help|version)",
+      "|",
+      {
+        "gen": "env_short_split"
+      },
+      "(?:[^\\S\\n]+)?",
+      {
+        "def": "sh_splitdump"
+      },
+      {
+        "def": "sh_word"
+      },
+      ")|-",
+      {
+        "gen": "env_short_flag"
+      },
+      "{1,8}",
       {
         "def": "sh_stop"
       },
-      ")[A-Za-z][A-Za-z-]{0,31}(?:=",
+      "|--?",
+      {
+        "def": "sh_stop"
+      },
+      "|--(?:",
+      {
+        "gen": "env_long_arg"
+      },
+      "(?:=|[^\\S\\n]+)",
+      {
+        "def": "sh_word"
+      },
+      "|",
+      {
+        "gen": "env_long_split"
+      },
+      "(?:=|[^\\S\\n]+)",
+      {
+        "def": "sh_splitdump"
+      },
+      {
+        "def": "sh_word"
+      },
+      ")|--(?!(?:help|version)",
+      {
+        "def": "sh_stop"
+      },
+      ")(?!(?:",
+      {
+        "gen": "env_long_arg"
+      },
+      "|",
+      {
+        "gen": "env_long_split"
+      },
+      ")(?![A-Za-z0-9-]))[A-Za-z][A-Za-z0-9-]{0,31}(?:=",
       {
         "def": "sh_word"
       },
@@ -295,6 +359,26 @@
         "def": "sh_notpat"
       },
       ")?"
+    ],
+    "assign_ctx": "(?:(?<![^\\n])[^\\S\\n]{0,64}(?:(?:export|readonly|local|declare|typeset|const|let|var|set|setenv|val|final|static|private|public|protected)[^\\S\\n]+(?:-[A-Za-z]{1,8}[^\\S\\n]+)?){0,3}(?:-[^\\S\\n]+)?\\$?(?<lq>[\"']?)[A-Za-z0-9_.-]{0,64}?|(?<kq>[\"'])[A-Za-z0-9_.-]{0,64}?|(?<![^\\s])(?:--|-e[^\\S\\n]+)(?<kd>)[A-Za-z0-9_.-]{0,64}?|(?<nc>))",
+    "assign_close": "(?:(?:\\k<kq>|\\k<lq>|\\k<kd>)(?<ml>)|\\\\?[\"']?)",
+    "sh_splitdump": [
+      "(?=['\"]?",
+      {
+        "def": "sh_path"
+      },
+      "(?:env|printenv)(?![^\\s;&|)<>`'\"])|''|\"\")"
+    ],
+    "sh_opts": [
+      "(?:[^\\S\\n]+-{1,2}[A-Za-z][A-Za-z0-9-]{0,31}(?:=",
+      {
+        "def": "sh_word"
+      },
+      "|[^\\S\\n]+(?!-)",
+      {
+        "def": "sh_word"
+      },
+      ")?){0,4}[^\\S\\n]+"
     ]
   },
   "limits": {
@@ -493,23 +577,40 @@
         "A quoted value under a secret name, of any length. Each quote style stands alone: an escaped opening quote (\\\") opens only",
         "an escaped value, which ends at the next \\\" (doubly encoded JSON), so no alternative reads past its own value. A value",
         "that runs to the end of a window is a match there: one too long for any window fails closed (limits).",
-        "A value whose first line has no blank and ends the line (a \\\\ before the newline too) runs across lines to its",
-        "closing quote; one that reaches the end of a window there is a match too, and fails closed when too long."
+        "A value runs across lines only in an assignment's context (defs assign_ctx, assign_close): the key starts its line, is quoted",
+        "itself with its quote closing before the operator, or is a flag (--db-password=, -e PASSWORD=). Only then is the quote after",
+        "the operator an opening quote. A key inside a string (console.log(\"password: \"+pw)) has no context: the quote after its",
+        "colon closes that string, so whatever follows is read to the end of its line at most. In context, a value whose first line",
+        "has no blank and ends the line (a \\\\ before the newline too) runs across lines to its closing quote.",
+        "States: assign_ctx sets exactly one of lq (key starts its line; lq is its quote or empty), kq (quoted key), kd (flag), or nc",
+        "(no context read). assign_close sets ml only when lq, kq, or kd was set and the key's quote (if any) closed. The multiline",
+        "value requires ml (\\\\k<ml>, an empty match); the escaped and one-line values require nc, so a match of those starts at",
+        "the key as before and only a value that spans lines is matched from its line's start, its key's quote, or its flag.",
+        "Impossible: ml without one of lq, kq, kd; a one-line value matched from a context (its span would grow and win over",
+        "secret_assignment's)."
       ],
       "id": "quoted_secret",
       "needs": "secret_key_name",
       "re": [
-        "(?<p>(?:",
+        "(?<p>",
+        {
+          "def": "assign_ctx"
+        },
+        "(?:",
         {
           "gen": "secret_key_tail"
         },
-        ")\\\\?[\"']?\\s{0,5}(?::=|=>|[:=])\\s{0,5}(?:\\\\\"|\"|'))",
+        ")",
+        {
+          "def": "assign_close"
+        },
+        "\\s{0,5}(?::=|=>|[:=])\\s{0,5}(?:\\\\\"|\"|'))",
         "(?!(?:",
         {
           "gen": "literal"
         },
         ")(?:\\\\\"|\"|'))",
-        "(?:(?<=\\\\\\\")(?:[^\\\"\\\\\\n]|\\\\\\\\(?:\\\\\\\\|\\\\\\\"|[^\\\"\\\\\\n]))+(?:(?=\\\\\\\")|(?![\\s\\S]))|(?<=\\\")(?<!\\\\\\\")(?:(?:[^\\\"\\\\\\s]|\\\\[^\\s])+\\\\?[^\\S\\n]*\\n(?:[^\\\"\\\\]|\\\\[\\s\\S])*|(?:[^\\\"\\\\\\n]|\\\\[^\\n])+)(?:(?=\\\")|(?![\\s\\S]))|(?<=')(?:(?:[^'\\\\\\s]|\\\\[^\\s])+\\\\?[^\\S\\n]*\\n(?:[^'\\\\]|\\\\[\\s\\S])*|(?:[^'\\\\\\n]|\\\\[^\\n])+)(?:(?=')|(?![\\s\\S])))"
+        "(?:\\k<nc>(?<=\\\\\\\")(?:[^\\\"\\\\\\n]|\\\\\\\\(?:\\\\\\\\|\\\\\\\"|[^\\\"\\\\\\n]))+(?:(?=\\\\\\\")|(?![\\s\\S]))|(?<=\\\")(?<!\\\\\\\")(?:\\k<ml>(?:[^\\\"\\\\\\s]|\\\\[^\\s])+\\\\?[^\\S\\n]*\\n(?:[^\\\"\\\\]|\\\\[\\s\\S])*|\\k<nc>(?:[^\\\"\\\\\\n]|\\\\[^\\n])+)(?:(?=\\\")|(?![\\s\\S]))|(?<=')(?:\\k<ml>(?:[^'\\\\\\s]|\\\\[^\\s])+\\\\?[^\\S\\n]*\\n(?:[^'\\\\]|\\\\[\\s\\S])*|\\k<nc>(?:[^'\\\\\\n]|\\\\[^\\n])+)(?:(?=')|(?![\\s\\S])))"
       ],
       "pre": [
         "(?:",
@@ -701,6 +802,11 @@
         ]
       },
       {
+        "_comment": [
+          "A CLI that prints a stored credential, read by the shell tokenizer like the env rules: only as the command at a",
+          "command position (behind wrappers, assignments, sudo, env, sh -c), never as words of a quoted argument, a search pattern,",
+          "a commit message, echo's arguments, or a quoted heredoc's body. Options may sit between its words (sh_opts)."
+        ],
         "id": "secret_cli",
         "needs": [
           "gh",
@@ -712,7 +818,78 @@
           "vault",
           "kubectl"
         ],
-        "re": "(?<![A-Za-z0-9_-])(?:gh\\s+auth\\s+token|aws\\s+configure\\s+(?:get|export-credentials)|git\\s+credential\\s+fill|gcloud\\s+auth\\s+(?:application-default\\s+)?print-(?:access|identity)-token|security\\s+find-(?:generic|internet)-password|op\\s+read|vault\\s+(?:read|kv\\s+get)|kubectl\\s+(?:get|describe|edit)\\s+secrets?)(?![A-Za-z0-9_-])"
+        "re": [
+          {
+            "def": "sh_at"
+          },
+          {
+            "def": "sh_prefix"
+          },
+          {
+            "def": "sh_path"
+          },
+          "(?:gh",
+          {
+            "def": "sh_opts"
+          },
+          "auth",
+          {
+            "def": "sh_opts"
+          },
+          "token|aws",
+          {
+            "def": "sh_opts"
+          },
+          "configure",
+          {
+            "def": "sh_opts"
+          },
+          "(?:get|export-credentials)|git",
+          {
+            "def": "sh_opts"
+          },
+          "credential",
+          {
+            "def": "sh_opts"
+          },
+          "fill|gcloud",
+          {
+            "def": "sh_opts"
+          },
+          "auth",
+          {
+            "def": "sh_opts"
+          },
+          "(?:application-default",
+          {
+            "def": "sh_opts"
+          },
+          ")?print-(?:access|identity)-token|security",
+          {
+            "def": "sh_opts"
+          },
+          "find-(?:generic|internet)-password|op",
+          {
+            "def": "sh_opts"
+          },
+          "read|vault",
+          {
+            "def": "sh_opts"
+          },
+          "(?:read|kv",
+          {
+            "def": "sh_opts"
+          },
+          "get)|kubectl",
+          {
+            "def": "sh_opts"
+          },
+          "(?:get|describe|edit)",
+          {
+            "def": "sh_opts"
+          },
+          "secrets?)(?![A-Za-z0-9_-])"
+        ]
       },
       {
         "id": "secret_file",
@@ -991,6 +1168,43 @@
       "%[A-Za-z_][A-Za-z0-9_]{0,63}%",
       "(?:your|YOUR|Your)[_-][A-Za-z0-9_-]{0,128}"
     ]
+  },
+  "shell_options": {
+    "_comment": [
+      "Option grammars the shell tokenizer reads, as data (redact.py composes {\"gen\": \"<tool>_short_flag\"} and the rest from them).",
+      "short_arg: short options that take an argument, the rest of their cluster or the next word (getopt: -uX, -u X, -iu X).",
+      "short_split, long_split: the option whose argument is itself a command line (env -S). long: every long option, so an",
+      "abbreviation is accepted only as far as getopt_long accepts it (--uns for --unset). long_arg: those taking an argument as",
+      "--opt arg or --opt=arg. A long option not listed in long_arg takes one only as --opt=arg (GNU's --block-signal[=SIG]).",
+      "env: GNU coreutils env and BSD env (-P altpath, -L/-U user, -S string)."
+    ],
+    "env": {
+      "short_arg": "uCPLUa",
+      "short_split": "S",
+      "long": [
+        "ignore-environment",
+        "null",
+        "unset",
+        "chdir",
+        "default-signal",
+        "ignore-signal",
+        "block-signal",
+        "list-signal-handling",
+        "debug",
+        "split-string",
+        "argv0",
+        "help",
+        "version"
+      ],
+      "long_arg": [
+        "unset",
+        "chdir",
+        "argv0"
+      ],
+      "long_split": [
+        "split-string"
+      ]
+    }
   },
   "members": [
     {

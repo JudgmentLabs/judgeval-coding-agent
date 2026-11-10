@@ -39,6 +39,7 @@ import functools
 import json
 import os
 import re
+import string
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -87,7 +88,35 @@ def generated(table: Mapping | None = None) -> dict[str, str]:
     # The same names where a match starts: at the name, after an identifier start, a separator, or a camelCase boundary.
     # A text rule starts here rather than at the identifier, so no prefix is tried at every position.
     tail = ("(?:(?:(?<![A-Za-z0-9_.-])|(?<=[_.-])|(?<=[a-z0-9])(?=[A-Z]))(?:" + names + ")|(?<![A-Za-z0-9_.-])(?:" + whole + "))")
-    return {"secret_key_name": name, "secret_key_tail": tail, "literal": literal, "secret_key_last": last}
+    out = {"secret_key_name": name, "secret_key_tail": tail, "literal": literal, "secret_key_last": last}
+    for tool, opts in table.get("shell_options", {}).items():
+        if not tool.startswith("_"):
+            out.update(_option_fragments(tool, opts))
+    return out
+
+
+def _option_fragments(tool: str, opts: Mapping) -> dict[str, str]:
+    """A command's option grammar (shell_options in the rules) as fragments: <tool>_short_flag, one short option that takes no
+    argument; <tool>_short_arg and <tool>_short_split, one that takes the next word (or the rest of its cluster);
+    <tool>_long_arg and <tool>_long_split, a long option that takes one, spelled whole or as any prefix getopt_long accepts
+    (the shortest one no other long option shares)."""
+    takes = opts["short_arg"] + opts.get("short_split", "")
+    flags = "".join(c for c in string.ascii_uppercase + string.ascii_lowercase + string.digits if c not in takes)
+    names = opts["long"]
+
+    def abbrev(name: str) -> str:
+        size = next(n for n in range(1, len(name) + 1) if not any(o != name and o.startswith(name[:n]) for o in names))
+        tail = ""
+        for char in reversed(name[size:]):
+            tail = "(?:" + re.escape(char) + tail + ")?"
+        return re.escape(name[:size]) + tail
+
+    def longs(key: str) -> str:
+        return "(?:" + "|".join(abbrev(name) for name in opts.get(key, [])) + ")" if opts.get(key) else "(?!)"
+
+    return {f"{tool}_short_flag": "[" + flags + "]", f"{tool}_short_arg": "[" + opts["short_arg"] + "]",
+            f"{tool}_short_split": "[" + opts.get("short_split", "") + "]" if opts.get("short_split") else "(?!)",
+            f"{tool}_long_arg": longs("long_arg"), f"{tool}_long_split": longs("long_split")}
 
 
 def compose(regex: Any, table: Mapping | None = None, depth: int = 0) -> str:
