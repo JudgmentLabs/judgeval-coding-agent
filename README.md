@@ -11,7 +11,7 @@
 
 ## Trace your coding agents in Judgment
 
-Claude Code, Codex, Cursor and Pi sessions, one trace per turn.
+Claude Code, Codex, Cursor, Pi and Hermes Agent sessions, one trace per turn.
 
 [![Docs](https://img.shields.io/badge/Documentation-orange)](https://docs.judgmentlabs.ai/documentation)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue)](LICENSE.md)
@@ -29,7 +29,7 @@ Tracing stays off until a project opts in. A hook writes each event to a local q
 
 ## Install
 
-The plugins run on macOS and Linux. The hooks need `jq` and `python3` (3.9 or later) on `PATH`. Without either one, the hooks still return and nothing is traced. Pi without `jq` records each event's ids and timing, and none of its text.
+The plugins run on macOS and Linux. The hooks need `jq` and `python3` (3.9 or later) on `PATH`. Without either one, the hooks still return and nothing is traced. Pi without `jq` records each event's ids and timing, and none of its text. The Hermes plugin runs in Hermes's own Python and doesn't need `jq`.
 
 1. Save your credentials in `~/.config/judgment/credentials`, then run `chmod 600` on that file. See [Credentials](#credentials) for every field.
 
@@ -46,6 +46,7 @@ The plugins run on macOS and Linux. The hooks need `jq` and `python3` (3.9 or la
    | Codex | `codex plugin marketplace add https://github.com/JudgmentLabs/judgeval-coding-agent.git`, then `codex plugin add judgment-tracing@judgment-tracing`, then trust the hooks when Codex starts | Automatic when a session starts | [codex/README.md](codex/README.md) |
    | Cursor | One copy command into `~/.cursor/plugins/local` | Run the copy command again | [cursor/README.md](cursor/README.md) |
    | Pi | `pi install git:github.com/JudgmentLabs/judgeval-coding-agent` | `pi update --extensions` | [pi/README.md](pi/README.md) |
+   | Hermes Agent | Copy `hermes/` to `~/.hermes/plugins/judgment-tracing`, then `hermes plugins enable judgment-tracing --no-allow-tool-override` | Run the copy command again | [hermes/README.md](hermes/README.md) |
 
 3. Turn tracing on in a project, from its root:
 
@@ -119,6 +120,7 @@ Inside an opted-in project, turn tracing on or off for the current conversation 
 | Codex | `$judgment on`, `$judgment off`, `$judgment status` |
 | Cursor | `/judgment on`, `/judgment off`, `/judgment status` |
 | Pi | `/judgment on`, `/judgment off`, `/judgment status` |
+| Hermes Agent | `/judgment on`, `/judgment off`, `/judgment status` |
 
 Other conversations in the project keep the project default.
 

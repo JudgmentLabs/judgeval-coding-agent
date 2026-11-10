@@ -22,6 +22,9 @@ MANIFESTS = {
 }
 INIT = Path("core/judgment_core/__init__.py")
 INIT_LINE = re.compile(r'^__version__ = "([^"]*)"$', re.M)
+# Hermes reads YAML. Only its top-level version line is touched.
+HERMES = Path("hermes/plugin.yaml")
+HERMES_LINE = re.compile(r"^version: *([^\s#]*)", re.M)
 
 
 def lookup(data, path):
@@ -40,6 +43,7 @@ if len(sys.argv) > 1:
         parent[key] = new
         Path(name).write_text(json.dumps(data, indent=2) + "\n")
     INIT.write_text(INIT_LINE.sub(f'__version__ = "{new}"', INIT.read_text()))
+    HERMES.write_text(HERMES_LINE.sub(f"version: {new}", HERMES.read_text(), count=1))
 
 found = {}
 for name, path in MANIFESTS.items():
@@ -50,6 +54,8 @@ for name, path in MANIFESTS.items():
         found[name] = None
 match = INIT_LINE.search(INIT.read_text())
 found[str(INIT)] = match.group(1) if match else None
+match = HERMES_LINE.search(HERMES.read_text()) if HERMES.is_file() else None
+found[str(HERMES)] = match.group(1) if match else None
 for name, value in found.items():
     print(name, value)
 if any(value is None or not VERSION.match(str(value)) for value in found.values()) or len(set(found.values())) != 1:

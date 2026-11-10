@@ -7,7 +7,7 @@ if [ "${1:-}" = "--check" ]; then
   check=1
 fi
 found=0
-for plugin in claude-code codex cursor pi; do
+for plugin in claude-code codex cursor pi hermes; do
   [ -d "$root/$plugin" ] || continue
   found=1
   dest="$root/$plugin/vendor/judgment-core"

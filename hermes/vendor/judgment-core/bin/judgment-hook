@@ -1,0 +1,281 @@
+#!/bin/sh
+# Record one agent event and return. Routing and export happen later, in the flusher.
+# Always exits 0. A failure here must not stop the agent.
+#
+#   judgment-hook --map FILE --event NAME --block claude|codex|cursor
+#                                  map the agent's payload with one jq
+#   judgment-hook --raw            an event the extension already prepared (Pi)
+
+trap 'exit 0' EXIT INT TERM
+# The inbox holds prompts and tool output. Keep it owner-only; the flusher started here inherits this.
+umask 077
+
+case $0 in
+  */*) HERE_HOOK=${0%/*} ;;
+  *) HERE_HOOK=. ;;
+esac
+# shellcheck disable=SC1091
+. "$HERE_HOOK/fast.sh"
+
+MAP=""
+EVENT_NAME=""
+BLOCK=""
+RAW=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    --map) MAP=${2:-}; shift 2 ;;
+    --event) EVENT_NAME=${2:-}; shift 2 ;;
+    --block) BLOCK=${2:-}; shift 2 ;;
+    --raw) RAW=1; shift ;;
+    *) shift ;;
+  esac
+done
+
+# Cursor blocks the action when a permission hook prints nothing or invalid JSON.
+# Answer allow on every exit, even when tracing is off or this script fails.
+if [ "$BLOCK" = "cursor" ]; then
+  case $EVENT_NAME in
+    preToolUse|subagentStart) trap 'printf "%s\n" "{\"permission\":\"allow\"}"; exit 0' EXIT INT TERM ;;
+    sessionStart)
+      # Cursor sets CURSOR_PLUGIN_ROOT right only for sessionStart. Later hooks read the root from this session variable.
+      PLUGIN_ROOT_DIR=$(CDPATH= cd -- "$HERE_HOOK/../../.." 2>/dev/null && pwd) || PLUGIN_ROOT_DIR=
+      judgment_json_escape "$PLUGIN_ROOT_DIR"
+      PLUGIN_ROOT_JSON=$JR
+      trap 'printf "%s\n" "{\"env\":{\"JUDGMENT_PLUGIN_ROOT\":\"$PLUGIN_ROOT_JSON\"}}"; exit 0' EXIT INT TERM
+      ;;
+  esac
+fi
+judgment_tracing_off && exit 0
+
+payload=$(cat) || exit 0
+[ -n "$payload" ] || exit 0
+
+judgment_field "$payload" cwd
+if [ -z "$JR" ]; then
+  # Cursor sends workspace_roots, not cwd, and the desktop app runs most hooks outside the project.
+  case $payload in
+    *'"workspace_roots":'*)
+      JR=${payload#*'"workspace_roots":'}
+      JR=${JR#"${JR%%[!][ ]*}"}
+      case $JR in
+        '"'*) JR=${JR#\"}; JR=${JR%%\"*} ;;
+        *) JR= ;;
+      esac
+      ;;
+  esac
+fi
+judgment_project_root "$JR" || exit 0
+root=$JR
+opt="$root/.judgment/tracing.json"
+
+session_id=
+for field in session_id parent_conversation_id conversation_id; do
+  judgment_field "$payload" "$field" && [ -n "$JR" ] && { session_id=$JR; break; }
+done
+[ -n "$session_id" ] || exit 0
+
+if [ -n "${JUDGMENT_STATE_DIR:-}" ]; then
+  STATE=$JUDGMENT_STATE_DIR
+elif [ -n "${XDG_STATE_HOME:-}" ]; then
+  STATE=$XDG_STATE_HOME/judgment
+else
+  STATE=${HOME}/.local/state/judgment
+fi
+
+sha() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    JR=$(printf '%s' "$1" | sha256sum)
+  else
+    JR=$(printf '%s' "$1" | shasum -a 256)
+  fi
+  JR=${JR%% *}
+  JR=$(printf '%.32s' "$JR")
+}
+
+# Ids come from agent payloads. Use one as a file name only when it is plainly safe.
+case $session_id in
+  *[!A-Za-z0-9._-]*|.|..) sha "$session_id"; sid=$JR ;;
+  *) sid=$session_id ;;
+esac
+mode=""
+if [ -f "$STATE/sessions/$sid" ]; then
+  read -r mode < "$STATE/sessions/$sid" || true
+fi
+
+STAMP=""
+# The env wins. A credentials file fills only what the env left empty, as the flusher reads it. The key is never written out.
+if [ -z "${JUDGMENT_API_KEY:-}" ] || [ -z "${JUDGMENT_PROJECT_ID:-}" ] || [ -z "${JUDGMENT_ORG_ID:-}" ] || [ -z "${JUDGMENT_API_URL:-}" ]; then
+  if [ -n "${JUDGMENT_CONFIG_DIR:-}" ]; then
+    credfile=$JUDGMENT_CONFIG_DIR/credentials
+  elif [ -n "${XDG_CONFIG_HOME:-}" ]; then
+    credfile=$XDG_CONFIG_HOME/judgment/credentials
+  else
+    credfile=${HOME}/.config/judgment/credentials
+  fi
+  if [ -f "$credfile" ]; then
+    while IFS= read -r credline || [ -n "$credline" ]; do
+      case $credline in
+        \#*|"") continue ;;
+        *=*) ;;
+        *) continue ;;
+      esac
+      credkey=${credline%%=*}
+      credkey=${credkey%"${credkey##*[![:space:]]}"}
+      credkey=${credkey##*[[:space:]]}
+      credval=${credline#*=}
+      credval=${credval#"${credval%%[![:space:]]*}"}
+      credval=${credval%"${credval##*[![:space:]]}"}
+      case $credval in
+        \"*\") credval=${credval#\"}; credval=${credval%\"} ;;
+        \'*\') credval=${credval#\'}; credval=${credval%\'} ;;
+      esac
+      case $credkey in
+        JUDGMENT_API_KEY) [ -n "${JUDGMENT_API_KEY:-}" ] || JUDGMENT_API_KEY=$credval ;;
+        JUDGMENT_PROJECT_ID) [ -n "${JUDGMENT_PROJECT_ID:-}" ] || JUDGMENT_PROJECT_ID=$credval ;;
+        JUDGMENT_ORG_ID) [ -n "${JUDGMENT_ORG_ID:-}" ] || JUDGMENT_ORG_ID=$credval ;;
+        JUDGMENT_API_URL) [ -n "${JUDGMENT_API_URL:-}" ] || JUDGMENT_API_URL=$credval ;;
+      esac
+    done < "$credfile"
+  fi
+fi
+if [ -n "${JUDGMENT_API_KEY:-}" ] && [ -n "${JUDGMENT_PROJECT_ID:-}" ]; then
+  # Only the fingerprint is recorded. The flusher sends a turn only with the key it came from.
+  sha "$JUDGMENT_API_KEY"
+  STAMP=",\"export_fp\":\"$JR\""
+  for pair in "export_project=$JUDGMENT_PROJECT_ID" "export_url=${JUDGMENT_API_URL:-https://api.judgmentlabs.ai}" "export_org=${JUDGMENT_ORG_ID:-}"; do
+    value=${pair#*=}
+    [ -n "$value" ] || continue
+    case $value in
+      *\\*|*'"'*) judgment_json_escape "$value"; value=$JR ;;
+    esac
+    STAMP="$STAMP,\"${pair%%=*}\":\"$value\""
+  done
+fi
+
+emit_block() {
+  judgment_json_escape "$1"
+  case $BLOCK in
+    claude) printf '%s\n' "{\"decision\":\"block\",\"reason\":\"$JR\",\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"suppressOriginalPrompt\":true}}" ;;
+    codex) printf '%s\n' "{\"decision\":\"block\",\"reason\":\"$JR\"}" ;;
+    cursor) printf '%s\n' "{\"continue\":false,\"user_message\":\"$JR\"}" ;;
+  esac
+}
+
+INBOX=$STATE/inbox
+n=0
+flush=0
+# One file per event: concurrent hooks never share a file, so no lock and no torn lines.
+record() {
+  line=$1
+  judgment_field "$line" kind
+  if [ "$JR" = command ]; then
+    judgment_field "$line" name; name=$JR
+    msg=$("$HERE_HOOK/judgment-session" "$name" --cwd "$root" --session "$session_id" 2>/dev/null || true)
+    emit_block "$msg"
+    return 0
+  fi
+  judgment_field "$line" event || return 0
+  case $JR in
+    turn_end|session_end|subagent_start|subagent_end) flush=1 ;;
+  esac
+  # A child's event can arrive after its parent turn was sent. Wake the flusher to send the turn again.
+  case $line in
+    *'"agent_id":"'?*) flush=1 ;;
+  esac
+  case $line in
+    *'"export_fp":'*) ;;
+    *) line="${line%?}${STAMP}}" ;;
+  esac
+  [ -d "$INBOX" ] || mkdir -p "$INBOX" || return 0
+  set -C
+  while ! { printf '%s\n' "$line" > "$INBOX/$$.$n.json"; } 2>/dev/null; do
+    # Retry only a name another hook already took. Any other failure drops the event.
+    [ -e "$INBOX/$$.$n.json" ] && [ "$n" -lt 20 ] || { set +C; return 0; }
+    n=$((n + 1))
+  done
+  set +C
+  n=$((n + 1))
+}
+
+# jq reads the payload from a here-document, one fork fewer than a pipe, and the key from its
+# environment, never from argv, so redaction can replace the key's value wherever it appears.
+prepare() {
+  JUDGMENT_API_KEY=${JUDGMENT_API_KEY:-} jq -L "$HERE_HOOK" -c --slurpfile cfg "$opt" --arg mode "$mode" --arg root "$root" --arg model "" "$@" <<JUDGMENT_PAYLOAD
+$payload
+JUDGMENT_PAYLOAD
+}
+
+if [ "$RAW" -eq 1 ] && ! command -v jq >/dev/null 2>&1; then
+  # Without jq nothing can redact. Record the event's ids and times, and none of its text.
+  compact=$(tr -d '[:space:]' < "$opt")
+  case $compact in
+    '{'*'}') ;;
+    *) exit 0 ;;  # empty or cut off: no opt-in
+  esac
+  case $compact in
+    *'"enabled":false'*) exit 0 ;;
+  esac
+  [ -n "$mode" ] || case $compact in
+    *'"sessionDefault":"off"'*) mode=off ;;
+    *) mode=on ;;
+  esac
+  [ "$mode" = "on" ] || exit 0
+  judgment_json_escape "$root"
+  line="{\"v\":1,\"capture\":\"sanitized\",\"redaction_error\":true,\"project_root\":\"$JR\",\"environment\":\"production\""
+  for field in harness event session_id turn_id agent_id agent_type tool_name tool_call_id model provider; do
+    judgment_field "$payload" "$field" || continue
+    case $JR in
+      *[!A-Za-z0-9._:@/+\ -]*) continue ;;
+    esac
+    line="$line,\"$field\":\"$JR\""
+  done
+  for field in ts start_ts end_ts; do
+    case $payload in
+      *"\"$field\":"[0-9]*) value=${payload#*"\"$field\":"} ;;
+      *"\"$field\": "[0-9]*) value=${payload#*"\"$field\": "} ;;
+      *) continue ;;
+    esac
+    value=${value%%[!0-9]*}
+    [ -n "$value" ] && line="$line,\"$field\":$value"
+  done
+  record "$line}"
+elif [ "$RAW" -eq 1 ]; then
+  mapped=$(prepare 'include "prepare"; judgment_prepare($cfg[0]; $mode; $root; $model)') || exit 0
+  [ -n "$mapped" ] && record "$mapped"
+else
+  command -v jq >/dev/null 2>&1 || exit 0
+  if [ -n "$MAP" ]; then
+    mapped=$(prepare --arg event "$EVENT_NAME" -f "$MAP") || exit 0
+  else
+    mapped=$(prepare 'include "prepare"; judgment_prepare($cfg[0]; $mode; $root; $model)') || exit 0
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] && record "$line"
+  done <<EOF
+$mapped
+EOF
+fi
+
+[ "$flush" -eq 1 ] && [ "${JUDGMENT_FLUSH:-}" != "0" ] || exit 0
+CORE=${HERE_HOOK%/*}
+PYTHONPATH="$CORE${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+if command -v setsid >/dev/null 2>&1; then
+  setsid python3 -m judgment_core.flush >>"$STATE/flush.log" 2>&1 </dev/null &
+  sender=$!
+  # An agent can kill this process group the moment the hook returns. Return only once the sender
+  # is in its own session: builtin reads of /proc, no fork, and never more than a few ms.
+  if read -r own < "/proc/$$/stat" 2>/dev/null; then
+    set -- ${own##*) }
+    own=$4
+    tries=0
+    while [ "$tries" -lt 300 ] && read -r stat < "/proc/$sender/stat" 2>/dev/null; do
+      set -- ${stat##*) }
+      [ "$4" = "$own" ] || break
+      tries=$((tries + 1))
+    done
+  fi
+else
+  python3 -m judgment_core.flush >>"$STATE/flush.log" 2>&1 </dev/null &
+fi
+exit 0
