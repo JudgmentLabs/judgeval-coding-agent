@@ -6,12 +6,14 @@
 # reads the same source, and its functions mirror the steps below (tests/test_redact.py checks they agree).
 #
 # Redaction: one blob of every string and key in the event's text fields gives the pairs (found text, replacement, rule):
-# env values, then each rule, every one matched against the unchanged blob, one pair per found text, longest first.
-# Members under secret keys are found in the fields' JSON. Each field then gets its members, then the pairs, replaced as
-# literals in its JSON; every replacement is counted into records {rule, field, count}, carried on the event as
-# `redactions`. Literals need no offsets in the replacing, and one pass over the JSON reaches every string and key at any
-# depth. When two keys of one object would become the same placeholder (the field has fewer members after), the field
-# is redone with every replacement numbered (#1, #2, ...), so no member is lost.
+# env values, then each rule, every one a complete match on the unchanged blob, one pair per found text, longest first.
+# Members under secret keys are found in the fields' JSON as "key":"value", made exact with the closing quote. Each field
+# then gets its members, then the pairs, replaced as literals in its JSON, when every pair can only sit inside a string
+# there (no quote; a character no number, true, false, null, or punctuation holds): so a replacement never touches a
+# number or the syntax. Otherwise the pairs are replaced in each string value. Every replacement is counted into records
+# {rule, field, count}, carried on the event as `redactions`. When two keys of one object would become the same
+# placeholder (the field has fewer members after), the field is redone with every replacement numbered (#1, #2, ...), so
+# no member is lost. A found text still there afterwards (it spanned two strings of the blob) fails the event closed.
 #
 # jq compiles this on every hook run, on the agent's critical path, at about 1.5 microseconds per instruction: so no
 # recursive walker, and only C builtins or tiny definitions (no any, first-of-many, test, gsub, to_entries, paths,
@@ -28,6 +30,10 @@ def jp_test($re): _match_impl($re; null; true);
 def jp_holds($needs): . as $t | $needs == null or ([$needs[] as $n | $t | contains($n) | if . then 1 else empty end] != []);
 # Split at each of the literals: the pieces, one per line.
 def jp_lines($at): reduce $at[] as $c (.; split($c) | jp_join("\n"));
+# Every string and key, in order, one per line: the blob rules run over.
+def jp_blob: [.. | if type == "string" then . elif type == "object" then keys_unsorted[] else empty end] | jp_join("\n");
+# How many members the value's objects hold in all.
+def jp_size: [.. | objects | length] | add;
 # Only the fields in $set.
 def jp_pick($set): . as $e | reduce (keys_unsorted[] | if $set[.] then . else empty end) as $k ({}; . + {($k): $e[$k]});
 # tool_calls as their ids, and their names when $names: a name is free-form text.
@@ -43,27 +49,28 @@ def jp_count($pairs; $ord):
              else $s | jp_join($x[1]) end),
             (.[1] | setpath([$x[2]]; .[$x[2]] + ($s | length) - 1)), .[2] + ($s | length) - 1]
       end);
-# A window's matches, leftmost first, each one's copies blanked to the same length before the next search: one search per
-# distinct match, so a secret repeated thousands of times costs one search, not a global match whose offsets jq counts
-# from the start of the string for every copy. An empty match (a user regex) falls back to the global match.
+# A window's matches, leftmost first, one search per distinct match: a secret repeated thousands of times costs one search,
+# not a global match whose offsets jq counts from the start of the string for every copy. After each match, only its copies
+# followed by the character that ended it are blanked (to the same length, that character kept): a copy followed by anything
+# else may start a longer credential, which a later search then finds whole. A match that ends the window is the last one.
+# An empty match (a user regex) falls back to the global match.
 def jp_scan($re; $budget):
   if $budget < 0 then error("redaction limit") else
     _match_impl($re; null; false)[0] as $m
     | if $m == null then empty
       elif $m.length == 0 then _match_impl($re; "g"; false)[] | if .length > 0 then . else empty end
-      else $m, (split($m.string) | jp_join("\u0001" * $m.length) | jp_scan($re; $budget - 1)) end
+      else $m, (($m.offset + $m.length) as $e | .[$e:$e + 1] as $c
+                | if $c == "" then empty else split($m.string + $c) | jp_join("\u0001" * $m.length + $c) | jp_scan($re; $budget - 1) end) end
   end;
 # Each distinct complete match of rule $p on the unchanged text, as [found, kept group + placeholder, rule], sorted.
-# Windows: see limits in redact-rules.json. A match that reaches the end of a window that is not the last is left to the
-# next window, which holds it from its start; one that starts before the next window does fails closed.
+# Windows: see limits in redact-rules.json. Each window is matched as it is in the text, so every match is a complete span.
+# A match that reaches the end of a window that is not the last is left to the next window, which holds it from its start;
+# one that starts before the next window does fails closed.
 def jp_found($p; $l):
   . as $t
   | (if $p.whole or length <= $l.window then 1 else ((length - $l.window) / $l.step | ceil) + 1 end) as $k
-  # A window is matched after every complete match found before it is blanked in it to the same length, so a secret
-  # that repeats is matched once, not once per copy, and every offset stays where it was.
   | reduce range(0; $k) as $i ([];
-      . as $found
-      | (if $k == 1 then $t else reduce $found[] as $x ($t[$i * $l.step:$i * $l.step + $l.window]; split($x[0]) | jp_join("\u0001" * ($x[0] | length))) end) as $w
+      (if $k == 1 then $t else $t[$i * $l.step:$i * $l.step + $l.window] end) as $w
       # A short window: one global match, one regex compile, and few enough matches that their offsets cost little. A long
       # one: the scan, so a secret repeated thousands of times costs one search.
       | (. + [$w | if length <= $l.dense
@@ -101,7 +108,7 @@ def jp_sensitive($c; $r):
         else "" end)) as $words
   | first(
       ($s.paths[], ($c.redactPaths // [] | .[]? | if type == "string" and . != "" then
-          {id: "custom_path", re: ("(?<![^\\n/])" + ([explode[] | [.] | implode | $s.glob[.] // .] | jp_join("")) + "(?![^\\n])")} else empty end)
+          {id: "custom_path", re: ("(?<![^\\n/:])" + ([explode[] | [.] | implode | $s.glob[.] // .] | jp_join("")) + "(?![^\\n])")} else empty end)
        | . as $p | if ($words | jp_holds($p.needs)) and ($words | jp_test($p.re)) then
            {rule: $p.id, trigger: ($words | _match_impl("(?<![^\\n])[^\\n]*?(?:" + $p.re + ")[^\\n]*"; null; false)[0].string)} else empty end),
       ($s.commands[] | . as $p | if ($cmds | jp_holds($p.needs)) and ($cmds | jp_test($p.re)) then {rule: $p.id, trigger: ("cmd:" + $p.id)} else empty end),
@@ -110,7 +117,7 @@ def jp_sensitive($c; $r):
 def jp_scrub($c; $r):
   . as $ev
   | (reduce (keys_unsorted[] | if $r.fields.plain[.] then empty else . end) as $k ({}; . + {($k): $ev[$k]})) as $sub
-  | ([$sub | .. | if type == "string" then . elif type == "object" then keys_unsorted[] else empty end] | jp_join("\n")) as $text
+  | ($sub | jp_blob) as $text
   | ([$ENV | keys_unsorted[] as $k | $ENV[$k] | (., (if contains("\n") then split("\n")[] | rtrimstr("\r") else empty end))
       | if length >= $r.env.min_length and (. as $v | $text | contains($v)) and jp_test("\\S") then [., $k] else empty end]
      | ([.[][1]] | unique | jp_join("\n") | [_match_impl($r.env.name_re; "g"; false)[] | {(.string): true}] | add) as $secret
@@ -118,20 +125,35 @@ def jp_scrub($c; $r):
      | unique | sort_by(-(.[0] | length), .[1])) as $env
   | ($env + ($text | jp_pairs($r.patterns + [$c.redactPatterns // [] | .[]? | if type == "string" and . != "" then {id: "custom", re: .} else empty end]; $r.limits))
      | unique_by(.[0]) | sort_by(-(.[0] | length))) as $pairs
-  | ([$sub[]] | tojson | jp_pairs($r.members; $r.limits)) as $members
+  # A member's text "key":"value is made exact with its closing quote: it is replaced only where it is that whole member.
+  | ([$sub[]] | tojson | [jp_pairs($r.members; $r.limits)[] | [.[0] + "\"", .[1] + "\"", .[2]]]) as $members
   | if ($pairs | length) + ($members | length) > $r.limits.pairs then error("redaction limit")
     elif $pairs == [] and $members == [] then .
     else
       [$pairs[] | [(.[0] | tojson | .[1:-1]), (.[1] | tojson | .[1:-1]), .[2]]] as $jpairs
+      # The pairs are replaced in each field's JSON text only when every one of them can sit nowhere but inside a string:
+      # no quote, and a character no number, true, false, null, or punctuation holds. Otherwise they are replaced in each
+      # string value, one by one, and a key that holds one fails closed below.
+      | ([$jpairs[] | .[0] | if contains("\"") or jp_test("^[-+.0-9eEtrufalsn{}\\[\\],:]*$") then 1 else empty end] == []) as $in_text
       | reduce ($sub | keys_unsorted[]) as $k ([., []];
-          ($sub[$k] | [.. | objects | length] | add) as $size
+          ($sub[$k] | jp_size) as $size
           | ([($sub[$k] | tojson), {}, 0] | jp_count($members; false)) as $m
-          | ($m | jp_count($jpairs; false) | [(.[0] | fromjson), .[1]]
-             # Two keys redacted to one name would lose a member: number every replacement in this field instead.
-             | if (.[0] | [.. | objects | length] | add) == $size then . else $m | jp_count($jpairs; true) | [(.[0] | fromjson), .[1]]
-               | if (.[0] | [.. | objects | length] | add) == $size then . else error("redaction limit") end end) as $d
+          | (if $in_text then
+               $m | jp_count($jpairs; false) | [(.[0] | fromjson), .[1]]
+               # Two keys redacted to one name would lose a member: number every replacement in this field instead.
+               | if (.[0] | jp_size) == $size then . else $m | jp_count($jpairs; true) | [(.[0] | fromjson), .[1]]
+                 | if (.[0] | jp_size) == $size then . else error("redaction limit") end end
+             else
+               [($m[0] | fromjson), $m[1]]
+               | reduce path(.[0] | .. | strings) as $p (.; ([getpath($p), .[1], 0] | jp_count($pairs; false)) as $y | setpath($p; $y[0]) | setpath([1]; $y[1]))
+             end) as $d
           | [(.[0] | setpath([$k]; $d[0])), .[1] + [$d[1] | keys_unsorted[] as $rule | {rule: $rule, field: $k, count: $d[1][$rule]}]])
-      | .[0] + (if .[1] == [] then {} else {redactions: (.[1] | sort_by(.field, .rule))} end)
+      | .[0] as $out | .[1] as $recs
+      # A found text still there spanned two strings (the blob joins them with a newline), or sits in a key the string pass
+      # does not reach: fail closed.
+      | ($out | jp_pick($sub) | jp_blob) as $after
+      | if [$pairs[] | .[0] as $f | $after | contains($f) | if . then 1 else empty end] != [] then error("redaction limit") else . end
+      | $out + (if $recs == [] then {} else {redactions: ($recs | sort_by(.field, .rule))} end)
     end;
 # The sanitized event with its records. When a rule fails (an invalid user regex, a limit), only what is never redacted,
 # without labels or tool names: never the raw text.

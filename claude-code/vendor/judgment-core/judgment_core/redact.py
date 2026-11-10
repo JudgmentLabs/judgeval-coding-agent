@@ -15,8 +15,10 @@ Everything is plain data through pure stages:
     sensitive      the sensitive path or env dump a tool call names, as {rule, trigger}, or None
     pairs          the blob of every string and key -> Pair(found, replacement, rule), all found on the
                    unchanged blob, one per distinct found text, longest first
-    scrub_fields   the pairs, and the secret-key members, applied to each field; a Counter of what was
-                   replaced, by rule
+    scrub_fields   the secret-key members (exact "key":"value" tokens), then the pairs, applied to each field:
+                   in its JSON when every pair can only sit inside a string there, else to each string value,
+                   so no number or JSON syntax is ever touched; a Counter of what was replaced, by rule. A found
+                   text still there afterwards fails closed
     records        [{rule, field, count}]: the audit, carried on the event as ``redactions``
     turn_redaction the turn's audit record, and why it was blanked
 
@@ -69,7 +71,8 @@ def generated(table: Mapping | None = None) -> dict[str, str]:
     # A name is the whole key, or its end after a separator or a camelCase boundary.
     name = "(?:(?:[A-Za-z0-9_.-]{0,64}?(?:[_.-]|(?<=[a-z0-9])(?=[A-Z])))?(?:" + names + ")|" + whole + ")"
     lit = table["literals"]
-    refs = "(?:" + "|".join(lit["refs"]) + ")(?:[^\"\\\\]|\\\\.)*"
+    # Each ref is a complete grammar: the value must be one reference and nothing else (literal text after it is a literal).
+    refs = "(?:" + "|".join(lit["refs"]) + ")"
     words = "|".join(case for word in lit["words"] for case in _cases(word))
     literal = "(?:" + refs + "|" + words + "|" + "|".join(lit["forms"]) + ")"
     last = "|".join(dict.fromkeys(case for word in keys["names"] + keys["whole"] for case in _cases(word.split("_")[-1])))
@@ -242,7 +245,7 @@ class Ruleset:
 def glob_re(glob: str) -> str:
     """Mirror of prepare.jq: a redactPaths glob, one character at a time through the table's glob map."""
     table = rules()["sensitive"]["glob"]
-    return "(?<![^\\n/])" + "".join(table.get(char, char) for char in glob) + "(?![^\\n])"
+    return "(?<![^\\n/:])" + "".join(table.get(char, char) for char in glob) + "(?![^\\n])"
 
 
 def ruleset(project: Mapping | None = None) -> Ruleset:
@@ -321,8 +324,13 @@ def windows(text: str) -> list[tuple[int, str, bool]]:
 
 
 def scan(pattern: re.Pattern, window: str, budget: int) -> list[re.Match]:
-    """Mirror of jp_scan: matches leftmost first, each one's copies blanked to the same length before the next search.
-    An empty first match falls back to every nonempty match."""
+    """Mirror of jp_scan: matches leftmost first, one search per distinct match.
+
+    After each match, only its copies followed by the character that ended it are blanked (to the same length, that
+    character kept). A copy followed by anything else may be the start of a longer credential, so it stays for a later
+    search to find whole: no copy inside a longer match is ever masked on its own. A match that ends the window is the
+    last one. An empty first match falls back to every nonempty match.
+    """
     out: list[re.Match] = []
     while True:
         if len(out) > budget:
@@ -333,14 +341,19 @@ def scan(pattern: re.Pattern, window: str, budget: int) -> list[re.Match]:
         if not match.group(0):
             return out + [item for item in pattern.finditer(window) if item.group(0)]
         out.append(match)
-        window = window.replace(match.group(0), "\x01" * len(match.group(0)))
+        end = window[match.end() : match.end() + 1]
+        if not end:
+            return out
+        window = window.replace(match.group(0) + end, "\x01" * len(match.group(0)) + end)
 
 
 def found(rule: Rule, text: str) -> list[Pair]:
     """Mirror of jp_found: each distinct complete match of the rule on the unchanged text, with what it becomes.
 
-    A match that reaches the end of a window that is not the last is left to the next window, which holds it from
-    its start; one that starts before the next window does is longer than window - step and fails closed.
+    Each window is matched as it is in the text: nothing found in an earlier window is masked first, so every match
+    is a complete span of the unchanged text. A match that reaches the end of a window that is not the last is left to
+    the next window, which holds it from its start; one that starts before the next window does is longer than
+    window - step and fails closed.
     """
     limits = rules()["limits"]
     # jq keeps the first named group's text when it is p. Oniguruma does not count unnamed groups once a group is named.
@@ -352,12 +365,8 @@ def found(rule: Rule, text: str) -> list[Pair]:
         parts = [(0, text, True)]
     else:
         parts = windows(text)
-    hits: list[Pair] = []
+    hits: set[Pair] = set()
     for _start, window, last in parts:
-        # As jq: every complete match found before is blanked to the same length first, so a repeat is matched once.
-        for pair in hits:
-            window = window.replace(pair.found, "\x01" * len(pair.found))
-        new: dict[Pair, None] = {}
         # As jq: a short window, one global match; a long one, the scan.
         if len(window) <= limits["dense"]:
             matches = [item for item in rule.pattern.finditer(window) if item.group(0)]
@@ -368,11 +377,10 @@ def found(rule: Rule, text: str) -> list[Pair]:
                 if match.start() < limits["step"]:
                     raise RedactionLimit(rule.id)
                 continue
-            new[Pair(match.group(0), ((match.group("p") or "") if keep else "") + placeholder(rule.id), rule.id)] = None
-        hits = sorted(set(hits) | set(new))
+            hits.add(Pair(match.group(0), ((match.group("p") or "") if keep else "") + placeholder(rule.id), rule.id))
         if len(hits) > limits["pairs"]:
             raise RedactionLimit(rule.id)
-    return hits
+    return sorted(hits)
 
 
 def _order(pairs: Iterable[Pair]) -> list[Pair]:
@@ -432,43 +440,82 @@ def member_pairs(fields: Mapping[str, Any], rs: Ruleset) -> list[Pair]:
     return _order(pair for rule in rs.members if rule.applies(text) for pair in found(rule, text))
 
 
+_OUTSIDE_STRING = re.compile(r"[-+.0-9eEtrufalsn{}\[\],:]*")
+
+
+def in_text(json_pairs: list[Pair]) -> bool:
+    """Mirror of prepare.jq: whether every pair, as JSON escapes it, can sit nowhere in compact JSON but inside a string.
+    It holds no quote, and a character no number, true, false, null, or punctuation holds."""
+    return not any('"' in pair.found or _OUTSIDE_STRING.fullmatch(pair.found) for pair in json_pairs)
+
+
 def _size(value: Any) -> int:
     """Mirror of jq's [.. | objects | length] | add: how many members the value's objects hold in all."""
     return sum(len(obj) for obj in _objects(value))
 
 
+def _strings(value: Any, pairs: list[Pair], counts: Counter) -> Any:
+    """Mirror of prepare.jq's string pass: each string value gets the pairs; keys, numbers, and the rest stay."""
+    if isinstance(value, str):
+        return apply_counted(value, pairs, counts)
+    if isinstance(value, list):
+        return [_strings(item, pairs, counts) for item in value]
+    if isinstance(value, dict):
+        return {key: _strings(item, pairs, counts) for key, item in value.items()}
+    return value
+
+
+def _loads(text: str) -> Any:
+    """As jq's fromjson inside its try: JSON a replacement broke fails closed, like any limit."""
+    try:
+        return json.loads(text)
+    except ValueError as exc:
+        raise RedactionLimit("json") from exc
+
+
 def scrub_fields(fields: Mapping[str, Any], rs: Ruleset, secrets: list[tuple[str, str]]) -> tuple[dict, list[dict]]:
     """Mirror of prepare.jq: the fields scrubbed together, and the records of what was replaced in each.
 
-    One blob of every string and key gives the pairs. Then each field: its secret-key members, its keys (rekeyed
-    without collisions, when a key holds a found text), and its strings. A field's name is never a member or a key.
+    One blob of every string and key gives the pairs, each a complete match on the unchanged blob. The compact JSON of
+    the fields gives the secret-key members as exact "key":"value" tokens. Then each field: its members, then the pairs,
+    replaced in its JSON when every pair can only sit inside a string there (``in_text``), so no number or syntax is
+    touched; otherwise the pairs go to each string value. Two keys that would become one are numbered instead. A found
+    text still there afterwards (it spanned two strings of the blob, or sits in a key the string pass does not reach)
+    fails closed. A field's name is never a member or a key.
     """
     if rs.error:
         raise RedactionLimit("rules")
     blob = "\n".join(blob_items(dict(fields)))
     found_pairs = pairs(blob, rs, secrets)
-    members = member_pairs(fields, rs)
+    members = [Pair(pair.found + '"', pair.replacement + '"', pair.rule) for pair in member_pairs(fields, rs)]
     if len(found_pairs) + len(members) > rules()["limits"]["pairs"]:
         raise RedactionLimit("pairs")
     if not found_pairs and not members:
         return dict(fields), []
     json_pairs = [Pair(jq_json(pair.found)[1:-1], jq_json(pair.replacement)[1:-1], pair.rule) for pair in found_pairs]
+    text = in_text(json_pairs)
     out: dict[str, Any] = {}
     records: list[dict] = []
     for field, value in fields.items():
         counts: Counter = Counter()
         # Member pairs were found in JSON text, so they apply to it as they are.
         after_members = apply_counted(jq_json(value), members, counts)
-        before = Counter(counts)
-        scrubbed = json.loads(apply_counted(after_members, json_pairs, counts))
-        if _size(scrubbed) != _size(value):
-            # Two keys of one object became one placeholder: number every replacement in this field instead.
-            counts = before
-            scrubbed = json.loads(apply_counted(after_members, json_pairs, counts, numbered=True))
+        if text:
+            before = Counter(counts)
+            scrubbed = _loads(apply_counted(after_members, json_pairs, counts))
             if _size(scrubbed) != _size(value):
-                raise RedactionLimit("keys")  # a key already named like a numbered placeholder: fail closed
+                # Two keys of one object became one placeholder: number every replacement in this field instead.
+                counts = before
+                scrubbed = _loads(apply_counted(after_members, json_pairs, counts, numbered=True))
+                if _size(scrubbed) != _size(value):
+                    raise RedactionLimit("keys")  # a key already named like a numbered placeholder: fail closed
+        else:
+            scrubbed = _strings(_loads(after_members), found_pairs, counts)
         out[field] = scrubbed
         records += [{"rule": rule, "field": field, "count": n} for rule, n in counts.items() if n and rule]
+    after = "\n".join(blob_items(out))
+    if any(pair.found in after for pair in found_pairs):
+        raise RedactionLimit("span")
     return out, sort_records(records)
 
 

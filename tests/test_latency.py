@@ -3,6 +3,12 @@
 The inputs come from the rules table: each rule's needed literals, repeated with the separators and value
 characters that would make an unbounded lookahead rescan the rest of the text, or a global match count
 offsets over and over. The layer-1 bound is for a whole jq run, startup included.
+
+The bounds catch catastrophic regressions (a rule that rescans, a quadratic match: seconds, not milliseconds) without
+flaking on a loaded machine: each case takes the best of up to three runs, and its bound is the larger of a fixed one
+and a multiple of what the same layer takes, at that moment, on a benign event of the same size (re-measured before a case
+is called slow). On an idle machine (2026-11) the worst case is 7.5x the benign one in jq (~90 ms) and 20x in Python
+(~200 ms): the bounds leave about 3x of room, and a load that slows everything scales the bound with it.
 """
 
 from __future__ import annotations
@@ -17,8 +23,13 @@ from support import CORE, clean_env
 from judgment_core import redact
 
 SIZE = 100_000
-JQ_MS = 100  # one jq run on one ~100 KB event, startup and compile included
-PY_MS = 250  # the sender's two passes (the hook's mirror, then its own) on the same event
+JQ_MS = 250  # one jq run on one ~100 KB event, startup and compile included
+PY_MS = 600  # the sender's two passes (the hook's mirror, then its own) and its sensitive check on the same event
+JQ_SCALE = 25  # x the benign jq run measured at the same time
+PY_SCALE = 60  # x the benign Python passes measured at the same time
+RUNS = 3
+PROGRAM = 'include "prepare"; judgment_prepare({enabled: true}; "on"; "/r"; "")'
+ENV = clean_env(SERVICE_TOKEN="Sv" + "9x" * 12)
 
 
 def fill(unit: str, size: int = SIZE) -> str:
@@ -55,40 +66,75 @@ def events(text: str) -> list[dict]:
             {**base, "event": "turn_start", "prompt": text}]
 
 
+def jq_once(data: str) -> tuple[float, subprocess.CompletedProcess]:
+    started = time.perf_counter()
+    result = subprocess.run(["jq", "-L", str(CORE / "bin"), "-c", PROGRAM], input=data, capture_output=True, text=True, env=ENV, timeout=60)
+    return (time.perf_counter() - started) * 1000, result
+
+
+def median(values: list[float]) -> float:
+    return sorted(values)[len(values) // 2]
+
+
+BENIGN = events(fill("hello world "))[0]  # the same size as the cases, matching no rule
+
+
+def jq_bound() -> float:
+    return max(JQ_MS, JQ_SCALE * median([jq_once(json.dumps(BENIGN))[0] for _ in range(5)]))
+
+
+def py_bound(rs, secrets) -> float:
+    def once() -> float:
+        started = time.perf_counter()
+        redact.sanitize_event(BENIGN, rs, secrets)
+        redact.redact_event(BENIGN, rs, secrets)
+        redact.first_sensitive([BENIGN], rs, secrets)
+        return (time.perf_counter() - started) * 1000
+
+    return max(PY_MS, PY_SCALE * median([once() for _ in range(5)]))
+
+
 class LatencyTests(unittest.TestCase):
     def test_python_layers(self):
         rs = redact.ruleset()
-        secrets = redact.env_secrets(clean_env(SERVICE_TOKEN="Sv" + "9x" * 12))
+        secrets = redact.env_secrets(ENV)
+        bound = py_bound(rs, secrets)
         slow = []
         for name, text in adversarial():
             for event in events(text):
-                started = time.perf_counter()
-                redact.sanitize_event(event, rs, secrets)
-                redact.redact_event(event, rs, secrets)
-                redact.first_sensitive([event], rs, secrets)
-                elapsed = (time.perf_counter() - started) * 1000
-                if elapsed > PY_MS:
-                    slow.append((name, event["event"], round(elapsed)))
+                best = None
+                for _ in range(RUNS):
+                    started = time.perf_counter()
+                    redact.sanitize_event(event, rs, secrets)
+                    redact.redact_event(event, rs, secrets)
+                    redact.first_sensitive([event], rs, secrets)
+                    elapsed = (time.perf_counter() - started) * 1000
+                    best = elapsed if best is None else min(best, elapsed)
+                    if best <= bound:
+                        break
+                if best > bound:
+                    bound = py_bound(rs, secrets)  # the machine may be busier now than when the bound was taken
+                if best > bound:
+                    slow.append((name, event["event"], round(best), round(bound)))
         self.assertEqual(slow, [])
 
     def test_jq_layer(self):
-        program = 'include "prepare"; judgment_prepare({enabled: true}; "on"; "/r"; "")'
+        bound = jq_bound()
         slow = []
         for name, text in adversarial():
             for event in events(text):
                 data = json.dumps(event)
                 best = None
-                for _ in range(2):  # the better of two runs, so a busy machine does not fail the test
-                    started = time.perf_counter()
-                    result = subprocess.run(["jq", "-L", str(CORE / "bin"), "-c", program], input=data, capture_output=True, text=True,
-                                            env=clean_env(SERVICE_TOKEN="Sv" + "9x" * 12), timeout=30)
-                    elapsed = (time.perf_counter() - started) * 1000
+                for _ in range(RUNS):
+                    elapsed, result = jq_once(data)
+                    self.assertEqual(result.returncode, 0, result.stderr)
                     best = elapsed if best is None else min(best, elapsed)
-                    if elapsed <= JQ_MS:
+                    if best <= bound:
                         break
-                self.assertEqual(result.returncode, 0, result.stderr)
-                if best > JQ_MS:
-                    slow.append((name, event["event"], round(best)))
+                if best > bound:
+                    bound = jq_bound()
+                if best > bound:
+                    slow.append((name, event["event"], round(best), round(bound)))
         self.assertEqual(slow, [])
 
     def test_limits_fail_closed(self):
