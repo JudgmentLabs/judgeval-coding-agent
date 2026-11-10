@@ -36,6 +36,7 @@ import socket
 import time
 import urllib.error
 import urllib.request
+from typing import Iterable
 from pathlib import Path
 
 from judgment_core import redact
@@ -406,6 +407,11 @@ class _Redactor:
         return self._secrets
 
     @property
+    def names(self) -> set[str]:
+        """The secret env names this process holds a value for."""
+        return {name for name, _value in self.secrets}
+
+    @property
     def home(self) -> str:
         return str(self.env.get("HOME") or "")
 
@@ -431,7 +437,7 @@ def _sanitize(state: Path, key: str, item: dict, events: list[dict], prepared: l
     """
     rs = redactor.rules(events)
     blank = item.get("blanked") or redact.first_sensitive(prepared, rs, redactor.secrets, redactor.home)
-    prepared = [redact.redact_event(event, rs, redactor.secrets) for event in carry_records(events, prepared)]
+    prepared = [redact.redact_event(event, rs, redactor.secrets) for event in carry_records(events, prepared, redactor.names)]
     stored = [redact.redact_event(event, rs, redactor.secrets) for event in events]
     if blank:
         item["blanked"] = blank
@@ -444,19 +450,41 @@ def _sanitize(state: Path, key: str, item: dict, events: list[dict], prepared: l
     return prepared, blank
 
 
-def carry_records(stored: list[dict], prepared: list[dict]) -> list[dict]:
-    """The enriched events, each with the records its stored event carried for the fields enrichment left as they were.
+def carry_records(stored: list[dict], prepared: list[dict], names: Iterable[str] | None = None) -> list[dict]:
+    """The enriched events, each with the records its stored event carried for the fields enrichment left as they were,
+    and the hook's text kept wherever this process cannot redact the transcript text that would replace it.
 
     Enrichment can replace a field with transcript text (a tool's output) or build new events. A record describes the
     text it was counted in, so a replaced field's records go; the sender counts what it replaces in the new text.
+
+    Env values are the one rule input a process may not share: the hook redacted with its agent's environment, and the
+    sender that reads the queue may have been started by another agent. So (``names``: the secret env names this
+    process holds; None skips the second step):
+      - a field the hook redacted an env value in keeps the hook's sanitized text, whatever the transcript says;
+      - when the hook redacted an env value this process does not hold, no transcript text is kept at all: a changed
+        or added text field goes back to the hook's text or is dropped, and an event built from the transcript alone
+        loses its text. The env value may be anywhere in the transcript, and nothing here could find it.
     """
     by_id = {event["_id"]: event for event in stored if event.get("_id")}
+    hook_env = {item["rule"][4:] for event in stored for item in redact.census(event) if item["rule"].startswith("env:")}
+    missing = bool(hook_env - set(names)) if names is not None else False
     seen: set[str] = set()
     out = []
     for event in prepared:
         base = by_id.get(event.get("_id")) if event.get("_id") not in seen else None
         if event.get("_id"):
             seen.add(event["_id"])
+        event = dict(event)
+        if base is not None:
+            env_fields = {item["field"] for item in redact.census(base) if item["rule"].startswith("env:")}
+            for field in env_fields | (set(event) | set(base) if missing else set()):
+                if (field in env_fields or redact.field_class(field)["redact"]) and event.get(field) != base.get(field):
+                    if field in base:
+                        event[field] = base[field]
+                    else:
+                        event.pop(field, None)
+        elif missing:
+            event = redact.strip_text(event)
         carried = [item for item in redact.census(base) if event.get(item["field"]) == base.get(item["field"])] if base else []
         event = {key: value for key, value in event.items() if key != "redactions"}
         out.append({**event, "redactions": carried} if carried else event)
@@ -591,7 +619,7 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
             rs = redactor.rules(events)
             if capture == "metadata":
                 # Transcript enrichment has already run, so this is what gets sent and kept.
-                prepared = [redact.metadata_event(event, rs, redactor.secrets) for event in carry_records(events, prepared)]
+                prepared = [redact.metadata_event(event, rs, redactor.secrets) for event in carry_records(events, prepared, redactor.names)]
             elif capture == "sanitized":
                 prepared, blank = _sanitize(state, key, item, events, prepared, redactor)
             # A blanked or metadata turn is no later turn's context. Nor is one whose rules failed.
