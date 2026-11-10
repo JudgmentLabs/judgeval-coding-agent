@@ -10,7 +10,7 @@ sink. Hermes runs with ``hermes chat -q`` (one-shot) and only PATH, HOME, HERMES
 the dummy Judgment settings in its env, so no real key reaches it.
 
 What is mocked: the model provider (scripted replies, fixed token counts) and the Judgment API.
-What is real: Hermes 0.19.x, its plugin loader, hook firing, read_file and delegate_task tools,
+What is real: Hermes (0.19.x to 0.21.3), its plugin loader, hook firing, read_file and delegate_task tools,
 the plugin, the vendored core, and the detached sender.
 """
 
@@ -277,6 +277,14 @@ class RealHermes(unittest.TestCase):
                         break
             return re.sub(r"\x1b\[[0-9;?]*[ a-zA-Z]|\x1b\][^\x07]*\x07|\r", "", out.decode(errors="replace"))
 
+        def submit(fd: int, line: str, seconds: float) -> str:
+            """Type a line, then Enter on its own. Hermes (0.21.2 on) reads an Enter that arrives within 50 ms of a text
+            change as a pasted newline, so a line and its Enter in one write are never submitted."""
+            os.write(fd, line.encode())
+            typed = drain(fd, 0.3)
+            os.write(fd, b"\r")
+            return typed + drain(fd, seconds)
+
         with Sink() as sink, MockLLM(lambda body, n: {"text": f"reply {n}"}) as llm:
             home = Home(llm.url, sink.url)
             try:
@@ -288,10 +296,8 @@ class RealHermes(unittest.TestCase):
                 drain(fd, 15)
                 said = {}
                 for line, wait in (("/judgment off", 4), ("first message, not traced", 8), ("/judgment on", 4), ("second message, traced", 8)):
-                    os.write(fd, line.encode() + b"\r")
-                    said[line] = drain(fd, wait)
-                os.write(fd, b"/exit\r")
-                drain(fd, 5)
+                    said[line] = submit(fd, line, wait)
+                submit(fd, "/exit", 5)
                 try:
                     os.kill(pid, 9)
                     os.waitpid(pid, 0)

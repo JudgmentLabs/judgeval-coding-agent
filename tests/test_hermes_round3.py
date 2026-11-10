@@ -317,7 +317,7 @@ class Identity(Case):
         from judgment_core import flush
 
         spooler, core = module("spooler"), load_plugin().core
-        gate = core.Gate("sanitized", (), (), str(self.sb.state), ())
+        gate = core.Gate("sanitized", core.settings({}), (), str(self.sb.state), ())
         record = {"v": 1, "harness": "hermes", "event": "turn_start", "session_id": "s9", "turn_id": "t9", "ts": 1, "prompt": "hi"}
         frames = [{"t": "gate", "id": 1, "gate": gate.to_json()}, {"t": "rec", "s": 1, "g": 1, "r": record}]
 
@@ -357,7 +357,7 @@ class Identity(Case):
 class Collisions(unittest.TestCase):
     def test_two_secret_keys_matching_one_rule_keep_both_entries(self):
         core = load_plugin().core
-        gate = core.Gate("sanitized", (), (), "/nonexistent", ())
+        gate = core.Gate("sanitized", core.settings({}), (), "/nonexistent", ())
         one, two = gh_token(), gh_token()
         record = {"v": 1, "harness": "hermes", "event": "tool", "session_id": "s", "turn_id": "t", "ts": 1,
                   "tool_input": {one: "first", two: "second", "nested": {one: "deep"}}, "tool_output": "ok"}

@@ -2,7 +2,7 @@
 
 This plugin sends a Hermes Agent session to Judgment when the project opts in. It's a native Hermes plugin that uses only read-only observer hooks. It never blocks, changes, or delays a prompt, a tool call, or a model call. Install it, then follow the project setup in the repository README.
 
-It's tested with Hermes Agent 0.19.0. It runs in Hermes's own Python and doesn't need `jq`.
+It's tested with Hermes Agent 0.19.0 and 0.21.3. It runs in Hermes's own Python and doesn't need `jq`.
 
 ## Install
 

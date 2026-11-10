@@ -51,7 +51,7 @@ def _hermes_version() -> str:
 
 
 def workspace(task_id: str = "") -> str:
-    """The folder Hermes works in for this task, resolved the way Hermes 0.19.0 resolves it.
+    """The folder Hermes works in for this task, resolved the way Hermes resolves it (0.19.0 to 0.21.3).
 
     1. A cwd registered for the task (TUI, desktop, ACP, batch: tools/terminal_tool.py
        resolve_task_overrides, which tools/file_tools.py reads first too).
@@ -193,14 +193,14 @@ def _callback(hook: str):
 _ctx = {"ctx": None}
 
 
-def requester() -> str:
-    """The conversation a /judgment command came from, or '' when Hermes doesn't say.
+def requester() -> tuple:
+    """(key, other session ids) of the conversation a /judgment command came from, or ('', ()) when Hermes doesn't say.
 
     Hermes passes a plugin command only its arguments (hermes_cli/plugins.py register_command). The
     interactive CLI runs one conversation and its PluginManager holds it (``_cli_ref``, cli.py), so
     its session id names the requester; a compression rotation maps back to the conversation's key.
     The gateway and the TUI serve many conversations and dispatch plugin commands before binding the
-    message's session (gateway/run.py: dispatch at 11194, binding at 12128), so nothing there names
+    message's session (gateway/run.py), so nothing there names
     the requester, and any process-wide id (HERMES_SESSION_ID, the newest session) could name another
     chat. Those get ''.
     """
@@ -208,18 +208,21 @@ def requester() -> str:
         cli = getattr(getattr(_ctx["ctx"], "_manager", None), "_cli_ref", None)
         sid = str(getattr(cli, "session_id", "") or "")
     except Exception:
-        return ""
+        return "", ()
     if not sid:
-        return ""
+        return "", ()
     with _lock:
         key = tracker.key_of(sid) or sid
-        return "" if tracker.kind_of(key) is Kind.CHILD else key
+        if tracker.kind_of(key) is Kind.CHILD:
+            return "", ()
+        return key, tuple(sorted(tracker.aliases_of(key) - {key}))
 
 
 def judgment_command(raw_args: str = "") -> str:
     try:
         words = (raw_args or "").split()
-        return core.command(words[0] if words else "status", workspace(), requester())
+        key, aliases = requester()
+        return core.command(words[0] if words else "status", workspace(), key, aliases=aliases)
     except Exception as exc:
         return f"Judgment tracing: the command failed ({type(exc).__name__})."
 

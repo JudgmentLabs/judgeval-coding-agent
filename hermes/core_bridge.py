@@ -83,7 +83,7 @@ class Gate:
     """One turn's opt-in decision: plain data, everything prepare needs, resolved once at turn start."""
 
     capture: str  # full | sanitized | metadata, as optin.resolve_capture decides
-    rules: tuple  # ((key, (value, ...)), ...) the project's redaction settings, one pair per optin.REDACT_KEYS
+    rules: str  # the project's redaction settings as tracing.json wrote them, as JSON: one member per optin.REDACT_KEYS
     secrets: tuple  # ((name, value), ...) secret env values, longest first. Crosses only the pipe.
     state: str
     stamps: tuple  # ((field, value), ...) environment, project_root, export_*: each checked by redaction
@@ -95,8 +95,7 @@ class Gate:
     @classmethod
     def from_json(cls, data: dict) -> "Gate":
         pairs = lambda items: tuple(tuple(item) for item in items)  # noqa: E731
-        rules = tuple((key, tuple(values)) for key, values in data["rules"])
-        return cls(data["capture"], rules, pairs(data["secrets"]), data["state"], pairs(data["stamps"]), tuple(data.get("withheld") or ()))
+        return cls(data["capture"], str(data["rules"]), pairs(data["secrets"]), data["state"], pairs(data["stamps"]), tuple(data.get("withheld") or ()))
 
 
 # The core API the bridge depends on: (module, name, the parameters the bridge passes by position, in order).
@@ -158,14 +157,16 @@ def _scrub(value, rs: "redact.Ruleset", secrets: list):
 
 
 @functools.lru_cache(maxsize=64)
-def _rules(settings: tuple) -> redact.Ruleset:
+def _rules(settings: str) -> redact.Ruleset:
     """Compiled once per distinct project config, not once per call."""
-    return redact.ruleset({key: list(values) for key, values in settings})
+    return redact.ruleset(json.loads(settings))
 
 
-def settings(project: dict) -> tuple:
-    """The project's redaction settings as a Gate carries them: every key load_project reads, so none is dropped here."""
-    return tuple((key, tuple(project[key])) for key in optin.REDACT_KEYS)
+def settings(project: dict) -> str:
+    """The project's redaction settings as a Gate carries them: every key the core reads, each value exactly as
+    tracing.json wrote it. redact.ruleset alone decides what a malformed value means (a rule setting that is not a list
+    of strings fails closed), so nothing here reshapes one: a tuple of a string would be a valid list of its letters."""
+    return json.dumps({key: project.get(key) for key in optin.REDACT_KEYS}, sort_keys=True, separators=(",", ":"))
 
 
 def rules(gate: Gate) -> redact.Ruleset:
@@ -174,7 +175,7 @@ def rules(gate: Gate) -> redact.Ruleset:
 
 def warm() -> None:
     """Compile the redaction rules now, at plugin load, so the first turn does not pay for it. Writes nothing."""
-    rs = _rules(())
+    rs = _rules(settings({}))
     redact.env_secrets({})
     _scrub("warm", rs, [])
 
@@ -520,11 +521,13 @@ os.register_at_fork(after_in_child=_after_fork)
 # ---- /judgment -----------------------------------------------------------------------------------
 
 
-def command(action: str, cwd: str, key: str, env: dict | None = None) -> str:
+def command(action: str, cwd: str, key: str, env: dict | None = None, aliases: tuple = ()) -> str:
     """/judgment on|off|status for conversation ``key``. Same rules and messages as core/bin/judgment-session.
 
     ``key`` is '' when the plugin cannot tell which conversation asked: status then reports the
-    project, and on/off change nothing.
+    project, and on/off change nothing. ``aliases``: the other session ids Hermes has given the
+    conversation (compression rotations). on/off is written under each, so a later Hermes process
+    that resumes under a rotated id reads the same mode.
     """
     env = dict(os.environ if env is None else env)
     action = (action or "status").strip().lower()
@@ -543,7 +546,8 @@ def command(action: str, cwd: str, key: str, env: dict | None = None) -> str:
             return ("Judgment tracing can't tell which conversation sent this command here, so it changed nothing. "
                     "Use /judgment on or off in the Hermes CLI, or set sessionDefault in .judgment/tracing.json.")
         _private_dir(optin.state_dir(env))
-        optin.write_session_mode(root, key, action, env)
+        for name in dict.fromkeys((key, *aliases)):
+            optin.write_session_mode(root, name, action, env)
         forget_cache()
     mode, message = optin.session_status(cwd, key, env)
     if action == "on" and mode == "on":

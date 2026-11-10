@@ -18,12 +18,13 @@ State machines. Impossible states are listed so the code can refuse them.
             agent.session_id mid-turn, conversation_compression.py:1246, and fires no hook)
       MAIN|CHILD --pre_llm_call whose session id is new but whose turn_id was built from one of its ids
             (preflight compression)--> same conversation, new id added as an alias. Hermes builds
-            turn_id = f"{session_id}:{task_id}:{8 hex}" before it compresses (agent/turn_context.py:369)
-            and fires pre_llm_call after (:697), so ``lineage`` reads the pre-rotation id back.
+            turn_id = f"{session_id}:{task_id}:{8 hex}" before it compresses (agent/turn_context.py)
+            and fires pre_llm_call after, so ``lineage`` reads the pre-rotation id back.
       unknown --pre_llm_call whose lineage id is unknown here (a resumed session that rotates in its
             first turn)--> MAIN keyed by the lineage id, so that id's /judgment on|off decides the gate
       MAIN --on_session_finalize|on_session_reset--> gone, with every alias, every turn, and every
-            child (and grandchild) bound to it
+            child (and grandchild) bound to it. Hermes 0.21 fires on_session_reset with the new session's
+            id, which names no conversation here, so there it does nothing and finalize closes the old one.
       CHILD --subagent_stop--> gone, with every alias and turn id
       Impossible: a session id in two conversations; an alias or turn owner pointing at a gone
       conversation; a child whose root changes after it started; a child opening a main turn; a
@@ -31,6 +32,7 @@ State machines. Impossible states are listed so the code can refuse them.
 
   Turn (main conversations only; ``turns``: turn_id -> Turn; ``owner``: turn_id -> conversation key)
       none --pre_llm_call--> OPEN --post_llm_call--> ANSWERED
+      closed --any event that names it--> dropped: never filed under the turn open now (``_turn``)
       OPEN|ANSWERED --on_session_end--> closed      turn_end, interrupted unless Hermes says it completed
       OPEN|ANSWERED --pre_llm_call(another turn)--> closed (interrupted), then the new turn opens
       OPEN|ANSWERED --on_session_finalize|reset--> closed (interrupted), then session_end
@@ -41,8 +43,7 @@ State machines. Impossible states are listed so the code can refuse them.
       takes effect at the next turn, so a turn is never half recorded.
 
   Model call attempt (per agent, per api_request_id; Hermes reuses one id and one started_at for
-      every retry of a request, conversation_loop.py:1215-1225, and can retry without changing
-      retry_count, conversation_loop.py:2804):
+      every retry of a request, and can retry without changing retry_count, conversation_loop.py):
       pre_api_request --> PENDING(seq = n + 1, start = now)
       PENDING --post_api_request--> done (model record)          message_id = id, then id#2, id#3 ...
       PENDING --api_request_error--> error (model record, is_error)
@@ -320,6 +321,18 @@ class Tracker:
         """The conversation a session id names now ('' when none). For /judgment."""
         return self.ids.get(session_id, "")
 
+    def aliases_of(self, key: str) -> set:
+        """Every session id that names the conversation now, its key included. For /judgment."""
+        conv = self.convs.get(key)
+        return set(conv.aliases) if conv else set()
+
+    def _turn(self, conv: Conv, turn_id: str) -> Turn | None:
+        """The conversation's turn an event belongs to: the one it names, or the open one when it names none.
+        An event that names a turn no longer open (a tool worker Hermes gave up on reports late) belongs to no
+        turn: filed under the open one it would take that turn's gate, and an untraced turn's text would be recorded."""
+        turn = self.turns.get(turn_id) if turn_id else self.turns.get(conv.open_turn)
+        return turn if turn is not None and turn.session_id == conv.key else None
+
     def kind_of(self, key: str) -> Kind | None:
         conv = self.convs.get(key)
         return conv.kind if conv else None
@@ -340,8 +353,8 @@ class Tracker:
             return False
         if conv.kind is Kind.CHILD:
             return conv.gate is not None
-        turn = self.turns.get(s(kw, "turn_id")) or self.turns.get(conv.open_turn)
-        return turn is not None and turn.session_id == conv.key and turn.gate is not None
+        turn = self._turn(conv, s(kw, "turn_id"))
+        return turn is not None and turn.gate is not None
 
     def _conv(self, kw: dict, step: Step, sid_name: str = "session_id") -> Conv | None:
         """The conversation an event belongs to, adding an alias when Hermes rotated its session id:
@@ -409,8 +422,8 @@ class Tracker:
             return None
         if conv.kind is Kind.CHILD:
             return Where(conv.gate, conv.calls, conv.root, conv.root_turn, conv.key)
-        turn = self.turns.get(s(kw, "turn_id")) or self.turns.get(conv.open_turn)
-        if turn is None or turn.session_id != conv.key:
+        turn = self._turn(conv, s(kw, "turn_id"))
+        if turn is None:
             return None
         return Where(turn.gate, turn.calls, turn.session_id, turn.turn_id)
 
@@ -533,8 +546,8 @@ class Tracker:
         conv = self._conv(kw, step)
         if conv is None or conv.kind is not Kind.MAIN:
             return step
-        turn = self.turns.get(s(kw, "turn_id")) or self.turns.get(conv.open_turn)
-        if turn is not None and turn.session_id == conv.key and turn.phase is Phase.OPEN:
+        turn = self._turn(conv, s(kw, "turn_id"))
+        if turn is not None and turn.phase is Phase.OPEN:
             turn.phase = Phase.ANSWERED
             turn.answer = text_of(kw.get("assistant_response"))
         return step
@@ -656,8 +669,8 @@ class Tracker:
         if parent is not None and parent.kind is Kind.CHILD:  # a grandchild takes its parent's root turn
             root, root_turn, gate = parent.root, parent.root_turn, parent.gate
         elif parent is not None:
-            turn = self.turns.get(s(kw, "parent_turn_id")) or self.turns.get(parent.open_turn)
-            if turn is None or turn.session_id != parent.key:
+            turn = self._turn(parent, s(kw, "parent_turn_id"))
+            if turn is None:
                 return step  # no turn of a conversation known here started it
             root, root_turn, gate = parent.key, turn.turn_id, turn.gate
         else:
