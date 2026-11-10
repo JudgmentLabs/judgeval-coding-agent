@@ -53,22 +53,22 @@
       "needs": [
         "eyJ"
       ],
-      "re": "(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\\.eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]*"
+      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrt]))eyJ[A-Za-z0-9_-]{8,}\\.eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]*"
     },
     {
       "id": "anthropic_key",
       "needs": [
         "sk-ant-"
       ],
-      "re": "(?<![A-Za-z0-9_-])sk-ant-[A-Za-z0-9_-]{20,}"
+      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrt]))sk-ant-[A-Za-z0-9_-]{20,}"
     },
     {
       "id": "openai_key",
       "needs": [
         "sk-"
       ],
-      "re": "(?<![A-Za-z0-9_-])sk-(?:proj-|svcacct-|admin-)?(?=[A-Za-z0-9_-]{0,256}?[A-Za-z0-9_]{16})[A-Za-z0-9_-]{20,}",
-      "pre": "(?<![A-Za-z0-9_-])sk-"
+      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrt]))sk-(?:proj-|svcacct-|admin-)?(?=[A-Za-z0-9_-]{0,256}?[A-Za-z0-9_]{16})[A-Za-z0-9_-]{20,}",
+      "pre": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrt]))sk-"
     },
     {
       "id": "aws_access_key_id",
@@ -78,7 +78,7 @@
         "ABIA",
         "ACCA"
       ],
-      "re": "(?<![A-Za-z0-9])(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}(?![0-9A-Za-z])"
+      "re": "(?:(?<![A-Za-z0-9])|(?<=\\\\[nrt]))(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}(?![0-9A-Za-z])"
     },
     {
       "id": "github_token",
@@ -89,14 +89,14 @@
         "ghs_",
         "ghr_"
       ],
-      "re": "(?<![A-Za-z0-9_])gh[pousr]_[A-Za-z0-9]{36,}"
+      "re": "(?:(?<![A-Za-z0-9_])|(?<=\\\\[nrt]))gh[pousr]_[A-Za-z0-9]{36,}"
     },
     {
       "id": "github_pat",
       "needs": [
         "github_pat_"
       ],
-      "re": "(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{22,}"
+      "re": "(?:(?<![A-Za-z0-9_])|(?<=\\\\[nrt]))github_pat_[A-Za-z0-9_]{22,}"
     },
     {
       "id": "slack_token",
@@ -108,7 +108,7 @@
         "xoxs-",
         "xoxe-"
       ],
-      "re": "(?<![A-Za-z0-9_-])xox[abprse]-(?=[A-Za-z0-9-]{0,255}[0-9])[A-Za-z0-9-]{10,}"
+      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrt]))xox[abprse]-(?=[A-Za-z0-9-]{0,255}[0-9])[A-Za-z0-9-]{10,}"
     },
     {
       "id": "slack_webhook",
@@ -122,7 +122,7 @@
       "needs": [
         "AIza"
       ],
-      "re": "(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"
+      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrt]))AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"
     },
     {
       "id": "stripe_key",
@@ -132,7 +132,7 @@
         "rk_live_",
         "rk_test_"
       ],
-      "re": "(?<![A-Za-z0-9_])(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}"
+      "re": "(?:(?<![A-Za-z0-9_])|(?<=\\\\[nrt]))(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}"
     },
     {
       "_comment": [
@@ -142,7 +142,7 @@
       "needs": [
         "://"
       ],
-      "re": "(?<p>(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{1,20}://[^\\s/:@'\\\"<>\\[\\]]{0,128}:)(?!(?:\\[REDACTED:[A-Za-z0-9_:.-]{1,128}\\](?:#[0-9]{1,6})?|\\$\\{[A-Za-z_][A-Za-z0-9_]{0,127}\\}|\\$[A-Za-z_][A-Za-z0-9_]{0,127}|\\{\\{\\s{0,4}[.A-Za-z_][A-Za-z0-9_.]{0,127}\\s{0,4}\\}\\}|%[A-Za-z_][A-Za-z0-9_]{0,63}%|\\*{1,64}|x{3,64}|X{3,64}|password|PASSWORD|Password|pass|PASS|Pass|passwd|PASSWD|Passwd|pwd|PWD|Pwd|secret|SECRET|Secret|changeme|CHANGEME|Changeme)@)[^\\s/@'\\\"<>]+(?=@)"
+      "re": "(?<p>(?:(?<![A-Za-z0-9+.-])|(?<=\\\\[nrt]))[A-Za-z][A-Za-z0-9+.-]{1,20}://[^\\s/:@'\\\"<>\\[\\]]{0,128}:)(?!(?:\\[REDACTED:[A-Za-z0-9_:.-]{1,128}\\](?:#[0-9]{1,6})?|\\$\\{[A-Za-z_][A-Za-z0-9_]{0,127}\\}|\\$[A-Za-z_][A-Za-z0-9_]{0,127}|\\{\\{\\s{0,4}[.A-Za-z_][A-Za-z0-9_.]{0,127}\\s{0,4}\\}\\}|%[A-Za-z_][A-Za-z0-9_]{0,63}%|\\*{1,64}|x{3,64}|X{3,64}|password|PASSWORD|Password|pass|PASS|Pass|passwd|PASSWD|Passwd|pwd|PWD|Pwd|secret|SECRET|Secret|changeme|CHANGEME|Changeme)@)[^\\s/@'\\\"<>]+(?=@)"
     },
     {
       "id": "authorization_header",
@@ -156,7 +156,7 @@
         "-Token",
         "-TOKEN"
       ],
-      "re": "(?<p>(?<![A-Za-z0-9_-])(?:(?:proxy|PROXY|Proxy)-(?:authorization|AUTHORIZATION|Authorization)|(?:authorization|AUTHORIZATION|Authorization)|(?:x|X)-(?:api|API|Api)-(?:key|KEY|Key)|(?:api|API|Api)-(?:key|KEY|Key)|(?:x|X)-(?:auth|AUTH|Auth)-(?:token|TOKEN|Token))\\\\?[\\\"']?\\s{0,5}[:=]\\s{0,5}\\\\?[\\\"']?(?:(?:basic|BASIC|Basic|bearer|BEARER|Bearer|token|TOKEN|Token|digest|DIGEST|Digest|bot|BOT|Bot|apikey|APIKEY|Apikey)\\s+)?)(?!\\$|<|\\{\\{|%)(?=[A-Za-z._~+/=-]{0,255}[0-9+/=])[A-Za-z0-9._~+/=-]{12,}"
+      "re": "(?<p>(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrt]))(?:(?:proxy|PROXY|Proxy)-(?:authorization|AUTHORIZATION|Authorization)|(?:authorization|AUTHORIZATION|Authorization)|(?:x|X)-(?:api|API|Api)-(?:key|KEY|Key)|(?:api|API|Api)-(?:key|KEY|Key)|(?:x|X)-(?:auth|AUTH|Auth)-(?:token|TOKEN|Token))\\\\?[\\\"']?\\s{0,5}[:=]\\s{0,5}\\\\?[\\\"']?(?:(?:basic|BASIC|Basic|bearer|BEARER|Bearer|token|TOKEN|Token|digest|DIGEST|Digest|bot|BOT|Bot|apikey|APIKEY|Apikey)\\s+)?)(?!\\$|<|\\{\\{|%)(?=[A-Za-z._~+/=-]{0,255}[0-9+/=])[A-Za-z0-9._~+/=-]{12,}"
     },
     {
       "id": "bearer_token",
@@ -165,7 +165,7 @@
         "BEARER",
         "Bearer"
       ],
-      "re": "(?<p>(?<![A-Za-z0-9_-])(?:bearer|BEARER|Bearer)\\s+)(?!\\$|<|\\{\\{|%)(?=[A-Za-z._~+/=-]{0,255}[0-9])[A-Za-z0-9._~+/=-]{16,}"
+      "re": "(?<p>(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrt]))(?:bearer|BEARER|Bearer)\\s+)(?!\\$|<|\\{\\{|%)(?=[A-Za-z._~+/=-]{0,255}[0-9])[A-Za-z0-9._~+/=-]{16,}"
     }
   ],
   "secretNames": {
@@ -200,7 +200,7 @@
         "Only the value is replaced. A value that is already a placeholder is left alone."
       ],
       "id": "secret_assignment",
-      "re": "(?<p>(?:(?<![A-Za-z0-9])|(?<=[a-z0-9])(?=[A-Z])){names}\\\\{0,31}[\"']?[^\\S\\n]{0,8}(?::=|=>|[:=])[^\\S\\n]{0,8}\\\\{0,31}[\"']?)(?!\\[REDACTED:)(?:(?<=\")[^\"\\s,\\\\+);\\]}][^\"\\n,\\\\]*|(?<=')[^'\\s,\\\\+);\\]}][^'\\n,\\\\]*|(?<![\"'])[^\\s\"'`,;\\\\)\\]}=\\[{(:][^\\s\"'`,;\\\\)\\]}]*)"
+      "re": "(?<p>(?:(?<![A-Za-z0-9])|(?<=\\\\[nrt])|(?<=[a-z0-9])(?=[A-Z])){names}\\\\{0,31}[\"']?[^\\S\\n]{0,32}(?::=|=>|[:=])[^\\S\\n]{0,32}\\\\{0,31}[\"'`]?)(?!\\[REDACTED:)(?:(?<=\")[^\"\\s,\\\\+);\\]}][^\"\\n,\\\\]*|(?<=')[^'\\s,\\\\+);\\]}][^'\\n,\\\\]*|(?<=`)[^`\\s,\\\\+);\\]}][^`\\n,\\\\]*|(?<![\"'`])[^\\s\"'`,;\\\\)\\]}=\\[{(:][^\\s\"'`,;\\\\)\\]}]*)"
     },
     "field": {
       "_comment": [
@@ -208,9 +208,26 @@
         "nonempty string value. It runs over the compact JSON of the event's text fields in both layers, as jq writes it."
       ],
       "id": "secret_field",
-      "re": "(?<p>(?<=[{,])\"[A-Za-z0-9_.-]{0,64}?(?:(?<![A-Za-z0-9])|(?<=[a-z0-9])(?=[A-Z])){names}\":\")(?!\\[REDACTED:)(?:[^\"\\\\]|\\\\.)+(?:(?=\")|(?![\\s\\S]))",
+      "re": "(?<p>(?<=[{,])\"[^\"\\\\\\n]{0,128}?(?:(?<![A-Za-z0-9])|(?<=[a-z0-9])(?=[A-Z])){names}\":\")(?!\\[REDACTED:)(?:[^\"\\\\]|\\\\.)+(?:(?=\")|(?![\\s\\S]))",
       "needs_suffix": "\":\""
-    }
+    },
+    "allow": [
+      "str",
+      "string",
+      "String",
+      "None",
+      "null",
+      "nil",
+      "undefined",
+      "bool",
+      "boolean",
+      "int",
+      "true",
+      "false",
+      "True",
+      "False",
+      "Optional[str"
+    ]
   },
   "env": {
     "_comment": [
@@ -317,24 +334,23 @@
       "|": "\\|"
     },
     "command": {
-      "prefix": "(?:(?<![\\s\\S])|(?<=[;&|\\n(`]))[^\\S\\n]*(?:sudo[^\\S\\n]+)?",
-      "unless": "(?![^;&|\\n)`]*[^\\S\\n](?:--help|-h|--version)(?![^\\s;&|)`]))"
+      "prefix": "(?:(?<![\\s\\S])|(?<=[;&|\\n(`{]))[^\\S\\n]*(?:(?:then|do|else|time|exec|command|nohup|!)[^\\S\\n]+)?(?:[A-Za-z_][A-Za-z0-9_]*=[^\\s;&|`()\"']*[^\\S\\n]+)*(?:sudo(?:[^\\S\\n]+-[A-Za-z]+(?:[^\\S\\n]+[^\\s;&|`)-][^\\s;&|`)]*)?)*[^\\S\\n]+)?(?:(?:ba|z|da|k)?sh[^\\S\\n]+-[A-Za-z]*c[^\\S\\n]+[\"']?)?(?:[^\\s;&|`()\"']*/)?",
+      "unless": "(?![^;&|\\n)`]*[^\\S\\n](?:--help|-h|--version)(?![^\\s;&|)`\"']))"
     },
     "paths": [
       {
         "id": "dotenv",
         "globs": [
-          ".env",
-          ".env.*",
-          ".env~",
-          ".envrc",
+          ".env*",
+          "?*.env",
           "!.env.example",
           "!.env.sample",
           "!.env.template",
           "!.env.dist",
           "!.env.default",
           "!.env.defaults",
-          "!.env.schema"
+          "!.env.schema",
+          "!example.env"
         ],
         "examples": [
           ".env",
@@ -343,12 +359,15 @@
           ".envrc",
           "HEAD:.env",
           ".env~",
-          ".env.local~"
+          ".env.local~",
+          "prod.env",
+          ".env-prod"
         ],
         "not": [
           ".env.example",
           "src/environment.ts",
-          "docs/env.md"
+          "docs/env.md",
+          "example.env"
         ]
       },
       {
@@ -443,7 +462,18 @@
           "!*.cs",
           "!*.swift",
           "!*.md",
-          "!*.rst"
+          "!*.rst",
+          "!*.c",
+          "!*.h",
+          "!*.cpp",
+          "!*.hpp",
+          "!*.html",
+          "!*.css",
+          "!*.scss",
+          "!*.vue",
+          "!*.svelte",
+          "!*.sql",
+          "!*.sh"
         ],
         "examples": [
           "secrets.yaml",
@@ -456,7 +486,9 @@
         "not": [
           "src/secrets.py",
           "lib/secret_manager.ts",
-          "docs/secrets.md"
+          "docs/secrets.md",
+          "src/secrets.sh",
+          "db/secrets.sql"
         ]
       },
       {
@@ -514,7 +546,7 @@
           "typeset"
         ],
         "re": [
-          "(?:env|printenv|set|export(?:[^\\S\\n]+-p)?)[^\\S\\n]*(?:[;&|\\n)`>]|(?![\\s\\S]))",
+          "(?:env|printenv|set|export(?:[^\\S\\n]+-p)?)[^\\S\\n]*(?=[;&|\\n)`>\"']|(?![\\s\\S]))",
           "(?:declare|typeset)[^\\S\\n]+-[A-Za-z]{0,8}[px][A-Za-z]{0,8}(?![A-Za-z0-9_-])"
         ],
         "examples": [
