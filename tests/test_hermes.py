@@ -334,13 +334,11 @@ class Redaction(HermesCase):
         self.assertIn("[REDACTED:openai_key]", self.sb.state_text())
 
     def test_a_cut_long_result_drops_the_partial_token(self):
-        from hermes_support import load_plugin as _load
-
-        tracker = sys.modules[_load().__name__ + ".tracker"]
+        core = load_plugin().core
         token = SECRETS["github_token"]["core"]
-        text = "x " * (tracker.TEXT_CAP // 2 - 10) + token + " tail"
-        out = tracker.cap(text)
-        self.assertTrue(out.endswith(tracker.CUT_MARK))
+        text = "x " * (core.TEXT_CAP // 2 - 10) + token + " tail"
+        out = core.fit(text, core._rules((), ()), [])
+        self.assertTrue(out.endswith(core.CUT_MARK))
         self.assertNotIn(token[:12], out)
 
 
@@ -379,6 +377,7 @@ class OptOut(HermesCase):
         turn = simple_turn(sid, "hi", path="a", result="b", answer="c")
         start, rest = turn.events[0], turn.events[1:]
         with plugin_env(self.sb) as (plugin, ctx):
+            ctx.cli(sid)  # the interactive CLI on this session
             fire_all(ctx, [start], plugin)
             handler = ctx.commands["judgment"]["handler"]
             self.assertIn("on for this session", handler("status"))
@@ -396,6 +395,7 @@ class OptOut(HermesCase):
         sid = new_session_id()
         _p, child_sid, events = subagent_turn(sid)
         with plugin_env(self.sb) as (plugin, ctx):
+            ctx.cli(sid)
             fire_all(ctx, events, plugin)
             os.environ["HERMES_SESSION_ID"] = child_sid  # Hermes points its session context at a child it builds
             self.assertIn("off for this session", ctx.commands["judgment"]["handler"]("off"))
@@ -408,6 +408,7 @@ class OptOut(HermesCase):
         one = simple_turn(sid, "quiet", path="a", result="b", answer="c")
         two = simple_turn(sid, "loud", path="a", result="b", answer="d", first=False, start=later(one.events, 2))
         with plugin_env(self.sb) as (plugin, ctx):
+            ctx.cli(sid)
             fire_all(ctx, one.events, plugin)
             self.assertIn("on for this session", ctx.commands["judgment"]["handler"]("on"))
             fire_all(ctx, two.events, plugin)
@@ -528,10 +529,18 @@ SENDER = textwrap.dedent(
     start = time.perf_counter()
     fire_all(ctx, turn.events, plugin)
     took = (time.perf_counter() - start) * 1000
-    print(json.dumps({{"ms": took, "senders": len(plugin.core._senders)}}), flush=True)
+    print(json.dumps({{"ms": took, "mode": plugin.spool.mode, "helper": plugin.spool.proc.pid if plugin.spool.proc else 0}}), flush=True)
     time.sleep(60)
     """
 )
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
 class Sender(HermesCase):
@@ -549,7 +558,10 @@ class Sender(HermesCase):
         os.killpg(proc.pid, signal.SIGKILL)  # Hermes and its whole group die the moment the turn ends
         proc.wait(timeout=10)
         info = json.loads(line)
-        self.assertEqual(info["senders"], 1, "one sender per turn end")
+        self.assertEqual(info["mode"], "helper")
+        self.assertGreater(info["helper"], 0)
+        # The helper runs in its own session, so the kill missed it; it folds the turn and starts the sender.
+        self.assertNotEqual(os.getpgid(info["helper"]) if _alive(info["helper"]) else -1, proc.pid)
         started = time.time()
         self.assertTrue(wait_for(lambda: roots(self.sink.spans()), timeout=20), (self.sb.state / "flush.log").read_text() if (self.sb.state / "flush.log").exists() else "no flush.log")
         self.assertEqual(attrs(roots(self.sink.spans())[0])["judgment.output"], "lands after the kill")

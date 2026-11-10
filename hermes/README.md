@@ -33,9 +33,11 @@ Run the copy command again, or `git pull` in the clone if you linked it. Start a
 
 The change applies from your next message, so a turn is never half recorded.
 
+`on` and `off` work in the interactive CLI, which runs one conversation. In the gateway and the TUI, Hermes doesn't tell a plugin command which conversation sent it, so `/judgment on` and `off` change nothing there and say so. `/judgment status` shows the project setting. Use `sessionDefault` in `.judgment/tracing.json` for those sessions.
+
 ## Which sessions are traced
 
-The plugin looks for `.judgment/tracing.json` in the folder Hermes's tools run in (`TERMINAL_CWD`, or the folder Hermes started in), then in each parent folder. Without one, the session isn't traced and the plugin writes no file. That includes gateway sessions, such as Telegram, Discord, or mobile, whose folder isn't inside an opted-in project. `JUDGMENT_TRACING=0` turns tracing off everywhere.
+The plugin looks for `.judgment/tracing.json` in the folder Hermes works in for that turn, then in each parent folder. It asks Hermes the way Hermes's own tools do: a folder registered for the task (TUI, desktop, ACP), then the session's folder in a multi-session gateway, then `TERMINAL_CWD`, then the folder Hermes started in. Without one, the session isn't traced and the plugin writes no file. That includes gateway sessions, such as Telegram, Discord, or mobile, whose folder isn't inside an opted-in project. `JUDGMENT_TRACING=0` turns tracing off everywhere.
 
 ## What this plugin can see
 
@@ -52,9 +54,15 @@ A turn interrupted before Hermes answers is sent with what it has, as an interru
 
 Hermes doesn't report cost. Judgment prices the model calls from the provider, model, and token counts when it knows the model.
 
+When Hermes compresses a long conversation mid-turn, it gives the session a new id. The plugin keeps the rest of the conversation in the same Judgment session, and `/judgment on` or `off` carries over to the new id. A manual `/compress` between turns looks the same to a plugin as `/resume` or `/branch`, so the conversation continues as a new Judgment session.
+
 ## How it records
 
-Each callback turns Hermes's arguments into an event, redacts it under the project's `capture` setting, and writes it to the same local queue as the other plugins, in `~/.local/state/judgment/inbox`. It makes no network call. Each callback took under 0.4 ms at p95 in the plugin's tests. When a turn, a subagent, or a session ends, the plugin starts the sender, `python3 -m judgment_core.flush`, in its own session with output to `flush.log`, and doesn't wait for it. The sender keeps running after Hermes exits.
+Each callback turns Hermes's arguments into an event and writes it down a pipe to one helper process per Hermes process. The helper redacts each event under the project's `capture` setting and writes it to the same local queue as the other plugins, in `~/.local/state/judgment/inbox`. Text crosses only the pipe, which is in memory, and reaches disk only redacted. Callbacks make no network call, write no file, and never wait on redaction. Each callback took under 0.5 ms at p95 in the plugin's tests, including a 56 KB tool output holding 1,000 fake credentials and 8 threads at once. Set `JUDGMENT_HERMES_SPOOL=inline` to do the work in the callback instead.
+
+The helper runs in its own session, so it keeps running after Hermes exits or is killed, and finishes what Hermes sent it. When a turn, a subagent, or a session ends, it starts the sender, `python3 -m judgment_core.flush`, in its own session with output to `flush.log`, and doesn't wait for it.
+
+A text longer than 64 KB is redacted first and then cut at a word boundary, so a cut never leaves part of a secret. Dictionary keys, and names a model or provider chose (the model, provider, tool name, tool call id, and child role), are redacted like text.
 
 The plugin uses the copy of the core in `hermes/vendor/judgment-core`, which `scripts/sync-core.sh` refreshes. `hermes/core_bridge.py` is the only file that calls into it.
 

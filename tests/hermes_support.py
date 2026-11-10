@@ -42,11 +42,17 @@ def load_plugin(name: str = "judgment_tracing_under_test"):
 
 
 class FakeCtx:
-    """The two PluginContext methods the plugin uses."""
+    """The two PluginContext methods the plugin uses, and the manager's ``_cli_ref`` (None outside the interactive CLI)."""
 
-    def __init__(self):
+    def __init__(self, cli_session: str | None = None):
         self.hooks: dict[str, list] = {}
         self.commands: dict[str, dict] = {}
+        cli = types.SimpleNamespace(session_id=cli_session) if cli_session is not None else None
+        self._manager = types.SimpleNamespace(_cli_ref=cli)
+
+    def cli(self, session_id: str | None) -> None:
+        """Be the interactive CLI on ``session_id`` (Hermes's cli.py sets ``_cli_ref``), or the gateway with None."""
+        self._manager._cli_ref = types.SimpleNamespace(session_id=session_id) if session_id is not None else None
 
     def register_hook(self, name, callback):
         self.hooks.setdefault(name, []).append(callback)
@@ -67,7 +73,9 @@ def plugin_env(sb, **extra):
     env = {**sb.env, "TERMINAL_CWD": str(sb.project), **extra}
     env = {key: value for key, value in env.items() if value is not None}
     with mock.patch.dict(os.environ, env, clear=True):
-        plugin.tracker = plugin.Tracker(plugin._resolve, version="0.19.0", cwd=plugin.terminal_cwd)
+        plugin.tracker = plugin.Tracker(plugin.core.resolve, version="0.19.0")
+        plugin.spool = plugin.spool_for()
+        plugin.core.forget_cache()  # a fresh Hermes process
         clock = plugin.now_ms
         plugin.errors["count"] = 0
         ctx = FakeCtx()
@@ -75,6 +83,8 @@ def plugin_env(sb, **extra):
         try:
             yield plugin, ctx
         finally:
+            plugin._drain_at_exit()  # what a callback handed to the drainer, as at Hermes's exit
+            plugin.spool.close()  # the helper folds every frame it was sent, then exits
             plugin.now_ms = clock
 
 
@@ -111,11 +121,15 @@ class Turn:
     def _ids(self) -> dict:
         return {"session_id": self.sid, "task_id": self.task, "turn_id": self.tid}
 
-    def api(self, *, text: str | None = None, tool: tuple[str, dict] | None = None, usage: tuple[int, int, int] = (1001, 21, 0), error: dict | None = None) -> str:
-        """One provider attempt. With ``error`` it fails (and the next call is the retry)."""
-        self.calls += 1
+    def api(self, *, text: str | None = None, tool: tuple[str, dict] | None = None, usage: tuple[int, int, int] = (1001, 21, 0), error: dict | None = None,
+            retry: bool = False) -> str:
+        """One provider attempt. With ``error`` it fails. With ``retry`` it is the next attempt of the last request, as Hermes
+        makes it (conversation_loop.py:1215-1225): the same api_request_id and the same started_at."""
+        if not (retry and self.calls):
+            self.calls += 1
+            self.request_start = self.clock + 0.001
         rid = f"{self.tid}:api:{self.calls}"
-        start, end = self.clock + 0.001, self.clock + 0.251
+        start, end = (self.request_start if retry else self.clock + 0.001), self.clock + 0.251
         common = {**self._ids(), "api_request_id": rid, "platform": self.platform, "model": self.model, "provider": self.provider,
                   "base_url": "http://127.0.0.1:9/v1", "api_mode": "chat_completions", "api_call_count": self.calls}
         request = {"method": "POST", "body": {"model": self.model, "messages": [{"role": "system", "content": "You are Hermes Agent."}] + self.history,
