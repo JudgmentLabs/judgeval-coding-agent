@@ -46,7 +46,7 @@ The plugins run on macOS and Linux. The hooks need `jq` and `python3` (3.9 or la
    | Codex | `codex plugin marketplace add https://github.com/JudgmentLabs/judgeval-coding-agent.git`, then `codex plugin add judgment-tracing@judgment-tracing`, then trust the hooks when Codex starts | Automatic when a session starts | [codex/README.md](codex/README.md) |
    | Cursor | One copy command into `~/.cursor/plugins/local` | Run the copy command again | [cursor/README.md](cursor/README.md) |
    | Pi | `pi install git:github.com/JudgmentLabs/judgeval-coding-agent` | `pi update --extensions` | [pi/README.md](pi/README.md) |
-   | Hermes Agent | Copy `hermes/` to `~/.hermes/plugins/judgment-tracing`, then `hermes plugins enable judgment-tracing --no-allow-tool-override` | Run the copy command again | [hermes/README.md](hermes/README.md) |
+   | Hermes Agent | Copy `hermes/` to `~/.hermes/plugins/judgment-tracing`, then `hermes plugins enable judgment-tracing --no-allow-tool-override` | `git pull` in the clone, then replace the plugin folder as [hermes/README.md](hermes/README.md#update) shows | [hermes/README.md](hermes/README.md) |
 
 3. Turn tracing on in a project, from its root:
 

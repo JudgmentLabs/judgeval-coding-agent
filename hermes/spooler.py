@@ -2,8 +2,8 @@
 
 Redaction can't run in Hermes's process. A Python regex call holds the GIL for its whole scan, up to
 several ms on a secret-dense 20 KB window, and no switch interval preempts it: in-process redaction of
-a 56 KB tool output stalled Hermes's own threads 8 ms at p95 (2.7 ms even at a 0.2 ms switch interval;
-see the bench notes in hermes/README.md). So the work is split:
+a 56 KB tool output stalled Hermes's own threads 8 ms at p95 (2.7 ms even at a 0.2 ms switch interval).
+So the work is split:
 
     callback (Hermes's thread)   bulky payloads snapshotted (snapshot.py, one bounded pass, before the
                                  plugin's lock) -> tracker records -> bound (sizes only: no walk) ->

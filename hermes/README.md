@@ -21,7 +21,23 @@ Hermes loads user plugins in the CLI, the TUI, and the gateway. It doesn't load 
 
 ## Update
 
-Run the copy command again, or `git pull` in the clone if you linked it. Start a new Hermes session afterwards.
+Pull the clone, then replace the plugin folder with a fresh copy. Copying onto the existing folder would nest the new copy inside the old one.
+
+```bash
+git -C ~/judgment-tracing pull
+rm -rf ~/.hermes/.judgment-tracing.new && cp -R ~/judgment-tracing/hermes ~/.hermes/.judgment-tracing.new && rm -rf ~/.hermes/plugins/judgment-tracing && mv ~/.hermes/.judgment-tracing.new ~/.hermes/plugins/judgment-tracing
+```
+
+If you linked the clone instead, `git pull` is enough. The plugin stays enabled. Start a new Hermes session afterwards.
+
+## Uninstall
+
+```bash
+hermes plugins disable judgment-tracing
+hermes plugins remove judgment-tracing
+```
+
+`remove` deletes the plugin folder. Your `.judgment/tracing.json` files and the local queue in `~/.local/state/judgment` stay.
 
 ## Turn a session on or off
 
@@ -58,7 +74,7 @@ When Hermes compresses a long conversation, it gives the session a new id, eithe
 
 ## How it records
 
-Each callback turns Hermes's arguments into events and appends them to one in-memory queue. It doesn't touch a file or a pipe, or wait on another thread. A writer thread hands the queue to one helper process per Hermes process. The helper redacts each event under the project's `capture` setting and writes it to the same local queue as the other plugins, in `~/.local/state/judgment/inbox`. Text crosses only the pipe, which is in memory, and reaches disk only redacted. Redaction runs in the helper, not in Hermes, because a Python regex holds the interpreter lock for its whole scan. Done in Hermes, it would stall Hermes's own threads by several milliseconds per 56 KB secret-dense output.
+Each callback turns Hermes's arguments into events and appends them to one in-memory queue. It doesn't touch a file or a pipe, or wait on another thread. A writer thread hands the queue to one helper process per Hermes process. The helper redacts each event under the project's `capture` setting and writes it to the same local queue as the other plugins, in `~/.local/state/judgment/inbox`. Text crosses only the pipe, which is in memory. Under `sanitized` and `metadata` capture, it reaches disk only after redaction. Under `"capture": "full"`, the helper writes text to the inbox unredacted, only cut at 64 KB. Redaction runs in the helper, not in Hermes, because a Python regex holds the interpreter lock for its whole scan. Done in Hermes, it would stall Hermes's own threads by several milliseconds per 56 KB secret-dense output.
 
 Each callback took under 1 ms at p95 in the plugin's benchmark (`tests/bench_hermes.py`). That includes a 56 KB tool output holding 1,000 fake credentials, 8 threads at once, a stopped helper, a queue fuller than the helper can drain, and structured tool arguments up to 329 KB and 10,000 rows.
 

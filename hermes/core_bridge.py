@@ -9,7 +9,7 @@ When the core's opt-in or redaction API changes, this is the one file to update.
     config    load_credentials, DEFAULT_API_URL
 
 They are listed, with the parameters the bridge passes, in ``CONTRACT``; ``contract_problems()``
-checks the vendored core against it (tests/test_hermes_contract.py), so a core change that moves one
+checks the vendored core against it (tests/test_hermes_round3.py), so a core change that moves one
 fails with the name of what moved, not with 50 unrelated test failures. Every redaction of a value
 goes through ``_scrub``: when the core's scrub entry point changes, that is the one line to update.
 
