@@ -59,9 +59,17 @@ State machines. Impossible states are listed so the code can refuse them.
       turn (the model's tool_calls, the tool event, an abandoned call) uses the same mapping.
       Impossible: two raw ids with one replacement; a raw id redaction would change, in a record.
 
-  Text: kept whole here. Hermes already holds every value in memory, so a record holds references,
-      not copies. The spooler drops a value too large to redact whole; the helper detects
-      sensitivity and redacts on complete values, and only then cuts what it keeps.
+  Text: kept whole here. A string is immutable, so a record holds the reference, not a copy. The
+      spooler drops a value too large to redact whole; the helper detects sensitivity and redacts on
+      complete values, and only then cuts what it keeps.
+
+  Structured value (tool arguments, provider tool calls; snapshot.py): one bounded pass per field.
+      within budget --> marshal bytes of a copy | over budget --> Omitted, dropped whole by the spooler
+      (an omitted input blanks its turn). pre_tool_call keeps only a reference to Hermes's arguments:
+      post_tool_call snapshots the same object, and only a call abandoned at turn end is snapshotted
+      from that reference. The plugin snapshots post_tool_call's arguments and post_api_request's
+      reply before it takes its lock (``_args``, ``_reply``); the tracker does it only when they are
+      missing. A model's JSON-text arguments stay text: the helper parses them (snapshot.unpack).
 
   Child binding: a child's events go to the root turn that started it, under agent_id = its key,
       even after that turn ended (Hermes runs delegations in the background). A grandchild takes
@@ -72,15 +80,14 @@ State machines. Impossible states are listed so the code can refuse them.
 from __future__ import annotations
 
 import enum
-import json
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from . import snapshot
+
 HARNESS = "hermes"
-# Nesting kept in a captured value; deeper structure is replaced whole, never cut.
-MAX_DEPTH = 12
 # A tool call id redaction would change is replaced by this and a number (see "Tool call id").
 ALIAS_PREFIX = "call_redacted_"
 OK_TOOL = "ok"
@@ -120,7 +127,7 @@ class Attempt:
 class Calls:
     """One agent's calls in flight."""
 
-    tools: dict = field(default_factory=dict)  # tool_call_id -> (name, args, start)
+    tools: dict = field(default_factory=dict)  # tool_call_id -> (name, Hermes's args object (a reference), start)
     attempts: dict = field(default_factory=dict)  # api_request_id -> Attempt
     seq: dict = field(default_factory=dict)  # api_request_id -> attempts started so far
     ids: dict = field(default_factory=dict)  # raw tool call id -> the id its records carry (see "Tool call id")
@@ -179,8 +186,9 @@ class Where:
 # ---- pure readers of Hermes kwargs ---------------------------------------------------------------
 
 
-def text_of(value: Any) -> str:
-    """A message content as text: a string, or the text parts of a content list. Never cut."""
+def text_of(value: Any) -> Any:
+    """A message content as text: a string, or the text parts of a content list. Never cut. Anything else
+    as its JSON, within the snapshot budget (else snapshot.Omitted)."""
     if value is None:
         return ""
     if isinstance(value, str):
@@ -196,21 +204,7 @@ def text_of(value: Any) -> str:
                 elif isinstance(part.get("text"), str):
                     parts.append(part["text"])
         return "\n".join(p for p in parts if p)
-    return json.dumps(value, ensure_ascii=False, default=str)
-
-
-def capped(value: Any, depth: int = 0) -> Any:
-    """A JSON-shaped copy: strings whole, unknown objects as their string, nesting past MAX_DEPTH replaced whole.
-    Plain recursion, no closure: a self-referencing closure per call is a cycle only the GC frees."""
-    if isinstance(value, str) or value is None or isinstance(value, (bool, int, float)):
-        return value
-    if not isinstance(value, (dict, list, tuple)):
-        return str(value)
-    if depth > MAX_DEPTH:
-        return "…"
-    if isinstance(value, dict):
-        return {str(k): capped(v, depth + 1) for k, v in value.items()}
-    return [capped(v, depth + 1) for v in value]
+    return snapshot.text(value)
 
 
 _LINEAGE = re.compile(r":[0-9a-f]{8}")
@@ -250,7 +244,8 @@ def _get(obj: Any, name: str) -> Any:
 
 
 def calls_of(raw: Any) -> list[dict]:
-    """Tool calls from Hermes's response: provider objects or dicts, flat or OpenAI ``function`` shaped."""
+    """Tool calls from Hermes's response: provider objects or dicts, flat or OpenAI ``function`` shaped.
+    JSON-text arguments stay text (the helper parses them); any other arguments are snapshotted."""
     calls = []
     for item in raw if isinstance(raw, (list, tuple)) else []:
         fn = _get(item, "function")
@@ -258,12 +253,7 @@ def calls_of(raw: Any) -> list[dict]:
         args = _get(item, "arguments")
         if args is None:
             args = _get(fn, "arguments")
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except ValueError:
-                pass
-        calls.append({"id": str(_get(item, "id") or ""), "name": str(name), "arguments": capped(args if args is not None else {})})
+        calls.append({"id": str(_get(item, "id") or ""), "name": str(name), "arguments": snapshot.take(args if args is not None else {})})
     return calls
 
 
@@ -340,6 +330,18 @@ class Tracker:
         sid = s(kw, "session_id")
         origin = lineage(kw)
         return self.ids.get(sid) or self.owner.get(s(kw, "turn_id")) or self.ids.get(origin) or origin or sid
+
+    def traced(self, kw: dict) -> bool:
+        """Would a call event with these kwargs be recorded? Read-only, same lookups as ``_where``. The plugin asks
+        before it snapshots a payload outside its lock; a wrong answer costs only a snapshot made under the lock."""
+        key = self.ids.get(s(kw, "session_id")) or self.owner.get(s(kw, "turn_id")) or self.ids.get(lineage(kw))
+        conv = self.convs.get(key) if key else None
+        if conv is None:
+            return False
+        if conv.kind is Kind.CHILD:
+            return conv.gate is not None
+        turn = self.turns.get(s(kw, "turn_id")) or self.turns.get(conv.open_turn)
+        return turn is not None and turn.session_id == conv.key and turn.gate is not None
 
     def _conv(self, kw: dict, step: Step, sid_name: str = "session_id") -> Conv | None:
         """The conversation an event belongs to, adding an alias when Hermes rotated its session id:
@@ -439,7 +441,7 @@ class Tracker:
         calls = where.calls
         for call_id, (name, args, start) in sorted(calls.tools.items(), key=lambda item: item[1][2]):
             out.append((where.gate, self._record("tool", where.session_id, where.turn_id, now, agent_id=where.agent_id, tool_name=name,
-                                                 tool_call_id=self._call_id(where, call_id), tool_input=args, tool_output="(no result: the turn ended first)",
+                                                 tool_call_id=self._call_id(where, call_id), tool_input=snapshot.take(args), tool_output="(no result: the turn ended first)",
                                                  is_error=True, start_ts=start, end_ts=max(now, start + 1))))
         for rid, att in sorted(calls.attempts.items(), key=lambda item: item[1].start):
             out.append(self._model(where, attempt_id(rid, att.seq), att.start, now, att.model, att.provider,
@@ -602,7 +604,7 @@ class Tracker:
             return step
         attempt, start, _pending = self._finish_attempt(where, kw, now)
         end = ms(kw.get("ended_at"), start + ms(kw.get("api_duration"), 1))
-        text, calls = reply_of(kw)
+        text, calls = kw["_reply"] if "_reply" in kw else reply_of(kw)
         step.records.append(self._model(where, attempt or None, start, end, s(kw, "response_model") or s(kw, "model"), s(kw, "provider"),
                                          output=text, tool_calls=self._calls(where, calls) or None, usage=usage_of(kw.get("usage"))))
         return step
@@ -622,7 +624,7 @@ class Tracker:
         where = self._where(kw, step)
         call_id = s(kw, "tool_call_id")
         if where is not None and where.gate is not None and call_id:
-            where.calls.tools[call_id] = (s(kw, "tool_name") or "tool", capped(kw.get("args")), now)
+            where.calls.tools[call_id] = (s(kw, "tool_name") or "tool", kw.get("args"), now)  # a reference: see "Structured value"
         return step
 
     def post_tool_call(self, kw: dict, now: int) -> Step:
@@ -639,7 +641,8 @@ class Tracker:
             start = pending[2] if pending else now - 1
         status = str(kw.get("status") or OK_TOOL)
         rec = self._record("tool", where.session_id, where.turn_id, now, agent_id=where.agent_id, tool_name=s(kw, "tool_name") or "tool",
-                           tool_call_id=self._call_id(where, call_id) or None, tool_input=capped(kw.get("args")), tool_output=text_of(kw.get("result")),
+                           tool_call_id=self._call_id(where, call_id) or None, tool_input=kw["_args"] if "_args" in kw else snapshot.take(kw.get("args")),
+                           tool_output=text_of(kw.get("result")),
                            is_error=True if status != OK_TOOL else None, start_ts=start, end_ts=max(now, start + 1))
         step.records.append((where.gate, rec))
         return step

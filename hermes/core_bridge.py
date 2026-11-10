@@ -5,8 +5,13 @@ When the core's opt-in or redaction API changes, this is the one file to update.
 
     optin     find_optin, load_project, tracing_forced_off, state_dir, session_override_path,
               read_session_mode, write_session_mode, session_status, safe_id
-    redact    ruleset, env_secrets, sanitize_event, scrub_value, strip_text, RedactionLimit
+    redact    ruleset, env_secrets, sanitize_event, scrub_fields, strip_text, field_class, RedactionLimit
     config    load_credentials, DEFAULT_API_URL
+
+They are listed, with the parameters the bridge passes, in ``CONTRACT``; ``contract_problems()``
+checks the vendored core against it (tests/test_hermes_contract.py), so a core change that moves one
+fails with the name of what moved, not with 50 unrelated test failures. Every redaction of a value
+goes through ``_scrub``: when the core's scrub entry point changes, that is the one line to update.
 
 The functions, in the order a record meets them:
 
@@ -95,6 +100,63 @@ class Gate:
                    pairs(data["stamps"]), tuple(data.get("withheld") or ()))
 
 
+# The core API the bridge depends on: (module, name, the parameters the bridge passes by position, in order).
+CONTRACT = (
+    ("optin", "find_optin", ("start",)),
+    ("optin", "load_project", ("path",)),
+    ("optin", "tracing_forced_off", ("env",)),
+    ("optin", "state_dir", ("env",)),
+    ("optin", "session_override_path", ("root", "session_id", "env")),
+    ("optin", "read_session_mode", ("root", "session_id", "default", "env")),
+    ("optin", "write_session_mode", ("root", "session_id", "mode", "env")),
+    ("optin", "session_status", ("cwd", "session_id", "env")),
+    ("optin", "safe_id", ("value",)),
+    ("redact", "ruleset", ("project",)),
+    ("redact", "env_secrets", ("env", "api_key")),
+    ("redact", "sanitize_event", ("event", "rs", "secrets", "capture")),
+    ("redact", "scrub_fields", ("fields", "rs", "secrets")),
+    ("redact", "strip_text", ("event",)),
+    ("redact", "field_class", ("name",)),
+    ("redact", "RedactionLimit", None),
+    ("redact", "Ruleset", None),
+)
+
+
+def contract_problems() -> list:
+    """What in the vendored core no longer matches CONTRACT, as readable lines; [] when it all does.
+    Parameter names are compared by position only: a rename the bridge doesn't pass by keyword is fine,
+    but a missing function, a new required parameter, or fewer parameters is reported."""
+    import inspect
+
+    problems = []
+    modules = {"optin": optin, "redact": redact}
+    for module, name, params in CONTRACT:
+        target = getattr(modules[module], name, None)
+        if target is None:
+            problems.append(f"judgment_core.{module}.{name} is gone (core_bridge uses it)")
+            continue
+        if params is None:
+            continue
+        try:
+            sig = inspect.signature(target)
+        except (TypeError, ValueError):
+            continue
+        listed = [p for p in sig.parameters.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+        if len(listed) < len(params) and not any(p.kind is p.VAR_POSITIONAL for p in sig.parameters.values()):
+            problems.append(f"judgment_core.{module}.{name}{sig} takes fewer than the {len(params)} arguments core_bridge passes {params}")
+        required = [p.name for p in listed[len(params):] if p.default is p.empty]
+        required += [p.name for p in sig.parameters.values() if p.kind is p.KEYWORD_ONLY and p.default is p.empty]
+        if required:
+            problems.append(f"judgment_core.{module}.{name}{sig} now requires {required}, which core_bridge does not pass")
+    return problems
+
+
+def _scrub(value, rs: "redact.Ruleset", secrets: list):
+    """One value with every secret in its strings and keys replaced. Raises RedactionLimit when it can't be
+    checked within the core's limits, or when the rules failed. The one call to the core's scrub entry point."""
+    return redact.scrub_fields({"value": value}, rs, secrets)[0]["value"]
+
+
 @functools.lru_cache(maxsize=64)
 def _rules(patterns: tuple, paths: tuple) -> redact.Ruleset:
     """Compiled once per distinct project config, not once per call."""
@@ -109,7 +171,7 @@ def warm() -> None:
     """Compile the redaction rules now, at plugin load, so the first turn does not pay for it. Writes nothing."""
     rs = _rules((), ())
     redact.env_secrets({})
-    redact.scrub_value("warm", rs, [])
+    _scrub("warm", rs, [])
 
 
 def forced_off(env: dict | None = None) -> bool:
@@ -148,7 +210,7 @@ def stamps(environment: str, root: str, export: list, rs: redact.Ruleset, secret
     try:
         if rs.error:
             raise redact.RedactionLimit(rs.error)
-        clean = {name: redact.scrub_value(value, rs, secrets) for name, value in wanted.items()}
+        clean = {name: _scrub(value, rs, secrets) for name, value in wanted.items()}
     except redact.RedactionLimit:
         return (), tuple(wanted)
     kept = [(name, clean[name]) for name in ("environment", "project_root")]
@@ -246,7 +308,7 @@ def needs_alias(gate, value: str) -> bool:
     if rs.error:
         return True
     try:
-        return redact.scrub_value(value, rs, list(gate.secrets)) != value
+        return _scrub(value, rs, list(gate.secrets)) != value
     except redact.RedactionLimit:
         return True
 
@@ -293,7 +355,7 @@ def _meta(out: dict, rs: redact.Ruleset, secrets: list) -> dict:
     try:
         if rs.error:
             raise redact.RedactionLimit(rs.error)
-        clean = {name: redact.scrub_value(value, rs, secrets) for name, value in present.items()}
+        clean = {name: _scrub(value, rs, secrets) for name, value in present.items()}
     except redact.RedactionLimit:
         clean = {}
     return {**{key: value for key, value in out.items() if key not in present}, **clean}
@@ -329,7 +391,11 @@ def _private_dir(path: Path) -> None:
 
 
 def stage(record: dict, state, name: str) -> None:
-    """Write the prepared record aside, owner-only, under the name it will be published as. Overwrites a stale copy."""
+    """Write the prepared record aside, owner-only, under the name it will be published as. Overwrites a stale copy.
+
+    This write fixes the record's identity: the flusher names an inbox event ``<name>.<mtime_ns>``, and a link
+    shares its file's mtime, so the record keeps that id through every later publish of it (see ``publish``).
+    """
     state = Path(state)
     scratch = state / "inbox.tmp"
     _private_dir(state)
@@ -344,19 +410,33 @@ def stage(record: dict, state, name: str) -> None:
 
 
 def publish(state, name: str) -> None:
-    """Link a staged record into ``inbox/``, whole, then drop the staged copy. Idempotent: run again after a crash
-    at any point, it finishes the job or finds it done. Its order is when it is published, not when it was written."""
+    """Link a staged record into ``inbox/``, whole, then drop the staged copy. Idempotent, and it never changes
+    the record's identity (name, mtime), so a replay can't make an event the flusher already folded look new.
+
+    One staged record, by which of its two links exist (a crash can stop between any two steps):
+
+        STAGED (tmp)  --link-->  LINKED (tmp + inbox)  --unlink tmp-->  PUBLISHED (inbox)  --flusher-->  FOLDED
+        LINKED --flusher folds and deletes the inbox link--> FOLDED, tmp left (the helper died before unlink)
+
+    A replay runs ``publish`` again from whatever state is left. From STAGED or LINKED it ends PUBLISHED;
+    from FOLDED-with-tmp it links the same inode again, same name, same mtime, so the flusher's id is
+    unchanged and its fold (``done`` ids, a turn's stored ``_id``) counts it once; from PUBLISHED or FOLDED it
+    finds nothing to do. Nothing here touches the mtime: the stage write set it, once.
+    Impossible: one record published under two ids; a staged copy rewritten after its seq was committed
+    (Helper.fold re-prepares only above the ledger's seq).
+    """
     state = Path(state)
     tmp = state / "inbox.tmp" / name
     try:
-        os.utime(tmp)
+        os.link(tmp, state / "inbox" / name)  # never replaces a file
     except FileNotFoundError:
         return  # published and cleaned up already
-    try:
-        os.link(tmp, state / "inbox" / name)  # never replaces a file
     except FileExistsError:
         pass
-    os.unlink(tmp)
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
 
 
 _senders: list = []

@@ -1,6 +1,6 @@
 """Hermes plugin callback latency, in-process, the way Hermes calls the callbacks.
 
-    python3 tests/bench_hermes.py [ROUNDS] [--json]
+    python3 tests/bench_hermes.py [ROUNDS] [--json] [--structured]
 
 Cases (every fake credential is built at runtime; the env is the sandbox's, never this process's):
 
@@ -15,6 +15,11 @@ Cases (every fake credential is built at runtime; the env is the sandbox's, neve
   saturated    56 KB turns back to back into a 4 MB queue, faster than the helper redacts: drops, never waits
   turnend      on_session_end with the real sender launch (sink down, so each sender exits quickly)
   handoff      not a callback: ms from on_session_end returning to its records being in the helper's pipe
+  rows329k     pre_tool_call, post_tool_call, post_api_request with 329 KB structured arguments, 10,000 rows
+               (review round 3's probe): over the snapshot budget, omitted whole, the turn blanked
+  rowsspread   10,000 rows as 100 lists of 100: the budget runs out partway through the walk
+  rowsedge     2,040 rows (~8,160 members, 68 KB): just within the budget, the most a callback copies
+  rows8x32k    8 threads, each running its own sessions with 32 KB (1,000-row) structured arguments
 
 Prints p50 / p95 / max in ms for each case and hook, and the queue's drop counts.
 """
@@ -100,6 +105,53 @@ def tool_turn(sid: str, n: int, result: str, answer: str, api_text: str | None =
     turn.api(text=api_text if api_text is not None else answer)
     turn.end(answer)
     return turn
+
+
+def rows(count: int, width: int = 12) -> dict:
+    return {"rows": [{"i": n, "v": ("r%07d" % n).ljust(width, "x")} for n in range(count)]}
+
+
+def rows_turn(sid: str, args) -> Turn:
+    turn = Turn(sid, "load the rows")
+    call = turn.api(tool=("load_rows", args))
+    turn.tool(call, "load_rows", args, '{"ok": true}')
+    turn.api(text="done")
+    turn.end("done")
+    return turn
+
+
+STRUCT_HOOKS = {"pre_tool_call", "post_tool_call", "post_api_request"}
+
+
+def run_structured(rounds: int, report: dict, summarize) -> int:
+    """The structured-argument cases (review round 3). Returns the callbacks that failed inside."""
+    sb = Sandbox()
+    try:
+        with plugin_env(sb, JUDGMENT_FLUSH="0") as (plugin, ctx):
+            Timer().fire(ctx, plugin, rows_turn(new_session_id(), {"warm": 1}).events)
+            spread = {"parts": [rows(100, 11)["rows"] for _ in range(100)]}
+            for case, args in (("rows329k", rows(10_000, 11)), ("rowsspread", spread), ("rowsedge", rows(2_040))):
+                timer = Timer()
+                for _n in range(max(rounds // 4, 60)):
+                    timer.fire(ctx, plugin, rows_turn(new_session_id(), args).events, only=STRUCT_HOOKS)
+                summarize(case, timer)
+
+            timer = Timer()
+            mid = rows(1_000)
+
+            def worker(w: int) -> None:
+                for _n in range(max(rounds // 8, 25)):
+                    timer.fire(ctx, plugin, rows_turn(new_session_id() + f"r{w}", mid).events, only=STRUCT_HOOKS)
+
+            threads = [threading.Thread(target=worker, args=(w,)) for w in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            summarize("rows8x32k", timer)
+            return plugin.errors["count"]
+    finally:
+        sb.cleanup()
 
 
 def run(rounds: int) -> dict[str, dict[str, tuple]]:
@@ -260,6 +312,7 @@ def run(rounds: int) -> dict[str, dict[str, tuple]]:
                     proc.wait(timeout=30)
                 except Exception:
                     pass
+        errors += run_structured(rounds, report, summarize)
         report["_errors"] = {"count": (errors, 0, 0, 0)}
     finally:
         sb.cleanup()
@@ -269,7 +322,17 @@ def run(rounds: int) -> dict[str, dict[str, tuple]]:
 def main() -> None:
     args = [arg for arg in sys.argv[1:] if not arg.startswith("--")]
     rounds = int(args[0]) if args else 400
-    report = run(rounds)
+    if "--structured" in sys.argv:  # only the round-3 cases
+        report: dict = {}
+
+        def summarize(case: str, timer: Timer) -> None:
+            report[case] = {hook: (statistics.median(v), pct(v, 0.95), max(v), len(v)) for hook, v in sorted(timer.times.items())}
+            everything = [x for v in timer.times.values() for x in v]
+            report[case]["ALL"] = (statistics.median(everything), pct(everything, 0.95), max(everything), len(everything))
+
+        report["_errors"] = {"count": (run_structured(rounds, report, summarize), 0, 0, 0)}
+    else:
+        report = run(rounds)
     if "--json" in sys.argv:
         print(json.dumps(report))
         return

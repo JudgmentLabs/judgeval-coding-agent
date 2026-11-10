@@ -5,11 +5,14 @@ several ms on a secret-dense 20 KB window, and no switch interval preempts it: i
 a 56 KB tool output stalled Hermes's own threads 8 ms at p95 (2.7 ms even at a 0.2 ms switch interval;
 see the bench notes in hermes/README.md). So the work is split:
 
-    callback (Hermes's thread)   tracker records -> bound -> Outbox.put: append to one queue, poke the
-                                 I/O thread. No I/O, no wait, no lock another thread holds for long.
+    callback (Hermes's thread)   bulky payloads snapshotted (snapshot.py, one bounded pass, before the
+                                 plugin's lock) -> tracker records -> bound (sizes only: no walk) ->
+                                 Outbox.put: append to one queue, poke the I/O thread. No I/O, no wait,
+                                 no lock another thread holds for long.
     I/O thread (Hermes, daemon)  spawn the helper; encode entries as frames; nonblocking writes to its
                                  pipe; read its acks; run alias jobs (a rotated id's /judgment file).
-    helper (own session)         frame -> core_bridge.prepare -> stage -> commit seq -> publish -> ack;
+    helper (own session)         frame -> snapshot.unpack -> core_bridge.prepare -> stage -> commit seq
+                                 -> publish -> ack;
                                  flush frame -> launch_sender -> ack. Survives Hermes's exit.
 
 Plain text crosses only the pipe, which is memory; nothing reaches disk before prepare ran.
@@ -38,7 +41,8 @@ Publication is exactly once per entry, even when a helper dies at any point (``s
     replayed entry at or below the ledger's seq is only re-linked if its staged copy is still there;
     above it, it is prepared again and overwrites a stale staged copy.
 
-Frames, length-prefixed JSON: ``{"t": "gate", "id": n, "gate": {...}}`` defines a gate for this
+Frames, length-prefixed marshal (the helper runs on Hermes's own interpreter; a snapshot crosses as the
+bytes it already is, so Hermes's I/O thread never re-encodes a large value): ``{"t": "gate", "id": n, "gate": {...}}`` defines a gate for this
 helper; ``{"t": "rec", "s": seq, "g": n, "r": record}``; ``{"t": "flush", "s": seq, "state": dir,
 "env": {...}}``; ``{"t": "forget"}`` drops the gates. The helper acks each seq with 8 bytes on fd 1.
 """
@@ -48,6 +52,7 @@ from __future__ import annotations
 import collections
 import fcntl
 import json
+import marshal
 import os
 import select
 import struct
@@ -62,9 +67,11 @@ from typing import Any
 
 if __package__:
     from . import core_bridge as core
+    from . import snapshot
 else:  # run as the helper: python spooler.py INSTANCE
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import core_bridge as core  # type: ignore[no-redef]
+    import snapshot  # type: ignore[no-redef]
 
 HELPER = Path(__file__).resolve()
 HEAD = struct.Struct("!I")
@@ -86,7 +93,10 @@ WRITE_CHUNK = 256 * 1024
 
 
 def frame(message: dict) -> bytes:
-    body = json.dumps(message, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+    try:
+        body = marshal.dumps(message)
+    except ValueError:  # a value marshal can't hold (a type the tracker never makes): as JSON would show it
+        body = marshal.dumps(json.loads(json.dumps(message, default=lambda value: value.decode("latin-1") if isinstance(value, bytes) else str(value))))
     return HEAD.pack(len(body)) + body
 
 
@@ -101,15 +111,17 @@ def helper_env(env: dict | None = None) -> dict:
 
 
 def _weigh(value: Any, limit: int) -> int:
-    """Characters of every string and key in ``value``, counting no further than just past ``limit``."""
-    if isinstance(value, str):
-        return len(value)
+    """What ``value`` weighs (snapshot.weight), counting no further than just past ``limit``. A snapshot or a
+    string is weighed by its length, with no walk; only small structures the tracker built (usage, the list
+    of tool calls around their snapshotted arguments) are walked."""
+    if isinstance(value, (str, bytes, snapshot.Omitted)):
+        return snapshot.weight(value)
     total = 0
     stack = [value]
     while stack and total <= limit:
         item = stack.pop()
-        if isinstance(item, str):
-            total += len(item)
+        if isinstance(item, (str, bytes, snapshot.Omitted)):
+            total += snapshot.weight(item)
         elif isinstance(item, dict):
             for key, inner in item.items():
                 total += len(key) if isinstance(key, str) else 8
@@ -124,8 +136,9 @@ def _weigh(value: Any, limit: int) -> int:
 def bound(record: dict) -> tuple[dict, int]:
     """The record with each field too large to redact whole replaced whole, never cut, and its size.
 
-    A field over FIELD_CAP, or one that would take the record past RECORD_CAP, becomes OMITTED and is
-    named in ``omitted``. prepare treats an omitted input as sensitive (its turn is blanked).
+    A field over FIELD_CAP, or one that would take the record past RECORD_CAP, or one the snapshot already
+    found over its budget (snapshot.Omitted, here or inside a tool call), becomes OMITTED and is named in
+    ``omitted``. prepare treats an omitted input as sensitive (its turn is blanked). No Omitted leaves here.
     """
     budget = RECORD_CAP
     out: dict = {}
@@ -542,7 +555,7 @@ def read_frames(fd: int):
             (size,) = HEAD.unpack_from(buffer, start)
             if len(buffer) - start - HEAD.size < size:
                 break
-            yield json.loads(bytes(buffer[start + HEAD.size : start + HEAD.size + size]))
+            yield marshal.loads(bytes(buffer[start + HEAD.size : start + HEAD.size + size]))
             start += HEAD.size + size
         del buffer[:start]
 
@@ -576,7 +589,7 @@ class Helper:
                 if gate.withheld and gate not in self.logged:
                     self.logged.add(gate)
                     core.log_line(gate.state, "hermes: redaction changed these stamps: " + ", ".join(gate.withheld))
-                core.stage(core.prepare(message["r"], gate), gate.state, name)
+                core.stage(core.prepare(snapshot.unpack(message["r"]), gate), gate.state, name)
                 ledger.commit(seq)
             core.publish(gate.state, name)
         elif kind == "flush":

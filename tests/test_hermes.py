@@ -271,7 +271,7 @@ class Redaction(HermesCase):
         env_value = SECRETS["env_value"]["core"]
         turn = Turn(sid, f"deploy with key {oa}, keep it safe")
         call = turn.api(tool=("terminal", {"command": f"curl -H 'Authorization: Bearer {SECRETS['bearer_token']['core']}' https://x"}), usage=(1001, 21, 0))
-        turn.tool(call, "terminal", {"command": f"echo {aws}"}, json.dumps({"output": f"token={gh}\nservice {env_value}\n{SECRETS['private_key']['text']}", "exit_code": 0}))
+        turn.tool(call, "terminal", {"command": f"echo {aws}"}, json.dumps({"output": f"token={gh}\npushed with {gh}\nservice {env_value}\n{SECRETS['private_key']['text']}", "exit_code": 0}))
         turn.api(error={"status_code": 401, "message": f"invalid key {SECRETS['anthropic_key']['core']}"})
         turn.api(text=f"Deployed. The slack token {slack} still works. Build {GIT_SHA}, id {UUID}.\n{CODE}")
         turn.end(f"Deployed. The slack token {slack} still works. Build {GIT_SHA}, id {UUID}.\n{CODE}")
@@ -279,7 +279,9 @@ class Redaction(HermesCase):
         body = self.sink.text()
         self.assertEqual(leaks(body, hashes=False), [], "a fake secret reached the sink")
         self.assertEqual(leaks(self.sb.state_text(), hashes=False), [], "a fake secret stayed under the state dir")
-        for rule in ("openai_key", "github_token", "aws_access_key_id", "slack_token", "env:" + ENV_SECRET_NAME, "anthropic_key", "private_key", "authorization_header"):
+        # PR1's rules take `token=<value>` whole as secret_assignment (the longer pair applies first); the bare
+        # token on the next line is github_token's.
+        for rule in ("openai_key", "github_token", "secret_assignment", "aws_access_key_id", "slack_token", "env:" + ENV_SECRET_NAME, "anthropic_key", "private_key", "authorization_header"):
             self.assertIn(f"[REDACTED:{rule}]", body, rule)
         # False positives stay byte for byte.
         for text in (GIT_SHA, UUID, CODE):

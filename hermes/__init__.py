@@ -8,7 +8,9 @@ waits on another thread's I/O:
     then, off the callback: I/O thread -> helper process (redacts, publishes the inbox, starts the sender)
 
 ``_lock`` serializes every tracker access and the put that follows a step, so records reach the
-queue in the order the tracker made them. Nothing slow runs under it.
+queue in the order the tracker made them. Nothing slow runs under it: the bulky payloads (tool
+arguments, the model's reply) are snapshotted before it is taken, by one bounded pass each
+(snapshot.py), and only for a call the tracker will record.
 
 Callbacks return None, so Hermes never blocks or changes anything because of this plugin, and
 any error inside one is swallowed.
@@ -28,7 +30,8 @@ import time
 
 from . import core_bridge as core
 from .spooler import spool_for
-from .tracker import HOOKS, Kind, Tracker
+from .tracker import HOOKS, Kind, Tracker, reply_of
+from . import snapshot
 
 log = logging.getLogger("judgment_tracing")
 errors = {"count": 0}  # callbacks that failed inside; never raised to Hermes
@@ -95,12 +98,28 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def normalize(hook: str, kwargs: dict) -> dict:
-    """The impure inputs a turn start needs, read before the lock: the workspace and the gate (files, cached).
+# Hooks whose payload is snapshotted before the lock: hook -> (kwarg the tracker reads, how it is made).
+SNAPSHOTS = {
+    "post_tool_call": ("_args", lambda kw: snapshot.take(kw.get("args"))),
+    "post_api_request": ("_reply", reply_of),
+}
 
-    The gate is resolved for the conversation the turn will run under (tracker.key_for), which for a
-    session id that preflight compression just rotated is the conversation it was rotated from.
+
+def normalize(hook: str, kwargs: dict) -> dict:
+    """What a step needs that is slow or impure, made before the lock.
+
+    pre_llm_call: the workspace and the gate (files, cached). The gate is resolved for the conversation
+    the turn will run under (tracker.key_for), which for a session id that preflight compression just
+    rotated is the conversation it was rotated from.
+    post_tool_call, post_api_request: the payload's snapshot (SNAPSHOTS), only when the call is traced.
     """
+    if hook in SNAPSHOTS:
+        with _lock:
+            wanted = tracker.traced(kwargs)
+        if not wanted:
+            return kwargs
+        name, make = SNAPSHOTS[hook]
+        return {**kwargs, name: make(kwargs)}
     if hook != "pre_llm_call" or kwargs.get("platform") == "subagent":
         return kwargs
     folder = workspace(str(kwargs.get("task_id") or ""))
