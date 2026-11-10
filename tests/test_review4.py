@@ -210,7 +210,8 @@ class EnvDumpWrapperTests(unittest.TestCase):
     DUMPS = ['bash -c "env"', "command env", "FOO=1 printenv", "sh -c 'cd /tmp; env'", 'bash -lc "ls && env"', 'echo "$(env)"',
              'echo "$(date)"; env; echo "done"', "sudo -u root env", "env FOO=1 env", "nohup env &", "timeout 5 printenv",
              "if true; then env; fi", "eval 'env'", "FOO='a b' env | sort", "x=`printenv`", "/usr/bin/env -0 > /tmp/e",
-             "cat <<'EOF' > f\nhello\nEOF\nenv"]
+             "cat <<'EOF' > f\nhello\nEOF\nenv", "LC_ALL=C printenv", "sudo -u root printenv", "LC_ALL=C env",
+             "sudo -E -u root printenv"]
 
     def test_both_layers(self):
         py, _ = assert_parity(self, [tool({"command": c}) for c in self.DUMPS])
