@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import os
@@ -132,6 +133,20 @@ def hermetic_dir(prefix: str = "jt-test-") -> Path:
     raise RuntimeError("no temp folder without a .judgment or .git above it: " + ", ".join(map(str, bases)))
 
 
+def _private_tmp() -> Path:
+    """The suite's own temp folder, made once and set as TMPDIR and tempfile.tempdir for this process and every process a
+    test starts: no test reads or writes the shared /tmp, so a stray /tmp/.judgment/tracing.json or /tmp/.git there can
+    never change a result. It sits under a base with no opt-in file or git repository above it (hermetic_dir)."""
+    folder = hermetic_dir("jt-suite-")
+    atexit.register(shutil.rmtree, folder, True)
+    os.environ["TMPDIR"] = str(folder)
+    tempfile.tempdir = str(folder)
+    return folder
+
+
+TMP = _private_tmp()
+
+
 class Sandbox:
     """A temp HOME, state dir, and opted-in project. The env holds no real variable but PATH.
 
@@ -163,6 +178,7 @@ class Sandbox:
             ENV_SECRET_NAME: SECRETS["env_value"]["core"],
             "PYTHONDONTWRITEBYTECODE": "1",
             "GIT_CEILING_DIRECTORIES": str(self.dir),
+            "TMPDIR": str(TMP),
         }
 
     def set_tracing(self, tracing: dict) -> None:
@@ -232,7 +248,7 @@ def wait_for(predicate, timeout: float = 20.0, step: float = 0.1) -> bool:
 
 
 def clean_env(**extra: str) -> dict:
-    return {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": "/home/tester", "LANG": "C.UTF-8", **extra}
+    return {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": "/home/tester", "LANG": "C.UTF-8", "TMPDIR": str(TMP), **extra}
 
 
 def jq(filter_text: str, inputs: list, *, cfg: dict | None = None, env: dict | None = None, bin_dir: Path = CORE / "bin") -> list:

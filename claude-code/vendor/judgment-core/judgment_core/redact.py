@@ -13,14 +13,21 @@ Everything is plain data through pure stages:
     Ruleset        compiled patterns, members, sensitive paths and commands (a user rule that fails: error)
     env_secrets    (name, literal) for each secret-named environment value, and each line of it
     sensitive      the sensitive path or env dump a tool call names, as {rule, trigger}, or None
-    pairs          the blob of every string and key -> Pair(found, replacement, rule), all found on the
-                   unchanged blob, one per distinct found text, longest first
+    findings       Finding(rule, start, end, kept): each rule's matches as spans of the unchanged blob, one
+                   finditer per window (linear: no match is searched for twice)
+    layers         the strings and keys of JSON nested deeper in a string than the rules read, one list per depth
+    pairs          findings -> Pair(found, replacement, rule), one per distinct found text, longest first; a
+                   nested layer's encoded as deep as it sits
+    env_found      {name, field}: the env values each field's raw text held, whatever rule replaced them
     scrub_fields   the secret-key members (exact "key":"value" tokens), then the pairs, applied to each field:
                    in its JSON when every pair can only sit inside a string there, else to each string value,
                    so no number or JSON syntax is ever touched; a Counter of what was replaced, by rule. A found
                    text still there afterwards fails closed
     records        [{rule, field, count}]: the audit, carried on the event as ``redactions``
     turn_redaction the turn's audit record, and why it was blanked
+
+Each event ends in one state (``outcome``): clean, redacted, sensitive, or error. The hook allows fewer distinct
+finds than the sender (``hook_budget``, ``sender_budget``): jq matches a long window once per distinct find.
 
 A rule set with an error (a user regex that does not compile) redacts every text to nothing. No
 function records a secret, or a hash, prefix, or length of one.
@@ -42,6 +49,7 @@ RULES_FILE = BIN / "redact-rules.json"
 COMPILED_FILE = BIN / "redact-compiled.json"
 SENSITIVE_REASON = "sensitive_path"
 _NAMED = re.compile(r"\(\?<([A-Za-z_][A-Za-z0-9_]*)>")
+_BACKREF = re.compile(r"\\k<([A-Za-z_][A-Za-z0-9_]*)>")
 
 
 # ---------------------------------------------------------------- the table, composed
@@ -82,16 +90,19 @@ def generated(table: Mapping | None = None) -> dict[str, str]:
     return {"secret_key_name": name, "secret_key_tail": tail, "literal": literal, "secret_key_last": last}
 
 
-def compose(regex: Any, table: Mapping | None = None) -> str:
-    """A rule's regex. A list joins its parts; {"def": name} is a shared fragment, {"gen": name} a generated one."""
+def compose(regex: Any, table: Mapping | None = None, depth: int = 0) -> str:
+    """A rule's regex. A list joins its parts; {"def": name} is a shared fragment (itself a string or a list), {"gen": name}
+    a generated one."""
     if not isinstance(regex, list):
         return regex
+    if depth > 16:
+        raise ValueError("defs nest too deep")
     table = table or rules()
     gen = generated(table) if any(isinstance(part, dict) and "gen" in part for part in regex) else {}
     out = []
     for part in regex:
         if isinstance(part, dict):
-            out.append(table["defs"][part["def"]] if "def" in part else gen[part["gen"]])
+            out.append(compose(table["defs"][part["def"]], table, depth + 1) if "def" in part else gen[part["gen"]])
         else:
             out.append(part)
     return "".join(out)
@@ -153,8 +164,8 @@ def _field_sets(fields: Mapping) -> dict:
 
 
 def _compile(regex: str) -> re.Pattern:
-    """Oniguruma names a group ``(?<p>...)``. Python spells it ``(?P<p>...)``."""
-    return re.compile(_NAMED.sub(r"(?P<\1>", regex))
+    """Oniguruma names a group ``(?<p>...)`` and refers back to it as ``\\k<p>``. Python spells them ``(?P<p>...)`` and ``(?P=p)``."""
+    return re.compile(_BACKREF.sub(r"(?P=\1)", _NAMED.sub(r"(?P<\1>", regex)))
 
 
 class RedactionLimit(ValueError):
@@ -224,7 +235,8 @@ def strip_text(event: Mapping) -> dict:
 
 
 def _unredactable(event: Mapping) -> dict:
-    """What an event keeps when its rules failed: only fields that are never redacted. No labels, no tool names."""
+    """What an event keeps when its rules failed: only fields that are never redacted (env_found among them). No labels,
+    no tool names."""
     return {**strip(event, lambda cls: cls["strip"] and not cls["redact"], names=False), "redaction_error": True}
 
 
@@ -314,7 +326,7 @@ def blob_items(value: Any) -> Iterator[str]:
 
 
 def windows(text: str) -> list[tuple[int, str, bool]]:
-    """Mirror of jp_windows: (start, text, last) for each window a rule runs over. See ``limits`` in redact-rules.json."""
+    """Mirror of jp_found's windows: (start, text, last) for each window a rule runs over. See ``limits`` in redact-rules.json."""
     limits = rules()["limits"]
     size, step = limits["window"], limits["step"]
     if len(text) <= size:
@@ -323,37 +335,23 @@ def windows(text: str) -> list[tuple[int, str, bool]]:
     return [(k * step, text[k * step : k * step + size], k == count - 1) for k in range(count)]
 
 
-def scan(pattern: re.Pattern, window: str, budget: int) -> list[re.Match]:
-    """Mirror of jp_scan: matches leftmost first, one search per distinct match.
+class Finding(NamedTuple):
+    """One match of a rule on the unchanged text: where it is, and how much of it (the p group) is kept."""
 
-    After each match, only its copies followed by the character that ended it are blanked (to the same length, that
-    character kept). A copy followed by anything else may be the start of a longer credential, so it stays for a later
-    search to find whole: no copy inside a longer match is ever masked on its own. A match that ends the window is the
-    last one. An empty first match falls back to every nonempty match.
-    """
-    out: list[re.Match] = []
-    while True:
-        if len(out) > budget:
-            raise RedactionLimit("pairs")
-        match = pattern.search(window)
-        if match is None:
-            return out
-        if not match.group(0):
-            return out + [item for item in pattern.finditer(window) if item.group(0)]
-        out.append(match)
-        end = window[match.end() : match.end() + 1]
-        if not end:
-            return out
-        window = window.replace(match.group(0) + end, "\x01" * len(match.group(0)) + end)
+    rule: str
+    start: int
+    end: int
+    kept: int  # the length of the kept prefix (the p group), 0 when the rule keeps none
 
 
-def found(rule: Rule, text: str) -> list[Pair]:
-    """Mirror of jp_found: each distinct complete match of the rule on the unchanged text, with what it becomes.
+def findings(rule: Rule, text: str, budget: int) -> list[Finding]:
+    """Every complete match of the rule on the unchanged text, as spans: one finditer per window, no rescans.
 
-    Each window is matched as it is in the text: nothing found in an earlier window is masked first, so every match
-    is a complete span of the unchanged text. A match that reaches the end of a window that is not the last is left to
-    the next window, which holds it from its start; one that starts before the next window does is longer than
-    window - step and fails closed.
+    jq matches a long window one distinct match at a time (jp_scan), since its global match counts offsets from the start
+    of the string; the distinct texts it finds are the ones a global match finds, so this finds the same pairs in linear time.
+    A match that reaches the end of a window that is not the last is left to the next window, which holds it from its start;
+    one that starts before the next window does is longer than window - step and fails closed. More than ``budget``
+    distinct texts fail closed too.
     """
     limits = rules()["limits"]
     # jq keeps the first named group's text when it is p. Oniguruma does not count unnamed groups once a group is named.
@@ -361,26 +359,40 @@ def found(rule: Rule, text: str) -> list[Pair]:
     keep = bool(named) and min(named.values()) == named.get("p")
     if rule.most is not None and rule.needs and text.count(rule.needs[0]) > rule.most:
         raise RedactionLimit(rule.id)
-    if rule.whole:
-        parts = [(0, text, True)]
-    else:
-        parts = windows(text)
-    hits: set[Pair] = set()
-    for _start, window, last in parts:
-        # As jq: a short window, one global match; a long one, the scan.
-        if len(window) <= limits["dense"]:
-            matches = [item for item in rule.pattern.finditer(window) if item.group(0)]
-        else:
-            matches = scan(rule.pattern, window, limits["pairs"])
-        for match in matches:
+    parts = [(0, text, True)] if rule.whole else windows(text)
+    out: dict[tuple[int, int], Finding] = {}
+    distinct: set[str] = set()
+    for start, window, last in parts:
+        for match in rule.pattern.finditer(window):
+            if not match.group(0):
+                continue
             if not last and match.end() == len(window):
                 if match.start() < limits["step"]:
                     raise RedactionLimit(rule.id)
                 continue
-            hits.add(Pair(match.group(0), ((match.group("p") or "") if keep else "") + placeholder(rule.id), rule.id))
-        if len(hits) > limits["pairs"]:
-            raise RedactionLimit(rule.id)
-    return sorted(hits)
+            kept = len(match.group("p") or "") if keep else 0
+            out.setdefault((start + match.start(), start + match.end()), Finding(rule.id, start + match.start(), start + match.end(), kept))
+            distinct.add(match.group(0))
+            if len(distinct) > budget:
+                raise RedactionLimit(rule.id)
+    return sorted(out.values(), key=lambda item: (item.start, item.end))
+
+
+def found(rule: Rule, text: str, budget: int | None = None) -> list[Pair]:
+    """Mirror of jp_found: each distinct complete match of the rule on the unchanged text, with what it becomes."""
+    budget = hook_budget() if budget is None else budget
+    pairs_ = {Pair(text[item.start : item.end], text[item.start : item.start + item.kept] + placeholder(rule.id), rule.id) for item in findings(rule, text, budget)}
+    return sorted(pairs_)
+
+
+def hook_budget() -> int:
+    """How many distinct found texts one event may hold in the hook (jq matches a long window once per distinct text)."""
+    return int(rules()["limits"]["pairs"])
+
+
+def sender_budget() -> int:
+    """The sender's: its matching is linear, so a turn dense with genuine secrets is redacted, not dropped."""
+    return int(rules()["limits"]["sender_pairs"])
 
 
 def _order(pairs: Iterable[Pair]) -> list[Pair]:
@@ -391,15 +403,75 @@ def _order(pairs: Iterable[Pair]) -> list[Pair]:
     return sorted(first.values(), key=lambda pair: (-len(pair.found), pair.found))
 
 
-def pairs(blob: str, rs: Ruleset, secrets: list[tuple[str, str]]) -> list[Pair]:
-    """Mirror of prepare.jq: the env values the blob holds, then each rule whose needs it holds, every one run over
-    the unchanged blob. One pair per found text, longest first."""
+def _layer_pairs(blob: str, rs: Ruleset, secrets: list[tuple[str, str]], budget: int) -> list[Pair]:
+    """The env values one layer's blob holds, then each rule whose needs it holds, over the unchanged blob."""
     out = [Pair(value, placeholder("env:" + name), "env:" + name) for name, value in secrets if value in blob]
     for rule in rs.patterns:
         if rule.applies(blob):
-            out += found(rule, blob)
+            out += found(rule, blob, budget)
+    return out
+
+
+def escaped(text: str, depth: int) -> str:
+    """Mirror of jp_esc: the text as it reads ``depth`` JSON string encodings down (jq's tojson without its quotes)."""
+    for _ in range(depth):
+        text = jq_json(text)[1:-1]
+    return text
+
+
+# A string holds JSON nested deeper than the text rules read (they read a quote, and one escaped as \") when it holds an
+# escaped backslash before a quote.
+NESTED = '\\\\"'
+
+
+def _containers(text: str) -> Iterator[Any]:
+    """Mirror of jp_containers: each JSON object or array the text holds whole, or from the first { or [ of the text or of
+    one of its lines (a log line's payload), decoded."""
+    for piece in [text] + (text.split("\n") if "\n" in text else []):
+        for opener in ("{", "["):
+            at = piece.find(opener)
+            if at < 0:
+                continue
+            try:
+                value = json.loads(piece[at:])
+            except (ValueError, RecursionError):
+                continue
+            if isinstance(value, (dict, list)):
+                yield value
+
+
+def layers(items: list[str]) -> list[list[str]]:
+    """Mirror of jp_layers: for each depth below the text, every string and key of the JSON nested in the strings above it
+    that hold an escaped backslash before a quote. Deeper than ``limits.depth`` fails closed: such nesting is not read."""
+    depth = rules()["limits"]["depth"]
+    out: list[list[str]] = []
+    current = items
+    while True:
+        nxt = [item for text in current if NESTED in text for value in _containers(text) for item in blob_items(value)]
+        if not nxt:
+            return out
+        if len(out) == depth:
+            raise RedactionLimit("depth")
+        out.append(nxt)
+        current = nxt
+
+
+def pairs(items: list[str], rs: Ruleset, secrets: list[tuple[str, str]], budget: int | None = None) -> list[Pair]:
+    """Mirror of prepare.jq: the pairs of the blob of ``items`` (every string and key), then those of each layer of JSON
+    nested in its strings, each found text there encoded as deep as its layer, so it is replaced where it sits. One pair per
+    found text, longest first. A nested find whose encoding is not in the blob (its JSON was written another way) fails
+    closed: it could not be replaced."""
+    budget = hook_budget() if budget is None else budget
+    blob = "\n".join(items)
+    out = _layer_pairs(blob, rs, secrets, budget)
+    for depth, layer in enumerate(layers(items), 1):
+        for pair in _layer_pairs("\n".join(layer), rs, secrets, budget):
+            deep = Pair(escaped(pair.found, depth), escaped(pair.replacement, depth), pair.rule)
+            if deep.found not in blob:
+                raise RedactionLimit("nested")
+            out.append(deep)
     ordered = _order(out)
-    if len(ordered) > rules()["limits"]["pairs"]:
+    if len(ordered) > budget:
         raise RedactionLimit("pairs")
     return ordered
 
@@ -433,11 +505,11 @@ def jq_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).replace("\x7f", "\\u007f")
 
 
-def member_pairs(fields: Mapping[str, Any], rs: Ruleset) -> list[Pair]:
+def member_pairs(fields: Mapping[str, Any], rs: Ruleset, budget: int | None = None) -> list[Pair]:
     """Mirror of prepare.jq: each member rule over the compact JSON of the fields' values (a field's name is never a
     key), as text: "key":"value" -> "key":"[REDACTED:secret_field]". One pair per found text, longest first."""
     text = jq_json(list(fields.values()))
-    return _order(pair for rule in rs.members if rule.applies(text) for pair in found(rule, text))
+    return _order(pair for rule in rs.members if rule.applies(text) for pair in found(rule, text, budget))
 
 
 _OUTSIDE_STRING = re.compile(r"[-+.0-9eEtrufalsn{}\[\],:]*")
@@ -473,7 +545,7 @@ def _loads(text: str) -> Any:
         raise RedactionLimit("json") from exc
 
 
-def scrub_fields(fields: Mapping[str, Any], rs: Ruleset, secrets: list[tuple[str, str]]) -> tuple[dict, list[dict]]:
+def scrub_fields(fields: Mapping[str, Any], rs: Ruleset, secrets: list[tuple[str, str]], budget: int | None = None) -> tuple[dict, list[dict]]:
     """Mirror of prepare.jq: the fields scrubbed together, and the records of what was replaced in each.
 
     One blob of every string and key gives the pairs, each a complete match on the unchanged blob. The compact JSON of
@@ -485,10 +557,10 @@ def scrub_fields(fields: Mapping[str, Any], rs: Ruleset, secrets: list[tuple[str
     """
     if rs.error:
         raise RedactionLimit("rules")
-    blob = "\n".join(blob_items(dict(fields)))
-    found_pairs = pairs(blob, rs, secrets)
-    members = [Pair(pair.found + '"', pair.replacement + '"', pair.rule) for pair in member_pairs(fields, rs)]
-    if len(found_pairs) + len(members) > rules()["limits"]["pairs"]:
+    budget = hook_budget() if budget is None else budget
+    found_pairs = pairs(list(blob_items(dict(fields))), rs, secrets, budget)
+    members = [Pair(pair.found + '"', pair.replacement + '"', pair.rule) for pair in member_pairs(fields, rs, budget)]
+    if len(found_pairs) + len(members) > budget:
         raise RedactionLimit("pairs")
     if not found_pairs and not members:
         return dict(fields), []
@@ -548,12 +620,34 @@ def _with_records(event: Mapping, records: list[dict]) -> dict:
     return out
 
 
-def scrub_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]]) -> dict:
+def env_found(event: Mapping, secrets: list[tuple[str, str]]) -> list[dict]:
+    """Mirror of jp_env_found: {name, field} for each secret env value a redacted field's text holds, whatever rule then
+    replaced it (a member or an assignment can swallow the value whole) and whether or not the event's rules failed.
+    The sender reads it to know which env values the hook's text depended on (flush.carry_records)."""
+    out = set()
+    for field, value in event.items():
+        if not field_class(field)["redact"]:
+            continue
+        blob = "\n".join(blob_items(value))
+        out |= {(field, name) for name, literal in secrets if literal in blob}
+    return [{"name": name, "field": field} for field, name in sorted(out)]
+
+
+def _with_env(event: Mapping, found: Iterable[Mapping]) -> dict:
+    """The event with ``found`` joined to the env provenance it already carries."""
+    merged = {(str(item.get("field")), str(item.get("name"))) for item in list(event.get("env_found") or []) + list(found) if isinstance(item, Mapping)}
+    out = {key: value for key, value in event.items() if key != "env_found"}
+    if merged:
+        out["env_found"] = [{"name": name, "field": field} for field, name in sorted(merged)]
+    return out
+
+
+def scrub_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]], budget: int | None = None) -> dict:
     """Every field whose class is redacted, scrubbed together. New records join the event's ``redactions``."""
     fields = {key: value for key, value in event.items() if field_class(key)["redact"]}
     if not fields:
         return dict(event)
-    scrubbed, records = scrub_fields(fields, rs, secrets)
+    scrubbed, records = scrub_fields(fields, rs, secrets, budget)
     return _with_records({**event, **scrubbed}, records)
 
 
@@ -561,20 +655,22 @@ def redact_text(text: str, rs: Ruleset, secrets: list[tuple[str, str]], field: s
     """One text, such as a history summary, and the records of what was replaced in it as ``field``.
     Nothing when the rules failed or hit a limit."""
     try:
-        scrubbed, records = scrub_fields({field: text}, rs, secrets)
+        scrubbed, records = scrub_fields({field: text}, rs, secrets, sender_budget())
     except RedactionLimit:
         return "", []
     return scrubbed[field], records
 
 
 def redact_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]]) -> dict:
-    """The sender's step: scrubbed, with what it replaced added to the records the event already carries."""
+    """The sender's step: scrubbed, with what it replaced added to the records the event already carries, and the env
+    values its text held added to its provenance. Its budget is the sender's: its matching is linear."""
+    found = env_found(event, secrets)
     if rs.error:
-        return _unredactable(event)
+        return _with_env(_unredactable(event), found)
     try:
-        return scrub_event(event, rs, secrets)
+        return _with_env(scrub_event(event, rs, secrets, sender_budget()), found)
     except RedactionLimit:
-        return _unredactable(event)
+        return _with_env(_unredactable(event), found)
 
 
 def metadata_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]]) -> dict:
@@ -583,7 +679,7 @@ def metadata_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]]) 
     kept["redactions"] = [item for item in census(event) if field_class(str(item["field"]))["metadata"]]
     if not rs.error:
         try:
-            return scrub_event(kept, rs, secrets)
+            return scrub_event(kept, rs, secrets, sender_budget())
         except RedactionLimit:
             pass
     return {**strip(event, lambda cls: cls["metadata"] and not cls["redact"], names=False), "redaction_error": True}
@@ -673,18 +769,20 @@ def sensitive(event: Mapping, rs: Ruleset) -> dict | None:
     for rule in rs.paths:
         if rule.applies(blob) and rule.pattern.search(blob):
             return {"rule": rule.id, "trigger": _whole_word(rule.pattern.pattern).search(blob).group(0)}
-    commands = "\n".join(texts)
+    # Each value is its own command line: a quote one leaves open never hides the next one's command.
     for rule in rs.commands:
-        if rule.applies(commands) and rule.pattern.search(commands):
+        if any(rule.applies(text) and rule.pattern.search(text) for text in texts):
             return {"rule": rule.id, "trigger": f"cmd:{rule.id}"}
     return None
 
 
 def sanitize_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]], capture: str = "sanitized") -> dict:
     """Mirror of prepare.jq's judgment_prepare for one event: capture policy, sensitive check, scrub, records."""
+    # The env values the raw text held, recorded whatever happens next: a rule that swallows one, a sensitive call that
+    # blanks the event, or a failure that drops its text (the sender must not restore that text from a transcript).
+    raw = event = _with_env({key: value for key, value in event.items() if key != "env_found"}, env_found(event, secrets))
     if rs.error:
         return _unredactable(event)
-    raw = event
     try:
         if capture == "metadata":
             event = {**strip(event), "prompt": "", "output": ""}
@@ -726,6 +824,32 @@ def first_sensitive(events: list[dict], rs: Ruleset, secrets: list[tuple[str, st
         if hit is not None:
             return {"rule": hit["rule"], "trigger": show_trigger(redact_text(hit["trigger"], rs, secrets)[0], home)}
     return None
+
+
+def outcome(event: Mapping) -> str:
+    """The state a redacted event is in, which the layers move it into and never out of:
+
+        clean      no rule replaced anything
+        redacted   records say what was replaced (``redactions``)
+        sensitive  a tool call read a sensitive path or dumped the environment: the text is gone (``sensitive``)
+        error      a rule failed or a limit was hit: the text, labels, and tool names are gone (``redaction_error``)
+
+    error wins over sensitive, which wins over redacted. Impossible: text in a sensitive or error event, or a label or
+    tool name in an error event. Those raise ValueError.
+    """
+    # tool_calls survive stripping as ids (and names, but not in an error event): checked on their own below.
+    text = [key for key, value in event.items() if key != "tool_calls" and not field_class(key)["strip"] and value not in ("", None)]
+    if event.get("redaction_error"):
+        labels = [key for key in event if field_class(key)["redact"]]
+        names = [call for call in event.get("tool_calls") or [] if isinstance(call, Mapping) and "name" in call]
+        if text or labels or names:
+            raise ValueError(f"error event keeps {sorted(set(text + labels)) or 'tool names'}")
+        return "error"
+    if event.get("sensitive"):
+        if text:
+            raise ValueError(f"sensitive event keeps {sorted(text)}")
+        return "sensitive"
+    return "redacted" if event.get("redactions") else "clean"
 
 
 def turn_redaction(events: list[dict], blank: Mapping | None = None, extra: Iterable[Mapping] = ()) -> dict:

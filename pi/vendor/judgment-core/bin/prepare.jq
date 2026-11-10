@@ -14,6 +14,8 @@
 # {rule, field, count}, carried on the event as `redactions`. When two keys of one object would become the same
 # placeholder (the field has fewer members after), the field is redone with every replacement numbered (#1, #2, ...), so
 # no member is lost. A found text still there afterwards (it spanned two strings of the blob) fails the event closed.
+# JSON nested in a string deeper than the rules read is decoded into layers (jp_layers); a find there is replaced as
+# encoded where it sits. env_found records which env values the raw text held, before anything can fail.
 #
 # jq compiles this on every hook run, on the agent's critical path, at about 1.5 microseconds per instruction: so no
 # recursive walker, and only C builtins or tiny definitions (no any, first-of-many, test, gsub, to_entries, paths,
@@ -30,8 +32,25 @@ def jp_test($re): _match_impl($re; null; true);
 def jp_holds($needs): . as $t | $needs == null or ([$needs[] as $n | $t | contains($n) | if . then 1 else empty end] != []);
 # Split at each of the literals: the pieces, one per line.
 def jp_lines($at): reduce $at[] as $c (.; split($c) | jp_join("\n"));
-# Every string and key, in order, one per line: the blob rules run over.
-def jp_blob: [.. | if type == "string" then . elif type == "object" then keys_unsorted[] else empty end] | jp_join("\n");
+# Every string and key, in order: the items of the blob rules run over, one per line.
+def jp_items: [.. | if type == "string" then . elif type == "object" then keys_unsorted[] else empty end];
+def jp_blob: jp_items | jp_join("\n");
+# The text as it reads $n JSON string encodings down.
+def jp_esc($n): if $n == 0 then . else tojson | .[1:-1] | jp_esc($n - 1) end;
+# Each JSON object or array a string holds whole, or from the first { or [ of it or of one of its lines, decoded.
+def jp_containers:
+  (., (if contains("\n") then split("\n")[] else empty end)) as $piece
+  | ("{", "[") as $o
+  | ($piece | split($o)) as $parts
+  | if ($parts | length) < 2 then empty
+    else ($o + ($parts[1:] | jp_join($o))) | try fromjson catch null | if type == "object" or type == "array" then . else empty end end;
+# For each depth below the items, every string and key of the JSON nested in the strings above it that hold an escaped
+# backslash before a quote (JSON deeper than a quote, or one escaped quote, which the rules read). Deeper than $max fails.
+def jp_layers($max):
+  def go($d):
+    [.[] | if contains("\\\"") then jp_containers | jp_items[] else empty end] as $next
+    | if $next == [] then empty elif $d == $max then error("redaction limit") else $next, ($next | go($d + 1)) end;
+  go(0);
 # How many members the value's objects hold in all.
 def jp_size: [.. | objects | length] | add;
 # Only the fields in $set.
@@ -97,8 +116,8 @@ def jp_sensitive($c; $r):
   | ([(.tool_input, (.tool_calls[]? | if type == "object" then .arguments, .input else empty end))
      | if type == "string" then (. as $t | try fromjson catch $t) else . end
      | if type == "string" then {command: .} else . end
-     | .. | if type == "object" then . as $o | keys_unsorted[] | if $s.keys[.] then $o[.] | .. | if type == "string" then . else empty end else empty end else empty end]
-     | jp_join("\n")) as $cmds
+     | .. | if type == "object" then . as $o | keys_unsorted[] | if $s.keys[.] then $o[.] | .. | if type == "string" then . else empty end else empty end else empty end]) as $vals
+  | ($vals | jp_join("\n")) as $cmds
   # Split, not a global match: jq counts each match's offset from the start of the string, so many matches cost its square.
   | (($cmds | jp_lines($s.split)) + "\n"
      + (if (.prompt | type) == "string" and (.prompt | contains("@")) then
@@ -111,19 +130,38 @@ def jp_sensitive($c; $r):
           {id: "custom_path", re: ("(?<![^\\n/:])" + ([explode[] | [.] | implode | $s.glob[.] // .] | jp_join("")) + "(?![^\\n])")} else empty end)
        | . as $p | if ($words | jp_holds($p.needs)) and ($words | jp_test($p.re)) then
            {rule: $p.id, trigger: ($words | _match_impl("(?<![^\\n])[^\\n]*?(?:" + $p.re + ")[^\\n]*"; null; false)[0].string)} else empty end),
-      ($s.commands[] | . as $p | if ($cmds | jp_holds($p.needs)) and ($cmds | jp_test($p.re)) then {rule: $p.id, trigger: ("cmd:" + $p.id)} else empty end),
+      # Each value is its own command line: a quote one leaves open never hides the next one's command.
+      ($s.commands[] | . as $p | if [$vals[] | if jp_holds($p.needs) and jp_test($p.re) then 1 else empty end] != [] then {rule: $p.id, trigger: ("cmd:" + $p.id)} else empty end),
       null);
+# [value, placeholder, rule] for each secret-named env value (and each line of one that spans lines) the text holds.
+def jp_env($text; $r):
+  [$ENV | keys_unsorted[] as $k | $ENV[$k] | (., (if contains("\n") then split("\n")[] | rtrimstr("\r") else empty end))
+   | if length >= $r.env.min_length and (. as $v | $text | contains($v)) and jp_test("\\S") then [., $k] else empty end]
+  | ([.[][1]] | unique | jp_join("\n") | [_match_impl($r.env.name_re; "g"; false)[] | {(.string): true}] | add) as $secret
+  | [.[] | if $secret[.[1]] then [.[0], "[REDACTED:env:" + .[1] + "]", "env:" + .[1]] else empty end]
+  | unique | sort_by(-(.[0] | length), .[1]);
+# {name, field} for each secret env value a redacted field's text holds, whatever rule then replaces it and whether or
+# not the rules fail: the sender reads it to know which env values the hook's text depended on (flush.carry_records).
+def jp_env_found($r):
+  . as $e
+  | [keys_unsorted[] | if $r.fields.plain[.] then empty else . end | . as $k
+     | jp_env($e[$k] | jp_blob; $r)[] | {name: .[2][4:], field: $k}]
+  | unique | sort_by(.field, .name);
 # Every field the class table does not keep plain, redacted, with its records.
 def jp_scrub($c; $r):
   . as $ev
   | (reduce (keys_unsorted[] | if $r.fields.plain[.] then empty else . end) as $k ({}; . + {($k): $ev[$k]})) as $sub
-  | ($sub | jp_blob) as $text
-  | ([$ENV | keys_unsorted[] as $k | $ENV[$k] | (., (if contains("\n") then split("\n")[] | rtrimstr("\r") else empty end))
-      | if length >= $r.env.min_length and (. as $v | $text | contains($v)) and jp_test("\\S") then [., $k] else empty end]
-     | ([.[][1]] | unique | jp_join("\n") | [_match_impl($r.env.name_re; "g"; false)[] | {(.string): true}] | add) as $secret
-     | [.[] | if $secret[.[1]] then [.[0], "[REDACTED:env:" + .[1] + "]", "env:" + .[1]] else empty end]
-     | unique | sort_by(-(.[0] | length), .[1])) as $env
-  | ($env + ($text | jp_pairs($r.patterns + [$c.redactPatterns // [] | .[]? | if type == "string" and . != "" then {id: "custom", re: .} else empty end]; $r.limits))
+  | ($sub | jp_items) as $items
+  | ($items | jp_join("\n")) as $text
+  | ($r.patterns + [$c.redactPatterns // [] | .[]? | if type == "string" and . != "" then {id: "custom", re: .} else empty end]) as $rules
+  # The blob's pairs, then each layer of JSON nested in its strings: a find there is encoded as deep as its layer, so it is
+  # replaced where it sits. One whose encoding is not in the blob (its JSON was written another way) fails closed.
+  | (jp_env($text; $r) + ($text | jp_pairs($rules; $r.limits))
+     + ([$items | jp_layers($r.limits.depth)] as $layers
+        | [range(0; $layers | length) as $i | ($layers[$i] | jp_join("\n")) as $lt
+           | (jp_env($lt; $r) + ($lt | jp_pairs($rules; $r.limits)))[]
+           | [(.[0] | jp_esc($i + 1)), (.[1] | jp_esc($i + 1)), .[2]]
+           | . as $x | if $text | contains($x[0]) then . else error("redaction limit") end])
      | unique_by(.[0]) | sort_by(-(.[0] | length))) as $pairs
   # A member's text "key":"value is made exact with its closing quote: it is replaced only where it is that whole member.
   | ([$sub[]] | tojson | [jp_pairs($r.members; $r.limits)[] | [.[0] + "\"", .[1] + "\"", .[2]]]) as $members
@@ -159,6 +197,9 @@ def jp_scrub($c; $r):
 # without labels or tool names: never the raw text.
 def judgment_redact($c; $capture):
   $redact_rules::redact_rules[0] as $r
+  # Recorded before anything can fail, so a failure that drops the text still says which env values it held.
+  | jp_env_found($r) as $found
+  | del(.env_found) + (if $found == [] then {} else {env_found: $found} end)
   | . as $raw
   | try (
       (if $capture == "metadata" then jp_pick($r.fields.strip) + jp_calls(true) + {prompt: "", output: ""}

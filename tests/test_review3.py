@@ -97,11 +97,13 @@ class CompleteSpanTests(unittest.TestCase):
         self.assertNotIn(full[30:], json.dumps(py + js))
         self.assertEqual(py[0]["redactions"], [{"rule": "openai_key", "field": "tool_output", "count": 3}])
 
-    def test_scan_keeps_a_copy_that_starts_a_longer_match(self):
+    def test_a_copy_that_starts_a_longer_match_is_found_whole(self):
+        # jq's jp_scan blanks only copies followed by the character that ended a match; the sender's single finditer
+        # finds the same distinct texts.
         rule = next(rule for rule in redact.ruleset().patterns if rule.id == "openai_key")
         full = "sk-" + "proj-" + _rand(48)
         window = filler(9000) + " " + full[:30] + "... " + full + " " + full[:30] + "."
-        found = sorted({match.group(0) for match in redact.scan(rule.pattern, window, 128)})
+        found = sorted({pair.found for pair in redact.found(rule, window)})
         self.assertEqual(found, sorted({full[:30], full}))
 
     def test_end_to_end(self):
