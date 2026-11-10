@@ -466,7 +466,9 @@ def carry_records(stored: list[dict], prepared: list[dict], names: Iterable[str]
         loses its text. The env value may be anywhere in the transcript, and nothing here could find it.
     """
     by_id = {event["_id"]: event for event in stored if event.get("_id")}
-    hook_env = {item["rule"][4:] for event in stored for item in redact.census(event) if item["rule"].startswith("env:")}
+    # Which env values the hook's text depended on: its env records, and its provenance (env_found), which says which
+    # env values each field held even when another rule replaced them or the event's rules failed.
+    hook_env = {name for event in stored for name, _field in _env_refs(event)}
     missing = bool(hook_env - set(names)) if names is not None else False
     seen: set[str] = set()
     out = []
@@ -476,7 +478,7 @@ def carry_records(stored: list[dict], prepared: list[dict], names: Iterable[str]
             seen.add(event["_id"])
         event = dict(event)
         if base is not None:
-            env_fields = {item["field"] for item in redact.census(base) if item["rule"].startswith("env:")}
+            env_fields = {field for _name, field in _env_refs(base)}
             for field in env_fields | (set(event) | set(base) if missing else set()):
                 if (field in env_fields or redact.field_class(field)["redact"]) and event.get(field) != base.get(field):
                     if field in base:
@@ -489,6 +491,16 @@ def carry_records(stored: list[dict], prepared: list[dict], names: Iterable[str]
         event = {key: value for key, value in event.items() if key != "redactions"}
         out.append({**event, "redactions": carried} if carried else event)
     return out
+
+
+def _env_refs(event: dict) -> set[tuple[str, str]]:
+    """(name, field) for each env value the hook found in the event's text: from its records and its provenance."""
+    refs = {(item["rule"][4:], item["field"]) for item in redact.census(event) if item["rule"].startswith("env:")}
+    found = event.get("env_found")
+    for item in found if isinstance(found, list) else []:
+        if isinstance(item, dict) and item.get("name") and item.get("field"):
+            refs.add((str(item["name"]), str(item["field"])))
+    return refs
 
 
 def _redact_history(history: list[dict], rs: redact.Ruleset, redactor: _Redactor) -> tuple[list[dict], list[dict]]:
