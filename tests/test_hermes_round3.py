@@ -7,6 +7,7 @@
                  (fails at hermes_support.LATENCY_GATE_P95_MS, best of 3 trials)
     Identity     #2 a helper dying between link and unlink, an ingestion, then a replay: one event, one id
     Collisions   #3 two distinct secret keys matching one rule keep both entries
+    Settings     tracing.json's redactCommands, redactNames, redactAllow, and redactDisable reach Hermes's redaction
 """
 
 from __future__ import annotations
@@ -316,7 +317,7 @@ class Identity(Case):
         from judgment_core import flush
 
         spooler, core = module("spooler"), load_plugin().core
-        gate = core.Gate("sanitized", (), (), (), str(self.sb.state), ())
+        gate = core.Gate("sanitized", (), (), str(self.sb.state), ())
         record = {"v": 1, "harness": "hermes", "event": "turn_start", "session_id": "s9", "turn_id": "t9", "ts": 1, "prompt": "hi"}
         frames = [{"t": "gate", "id": 1, "gate": gate.to_json()}, {"t": "rec", "s": 1, "g": 1, "r": record}]
 
@@ -356,7 +357,7 @@ class Identity(Case):
 class Collisions(unittest.TestCase):
     def test_two_secret_keys_matching_one_rule_keep_both_entries(self):
         core = load_plugin().core
-        gate = core.Gate("sanitized", (), (), (), "/nonexistent", ())
+        gate = core.Gate("sanitized", (), (), "/nonexistent", ())
         one, two = gh_token(), gh_token()
         record = {"v": 1, "harness": "hermes", "event": "tool", "session_id": "s", "turn_id": "t", "ts": 1,
                   "tool_input": {one: "first", two: "second", "nested": {one: "deep"}}, "tool_output": "ok"}
@@ -373,3 +374,27 @@ class Collisions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Settings(Case):
+    def test_every_redaction_key_in_tracing_json_applies(self):
+        """Each assertion differs from what the built-in rules alone would do, so a key the bridge dropped fails here."""
+        pin = "pw" + gh_token()[4:14]
+        token = gh_token()
+        project = self.sb.home / "settings"
+        (project / ".judgment").mkdir(parents=True)
+        (project / ".judgment" / "tracing.json").write_text(json.dumps({
+            "enabled": True, "redactCommands": ["mycli[^\\S\\n]+show-secret"], "redactNames": ["vault_pin"],
+            "redactAllow": ["changeme"], "redactDisable": ["github_token"]}))
+        turn = Turn(new_session_id(), "go")
+        calls = [("mycli show-secret db", "x"), ("ls", "vault_pin = " + pin), ("ls", "password = changeme"), ("ls", "gh " + token)]
+        for command, result in calls:
+            call = turn.api(tool=("terminal", {"command": command}))
+            turn.tool(call, "terminal", {"command": command}, result)
+        turn.api(text="ok")
+        turn.end("ok")
+        self.fire(turn.events, TERMINAL_CWD=str(project))
+        tools = [event for event in self.sb.inbox() if event.get("event") == "tool"]
+        self.assertEqual([event.get("sensitive_rule") for event in tools], ["custom_command", None, None, None])
+        self.assertEqual([event["tool_output"] for event in tools[1:]],
+                         ["vault_pin = [REDACTED:secret_assignment]", "password = changeme", "gh " + token])

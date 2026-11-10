@@ -344,7 +344,7 @@ class Redaction(HermesCase):
         core = load_plugin().core
         token = SECRETS["github_token"]["core"]
         text = "x " * (core.TEXT_CAP // 2 - 10) + token + " tail"
-        gate = core.Gate("sanitized", (), (), (), str(self.sb.state), ())
+        gate = core.Gate("sanitized", (), (), str(self.sb.state), ())
         out = core.prepare({"event": "tool", "tool_output": text}, gate)["tool_output"]
         self.assertTrue(out.endswith(core.CUT_MARK))
         self.assertNotIn(token[4:12], out)

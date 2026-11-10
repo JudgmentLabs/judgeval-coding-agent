@@ -123,7 +123,7 @@ class Stamps(Case):
 
     def test_a_failing_stage_keeps_no_label_or_metadata_unredacted(self):
         core = load_plugin().core
-        gate = core.Gate("sanitized", (), (), (), "/s", ())
+        gate = core.Gate("sanitized", (), (), "/s", ())
         record = {"event": "tool", "tool_name": "t-" + GH, "agent_type": "r-" + GH, "model": "m-" + GH, "tool_output": GH, "session_id": "s"}
         with mock.patch.object(core.redact, "sanitize_event", side_effect=TypeError("boom")):
             out = core.prepare(record, gate)
@@ -134,8 +134,8 @@ class Stamps(Case):
     def test_stamps_are_checked_through_prepare(self):
         core = load_plugin().core
         kept, withheld = core.stamps("prod-" + GH, "/w/" + GH, [("export_fp", "f" * 32), ("export_project", "p1"), ("export_url", "http://x")],
-                                     core._rules((), ()), [])
-        gate = core.Gate("sanitized", (), (), (), "/s", kept, withheld)
+                                     core._rules(()), [])
+        gate = core.Gate("sanitized", (), (), "/s", kept, withheld)
         out = core.prepare({"event": "turn_start", "prompt": "hi", "cwd": "/w/" + GH}, gate)
         self.assertEqual(no_piece(json.dumps(out), GH[4:]), [])
         self.assertEqual(out["export_project"], "p1")
@@ -149,7 +149,7 @@ class Truncation(Case):
     def setUp(self):
         super().setUp()
         self.core = load_plugin().core
-        self.gate = self.core.Gate("sanitized", (), (), ((ENV_SECRET_NAME, ENV_VALUE),), str(self.sb.state), ())
+        self.gate = self.core.Gate("sanitized", (), ((ENV_SECRET_NAME, ENV_VALUE),), str(self.sb.state), ())
 
     def tool_turn(self, args: dict, result: str) -> Turn:
         turn = Turn(new_session_id(), "go")
@@ -179,7 +179,7 @@ class Truncation(Case):
 
     def test_the_cut_after_redaction_drops_the_partial_word_whole(self):
         cap = self.core.TEXT_CAP
-        rs_gate = self.core.Gate("sanitized", ("passphrase is [a-z]+ [a-z]+ [a-z]+",), (), (("X_TOKEN", "correct horse " + ENV_VALUE),),
+        rs_gate = self.core.Gate("sanitized", (("redactPatterns", ("passphrase is [a-z]+ [a-z]+ [a-z]+",)),), (("X_TOKEN", "correct horse " + ENV_VALUE),),
                                  str(self.sb.state), ())
         for at in range(cap - 40, cap + 10, 7):
             with self.subTest(at=at):
@@ -525,7 +525,7 @@ class Replay(Case):
         """The helper's steps one at a time: prepare, stage, commit, publish, ack. A crash after any of them, then a new helper
         replaying every unacked frame, publishes each record exactly once."""
         spooler, core = module("spooler"), load_plugin().core
-        gate = core.Gate("sanitized", (), (), (), str(self.sb.state), ())
+        gate = core.Gate("sanitized", (), (), str(self.sb.state), ())
         frames = [{"t": "gate", "id": 1, "gate": gate.to_json()}] + [
             {"t": "rec", "s": n, "g": 1, "r": {"v": 1, "harness": "hermes", "event": "tool", "session_id": "s", "turn_id": "t", "ts": n,
                                                "tool_call_id": f"c{n}", "tool_output": "x"}} for n in range(1, 6)]

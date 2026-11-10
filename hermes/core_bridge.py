@@ -3,7 +3,7 @@
 judgment_core is vendored next to this file (``vendor/judgment-core``, synced by scripts/sync-core.sh).
 When the core's opt-in or redaction API changes, this is the one file to update. It uses only:
 
-    optin     find_optin, load_project, tracing_forced_off, state_dir, session_override_path,
+    optin     find_optin, load_project, REDACT_KEYS, tracing_forced_off, state_dir, session_override_path,
               read_session_mode, write_session_mode, session_status, safe_id
     redact    ruleset, env_secrets, sanitize_event, scrub_fields, strip_text, field_class, RedactionLimit
     config    load_credentials, DEFAULT_API_URL
@@ -83,8 +83,7 @@ class Gate:
     """One turn's opt-in decision: plain data, everything prepare needs, resolved once at turn start."""
 
     capture: str  # full | sanitized | metadata, as optin.resolve_capture decides
-    patterns: tuple  # the project's redactPatterns
-    paths: tuple  # the project's redactPaths
+    rules: tuple  # ((key, (value, ...)), ...) the project's redaction settings, one pair per optin.REDACT_KEYS
     secrets: tuple  # ((name, value), ...) secret env values, longest first. Crosses only the pipe.
     state: str
     stamps: tuple  # ((field, value), ...) environment, project_root, export_*: each checked by redaction
@@ -96,14 +95,15 @@ class Gate:
     @classmethod
     def from_json(cls, data: dict) -> "Gate":
         pairs = lambda items: tuple(tuple(item) for item in items)  # noqa: E731
-        return cls(data["capture"], tuple(data["patterns"]), tuple(data["paths"]), pairs(data["secrets"]), data["state"],
-                   pairs(data["stamps"]), tuple(data.get("withheld") or ()))
+        rules = tuple((key, tuple(values)) for key, values in data["rules"])
+        return cls(data["capture"], rules, pairs(data["secrets"]), data["state"], pairs(data["stamps"]), tuple(data.get("withheld") or ()))
 
 
 # The core API the bridge depends on: (module, name, the parameters the bridge passes by position, in order).
 CONTRACT = (
     ("optin", "find_optin", ("start",)),
     ("optin", "load_project", ("path",)),
+    ("optin", "REDACT_KEYS", None),
     ("optin", "tracing_forced_off", ("env",)),
     ("optin", "state_dir", ("env",)),
     ("optin", "session_override_path", ("root", "session_id", "env")),
@@ -158,18 +158,23 @@ def _scrub(value, rs: "redact.Ruleset", secrets: list):
 
 
 @functools.lru_cache(maxsize=64)
-def _rules(patterns: tuple, paths: tuple) -> redact.Ruleset:
+def _rules(settings: tuple) -> redact.Ruleset:
     """Compiled once per distinct project config, not once per call."""
-    return redact.ruleset({"redactPatterns": list(patterns), "redactPaths": list(paths)})
+    return redact.ruleset({key: list(values) for key, values in settings})
+
+
+def settings(project: dict) -> tuple:
+    """The project's redaction settings as a Gate carries them: every key load_project reads, so none is dropped here."""
+    return tuple((key, tuple(project[key])) for key in optin.REDACT_KEYS)
 
 
 def rules(gate: Gate) -> redact.Ruleset:
-    return _rules(gate.patterns, gate.paths)
+    return _rules(gate.rules)
 
 
 def warm() -> None:
     """Compile the redaction rules now, at plugin load, so the first turn does not pay for it. Writes nothing."""
-    rs = _rules((), ())
+    rs = _rules(())
     redact.env_secrets({})
     _scrub("warm", rs, [])
 
@@ -256,7 +261,7 @@ def _base(workspace: str, env: dict) -> dict | None:
         return {"file": file, "version": version, "off": True}
     api_key = load_credentials(env).get("JUDGMENT_API_KEY", "")
     secrets = tuple(redact.env_secrets(env, api_key))
-    rs = _rules(tuple(project["redactPatterns"]), tuple(project["redactPaths"]))
+    rs = _rules(settings(project))
     kept, withheld = stamps(project["environment"], str(root), _export(env), rs, list(secrets))
     return {"root": root, "file": file, "version": version, "project": project, "secrets": secrets, "stamps": kept, "withheld": withheld,
             "state": optin.state_dir(env)}
@@ -308,8 +313,7 @@ def resolve(key: str, workspace: str, env: dict | None = None) -> Gate | None:
     if base is None or base.get("off") or _session_mode(base, key, env, now) != "on":
         return None
     project = base["project"]
-    return Gate(project["capture"], tuple(project["redactPatterns"]), tuple(project["redactPaths"]), base["secrets"], str(base["state"]),
-                base["stamps"], base["withheld"])
+    return Gate(project["capture"], settings(project), base["secrets"], str(base["state"]), base["stamps"], base["withheld"])
 
 
 def needs_alias(gate, value: str) -> bool:
