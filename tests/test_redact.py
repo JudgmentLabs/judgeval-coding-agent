@@ -361,8 +361,8 @@ class ProjectRuleTests(unittest.TestCase):
             self.assertEqual(set(optin.REDACT_KEYS), set(settings))
             self.assertEqual(redact.ruleset(loaded).error, "redactNames")
             path.write_text("{")
-            self.assertEqual({key: optin.load_project(path)[key] for key in settings}, {key: None for key in settings})
-            self.assertEqual(redact.ruleset(optin.load_project(path)).error, "")
+            # A file that cannot be read has unknown rules: the rule set fails closed (test_review10).
+            self.assertTrue(redact.ruleset(optin.load_project(path)).error)
 
 
 class GateTests(unittest.TestCase):

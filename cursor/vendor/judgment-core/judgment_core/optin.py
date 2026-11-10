@@ -59,13 +59,18 @@ def resolve_capture(data: dict) -> str:
 REDACT_KEYS = tuple(redact.settings())
 
 
-_CLOSED = {"enabled": False, "capture": "sanitized", "sessionDefault": "on", "environment": "production", **{key: None for key in REDACT_KEYS}}
+# A file that cannot be read is no opt-in, and its rules are unknown: every rule setting is malformed, so a turn already
+# recorded under it loses its text in the sender (redact.ruleset fails closed) instead of going out under the built-in rules alone.
+_CLOSED = {"enabled": False, "capture": "sanitized", "sessionDefault": "on", "environment": "production",
+           **{key: False if kind == "rule" else None for key, kind in redact.settings().items()}}
 
 
 def load_project(path: Path) -> dict:
+    """The project's settings. Read as the hook's jq reads the file: a byte order mark is skipped, and the first JSON
+    document is the file."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        data, _end = json.JSONDecoder().raw_decode(path.read_text(encoding="utf-8-sig").lstrip())
+    except (OSError, ValueError):
         return dict(_CLOSED)
     if not isinstance(data, dict):
         return dict(_CLOSED)

@@ -102,15 +102,18 @@ def jp_found($p; $l):
                 else empty end]
          | unique)
       | if length > $l.pairs then error("redaction limit") else . end);
+# The pairs whose redacted text (the found text after its kept prefix) redactAllow does not name.
+def jp_allow($allow): [.[] | if $allow[.[0][((.[1] | length) - ("[REDACTED:" + .[2] + "]" | length)):]] then empty else . end];
 # Every rule whose needs and pre the text passes, over the unchanged text: one pair per found text, first in rule order,
-# longest first. A whole rule fails when the text holds more than `most` of its first need.
-def jp_pairs($rules; $l):
+# longest first. A whole rule fails when the text holds more than `most` of its first need. A find $allow names is left out
+# before one pair is kept per found text: the same text found by a second rule still goes.
+def jp_pairs($rules; $l; $allow):
   . as $t
   | [$rules[] | . as $p
      | if ($t | jp_holds($p.needs)) and ($p.pre == null or ($t | jp_test($p.pre))) then
          if $p.most and ($t | split($p.needs[0]) | length) > $p.most + 1 then error("redaction limit") else $t | jp_found($p; $l)[] end
        else empty end]
-  | unique_by(.[0]) | sort_by(-(.[0] | length));
+  | jp_allow($allow) | unique_by(.[0]) | sort_by(-(.[0] | length));
 # A project's redactNames name as secretNames spells a name: each part lower, UPPER, or Capitalized, joined by _, -, ., or nothing.
 def jp_word: ascii_downcase | split("_") | map("(?:" + . + "|" + ascii_upcase + "|" + (.[:1] | ascii_upcase) + .[1:] + ")") | jp_join("[_.-]?");
 # The rules this event runs (redact.ruleset): the built-in rules redactDisable keeps, the name rules over the built-in names
@@ -145,8 +148,6 @@ def jp_rules($c; $r):
      commands: (($r.sensitive.commands | kept)
                 + [setting("redactCommands")[] | {id: "custom_command", re: ($r.sensitive.command.prefix + "(?:" + . + ")" + $r.sensitive.command.unless)}]),
      allow: ($r.allow + setting("redactAllow") | map({(.): true}) | add // {})};
-# The pairs whose redacted text (the found text after its kept prefix) redactAllow does not name.
-def jp_allow($allow): [.[] | if $allow[.[0][((.[1] | length) - ("[REDACTED:" + .[2] + "]" | length)):]] then empty else . end];
 # {rule, trigger} for the first sensitive command, then path, the tool input names, or null. Path rules see one token per line:
 # the tokens of every path, command, and patch value, then the prompt's @mentions. Command rules see each command value
 # on its own.
@@ -195,12 +196,12 @@ def jp_scrub($x; $r):
   # so it is replaced where it sits. One whose encoding is not in the blob (its JSON was written another way) fails closed.
   | ([$items, ($items | jp_layers($r.limits.depth))] as $layers
      | [range(0; $layers | length) as $i | ($layers[$i] | jp_join("\n")) as $lt
-        | (jp_env($lt; $r) + ($lt | jp_pairs($x.patterns; $r.limits)) | jp_allow($x.allow))[]
+        | ((jp_env($lt; $r) | jp_allow($x.allow)) + ($lt | jp_pairs($x.patterns; $r.limits; $x.allow)))[]
         | [(.[0] | jp_esc($i)), (.[1] | jp_esc($i)), .[2]]
         | .[0] as $f | if $text | contains($f) then . else error("redaction limit") end]
      | unique_by(.[0]) | sort_by(-(.[0] | length))) as $pairs
   # A member's text "key":"value is made exact with its closing quote: it is replaced only where it is that whole member.
-  | ([$sub[]] | tojson | [jp_pairs($x.members; $r.limits) | jp_allow($x.allow)[] | [.[0] + "\"", .[1] + "\"", .[2]]]) as $members
+  | ([$sub[]] | tojson | [jp_pairs($x.members; $r.limits; $x.allow)[] | [.[0] + "\"", .[1] + "\"", .[2]]]) as $members
   | if ($pairs | length) + ($members | length) > $r.limits.pairs then error("redaction limit")
     elif $pairs == [] and $members == [] then .
     else
