@@ -88,8 +88,9 @@ class StructuredSecretTests(unittest.TestCase):
         self.assertTrue({("secret_field", "tool_input"), ("secret_field", "tool_output"), ("github_token", "tool_output"), ("secret_field", "tool_calls")} <= audit)
 
     def test_ordinary_members_stay(self):
+        # A string under a secret key is a literal, not code: "config2.access_token" there now goes (review 2, finding 3).
         keep = {"token": "the", "max_tokens": 4096, "key": "user_id_2024_v1", "password_hint": "ask Pat", "api_key": "${API_KEY}",
-                "access_token": "config2.access_token", "session_token": "tokenV2", "secret": False, "credentials": None, "author": "Pat Q"}
+                "secret": False, "credentials": None, "author": "Pat Q", "token_count": "12", "tokenizer": "bert-base"}
         py, js = both([tool(keep, {"rows": [keep]})])
         for out in (py[0], js[0]):
             self.assertEqual(out["tool_input"], keep)
@@ -116,8 +117,8 @@ class StructuredSecretTests(unittest.TestCase):
 class EnvValueTests(unittest.TestCase):
     """Finding 2: only a value's first line was replaced, and short, numeric, or lowercase values were skipped.
 
-    Threshold: a value (or one line of it) is replaced when it is 12 or more characters of any kind, or 8 to 11
-    characters that are not a single class (all lowercase, all capitals, all digits); and does not start with /.
+    Threshold since review 2: a value (or one line of it) of 8 or more characters, of any shape, that is not only
+    whitespace. Shorter values stay: replacing every short run such as 2024 in all text would destroy ordinary text.
     """
 
     def test_every_line_of_a_multiline_value(self):
@@ -138,7 +139,8 @@ class EnvValueTests(unittest.TestCase):
             "PIN_PASSWORD": "".join(_rng.choice(string.digits) for _ in range(12)),
             "MIXED_TOKEN": "Ab" + _rand(7),  # 9 characters, two classes
         }
-        kept = {"AUTH_PROVIDER": "keycloak", "SHORT_TOKEN": "Ab1", "DIGIT_TOKEN": "20240101", "CREDENTIAL_HELPER": "/usr/bin/helper-x"}
+        values.update({"AUTH_PROVIDER": "keycloak", "DIGIT_TOKEN": "20240101", "CREDENTIAL_HELPER": "/usr/bin/helper-x"})
+        kept = {"SHORT_TOKEN": "Ab1", "PIN_CODE_TOKEN": "4821"}
         env = clean_env(**values, **kept)
         event = tool({"command": "x"}, " | ".join(list(values.values()) + list(kept.values())))
         py, js = both([event], env=env)
@@ -303,7 +305,7 @@ class RuleErrorHistoryTests(unittest.TestCase):
     def test_redact_text_is_empty_on_error(self):
         broken = redact.ruleset({"redactPatterns": ["(unclosed"]})
         self.assertTrue(broken.error)
-        self.assertEqual(redact.redact_text("plain words", broken, []), "")
+        self.assertEqual(redact.redact_text("plain words", broken, []), ("", []))
 
 
 class CodeReferenceTests(unittest.TestCase):

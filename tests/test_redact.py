@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import unittest
 
 from support import ENV_SECRET_NAME, SECRETS, clean_env, jq, jq_sanitize, leaks, norm, py_sanitize, secret_blob, whole_leaks
@@ -112,11 +113,12 @@ class EnvTests(unittest.TestCase):
             "SSH_AUTH_SOCK": "/tmp/ssh-abc/agent.1234",
             "MAX_THINKING_TOKENS": "31999999",
             "KEYBOARD_LAYOUT": "us-intl-alt",
-            "AUTH_PROVIDER": "keycloak",
             "OAUTH_REDIRECT_URL": "https://example.com/callback",
             "SHORT_TOKEN": "abc",
         }
-        redacted = {"JUDGMENT_API_KEY": "short123", "SERVICE_PASSWORD": "Pw-" + SECRETS["env_value"]["core"][:10], "GITHUB_TOKEN": SECRETS["github_token"]["core"]}
+        # Any value of 8 or more characters under a secret name goes, whatever its shape (review 2, finding 2).
+        redacted = {"JUDGMENT_API_KEY": "short123", "SERVICE_PASSWORD": "Pw-" + SECRETS["env_value"]["core"][:10], "GITHUB_TOKEN": SECRETS["github_token"]["core"],
+                    "AUTH_PROVIDER": "keycloak"}
         env = self.env(**keep, **redacted)
         py_names = sorted({name for name, _ in redact.env_secrets(env)})
         self.assertEqual(py_names, sorted(redacted))
@@ -283,7 +285,7 @@ class GateTests(unittest.TestCase):
 
     def test_every_match_holds_a_needed_literal(self):
         rs = redact.ruleset()
-        for rule in rs.patterns + rs.paths + rs.commands:
+        for rule in rs.patterns + rs.paths + rs.commands + rs.members:
             for text in self.corpus():
                 for match in rule.pattern.finditer(text):
                     with self.subTest(rule=rule.id, match=match.group(0)[:40]):
@@ -293,15 +295,30 @@ class GateTests(unittest.TestCase):
         from dataclasses import replace
 
         rs = redact.ruleset()
-        open_rs = redact.Ruleset(tuple(replace(rule, needs=()) for rule in rs.patterns), rs.paths, rs.commands)
+        open_rs = redact.Ruleset(tuple(replace(rule, needs=(), pre=None) for rule in rs.patterns), rs.paths, rs.commands,
+                                 tuple(replace(rule, needs=(), pre=None) for rule in rs.members))
         for text in self.corpus():
             self.assertEqual(redact.redact_text(text, rs, []), redact.redact_text(text, open_rs, []))
 
     def test_member_rule_needs_cover_its_keys(self):
-        member, key_re, _ = redact._member()
-        for key in ("api_key", "x-api-key", "DB_PASSWORD", "clientSecret", "refresh_token", "Credentials", "passphrase"):
-            self.assertTrue(key_re.search(key), key)
-            self.assertTrue(member.applies(key), key)
+        """Every secret key the member rules take holds a need of the rule that took it, in the JSON the rule sees."""
+        rs = redact.ruleset()
+        for key in ("api_key", "x-api-key", "X-Api-Key", "DB_PASSWORD", "clientSecret", "refresh_token", "Credentials", "passphrase", "pwd",
+                    "Authorization", "smtpPassword", "aws_secret_access_key", "token", "SESSION_TOKEN"):
+            text = redact.jq_json([{key: "Zq81jdjskaQ8a9d2"}])
+            hits = [rule for rule in rs.members if rule.pattern.search(text)]
+            self.assertTrue(hits, key)
+            for rule in hits:
+                self.assertTrue(rule.applies(text), (key, rule.id))
+
+    def test_member_and_pre_filters_cover_every_match(self):
+        """needs and pre only let the layers skip a regex: each match of a rule passes both, in the corpus and the secrets."""
+        rs = redact.ruleset()
+        for text in self.corpus():
+            json_text = redact.jq_json([text, {"k": text}])
+            for rule in rs.members:
+                for match in rule.pattern.finditer(json_text):
+                    self.assertTrue(rule.applies(match.group(0)), (rule.id, match.group(0)[:40]))
 
 
 CAPTURE_MATRIX = [
@@ -363,9 +380,14 @@ class CaptureModeTests(unittest.TestCase):
 
         from judgment_core import cli
 
-        with tempfile.TemporaryDirectory() as folder, redirect_stdout(io.StringIO()):
-            cli.main(["--cwd", folder, "enable"])
-            written = json.loads((Path(folder) / ".judgment" / "tracing.json").read_text())
+        from support import hermetic_dir
+
+        folder = hermetic_dir("jt-cli-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        (folder / ".git").mkdir()  # the CLI writes at the repository root: make it this folder, whatever is above
+        with redirect_stdout(io.StringIO()):
+            cli.main(["--cwd", str(folder), "enable"])
+        written = json.loads((folder / ".judgment" / "tracing.json").read_text())
         self.assertEqual(written["capture"], "sanitized")
 
 

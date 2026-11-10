@@ -108,11 +108,39 @@ def whole_leaks(text: str) -> list[str]:
     return [rule for rule, item in SECRETS.items() if item["core"] in text]
 
 
+def _ancestor_markers(folder: Path) -> list[Path]:
+    """Opt-in files and git folders in ``folder`` or above it: anything a project-root walk could stop at."""
+    found = []
+    for parent in [folder, *folder.parents]:
+        for marker in (parent / ".judgment" / "tracing.json", parent / ".git"):
+            if marker.exists():
+                found.append(marker)
+    return found
+
+
+def hermetic_dir(prefix: str = "jt-test-") -> Path:
+    """A new temp folder no ancestor of which holds a .judgment/tracing.json or a .git, so no walk up from inside it
+    finds one the test did not make. The default temp dir comes first; a stray /tmp/.judgment skips to the next."""
+    bases = [Path(tempfile.gettempdir()), Path("/var/tmp"), Path("/dev/shm"), Path.home() / ".cache"]
+    for base in bases:
+        try:
+            base = base.resolve()
+            if base.is_dir() and os.access(base, os.W_OK) and not _ancestor_markers(base):
+                return Path(tempfile.mkdtemp(prefix=prefix, dir=base))
+        except OSError:
+            continue
+    raise RuntimeError("no temp folder without a .judgment or .git above it: " + ", ".join(map(str, bases)))
+
+
 class Sandbox:
-    """A temp HOME, state dir, and opted-in project. The env holds no real variable but PATH."""
+    """A temp HOME, state dir, and opted-in project. The env holds no real variable but PATH.
+
+    Hermetic: no folder above it holds an opt-in file or a git repository, and git stops at it.
+    """
 
     def __init__(self, tracing: dict | None = {"enabled": True}, sink_url: str = "http://127.0.0.1:9"):
-        self.dir = Path(tempfile.mkdtemp(prefix="jt-test-"))
+        self.dir = hermetic_dir()
+        assert not _ancestor_markers(self.dir), _ancestor_markers(self.dir)
         self.home = self.dir / "home"
         self.state = self.dir / "state"
         self.project = self.home / "proj"
@@ -134,6 +162,7 @@ class Sandbox:
             "JUDGMENT_FLUSH_GRACE_MS": "0",
             ENV_SECRET_NAME: SECRETS["env_value"]["core"],
             "PYTHONDONTWRITEBYTECODE": "1",
+            "GIT_CEILING_DIRECTORIES": str(self.dir),
         }
 
     def set_tracing(self, tracing: dict) -> None:
