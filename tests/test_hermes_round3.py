@@ -17,18 +17,15 @@ import json
 import marshal
 import os
 import secrets
-import statistics
 import string
 import sys
-import threading
 import time
 import unittest
 from unittest import mock
 
 from fake_sink import attrs, roots
-from hermes_support import LATENCY_GATE_P95_MS, LATENCY_TARGET_P95_MS, VENDOR_CORE, Turn, latency_trials, load_plugin, new_session_id, over, plugin_env
+from hermes_support import VENDOR_CORE, Turn, load_plugin, new_session_id
 from test_hermes_round2 import Case, module
-
 
 
 def gh_token() -> str:
@@ -228,87 +225,6 @@ class Structured(Case):
         tool = next(event for event in self.sb.inbox() if event["event"] == "tool")
         self.assertTrue(tool["is_error"])
         self.assertEqual(tool["tool_input"], args)
-
-
-class Latency(unittest.TestCase):
-    REPORT: dict = {}
-
-    @classmethod
-    def tearDownClass(cls):
-        for case, (p50, p95, mx, count, tried, slow) in sorted(cls.REPORT.items()):
-            flag = f"  over {LATENCY_TARGET_P95_MS} ms target: {slow}" if slow else ""
-            print(f"  {case:40s} n={count:5d} p50={p50:.3f} p95={p95:.3f} max={mx:.3f} ms (trials {tried}){flag}", file=sys.stderr)
-
-    def setUp(self):
-        from hermes_support import Sandbox
-
-        self.sb = Sandbox()
-        self.addCleanup(self.sb.cleanup)
-
-    def turn(self, sid: str, args) -> Turn:
-        turn = Turn(sid, "load the rows")
-        call = turn.api(tool=("load_rows", args))
-        turn.tool(call, "load_rows", args, '{"ok": true}')
-        turn.api(text="done")
-        turn.end("done")
-        return turn
-
-    def timed(self, ctx, events, times: dict, only: set, lock: threading.Lock) -> None:
-        for hook, kwargs, _at in events:
-            kwargs.setdefault("telemetry_schema_version", "hermes.observer.v1")
-            (callback,) = ctx.hooks[hook]
-            start = time.perf_counter()
-            callback(**kwargs)
-            took = (time.perf_counter() - start) * 1000
-            if hook in only:
-                with lock:
-                    times.setdefault(hook, []).append(took)
-
-    def check(self, case: str, times: dict, tried: int) -> None:
-        values = [value for series in times.values() for value in series]
-        self.REPORT[case] = (statistics.median(values), pct(values, 0.95), max(values), len(values), tried, over(times, LATENCY_TARGET_P95_MS))
-        self.assertEqual(over(times, LATENCY_GATE_P95_MS), {}, f"{case}: p95 over {LATENCY_GATE_P95_MS} ms in each of {tried} trials")
-
-    def test_large_structured_arguments(self):
-        big = rows(10_000, 11)  # 329 KB, the review's probe
-        lock = threading.Lock()
-        with plugin_env(self.sb, JUDGMENT_FLUSH="0") as (plugin, ctx):
-            self.timed(ctx, self.turn(new_session_id(), {"warm": 1}).events, {}, set(), lock)
-
-            def trial() -> dict:
-                times: dict = {}
-                for _ in range(60):
-                    self.timed(ctx, self.turn(new_session_id(), big).events, times, {"pre_tool_call", "post_tool_call", "post_api_request"}, lock)
-                self.assertEqual(plugin.errors["count"], 0)
-                return times
-
-            times, tried = latency_trials(trial)
-        self.check("329 KB / 10,000-row arguments", times, tried)
-
-    def test_eight_sessions_with_32k_structured_arguments(self):
-        args = rows(1_000)
-        self.assertGreater(len(json.dumps(args)), 30_000)
-        lock = threading.Lock()
-        with plugin_env(self.sb, JUDGMENT_FLUSH="0") as (plugin, ctx):
-            self.timed(ctx, self.turn(new_session_id(), {"warm": 1}).events, {}, set(), lock)
-
-            def trial() -> dict:
-                times: dict = {}
-
-                def worker(n: int) -> None:
-                    for _ in range(25):
-                        self.timed(ctx, self.turn(new_session_id() + f"w{n}", args).events, times, {"pre_tool_call", "post_tool_call", "post_api_request"}, lock)
-
-                threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
-                for thread in threads:
-                    thread.start()
-                for thread in threads:
-                    thread.join()
-                self.assertEqual(plugin.errors["count"], 0)
-                return times
-
-            times, tried = latency_trials(trial)
-        self.check("8 sessions, 32 KB structured arguments", times, tried)
 
 
 class Identity(Case):

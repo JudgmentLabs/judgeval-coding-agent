@@ -520,7 +520,6 @@ class Tracker:
             conv = self._new(origin, Kind.MAIN)
             if origin != sid:
                 self._alias(origin, sid, step)
-            self._evict()
         if conv.open_turn:
             closed = self._close_turn(conv.open_turn, now, interrupted=True)
             step.records += closed.records
@@ -534,6 +533,7 @@ class Tracker:
         self.owner[tid] = conv.key
         conv.turn_ids.add(tid)
         conv.open_turn = tid
+        self._evict()  # after the turn opens: a conversation with an open turn is never the one that goes
         if gate is None:
             return step
         conv.traced = gate
@@ -562,7 +562,7 @@ class Tracker:
         turn = self.turns.get(tid)
         if turn is None or turn.session_id != conv.key:
             return step
-        interrupted = bool(kw.get("interrupted")) or (kw.get("completed") is False and turn.phase is Phase.OPEN)
+        interrupted = bool(kw.get("interrupted")) or kw.get("completed") is False
         closed = self._close_turn(tid, now, interrupted)
         closed.aliases = step.aliases
         return closed

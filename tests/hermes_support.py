@@ -26,13 +26,13 @@ VENDOR_CORE = PLUGIN_DIR / "vendor" / "judgment-core"
 SCHEMA = "hermes.observer.v1"
 
 # Callback latency. Two numbers, on purpose:
-#   LATENCY_TARGET_P95_MS  what a callback should cost (Nick's target: p95 < 3 ms). Measured and
+#   LATENCY_TARGET_P95_MS  what a callback should cost (the target: p95 < 3 ms). Measured and
 #                          reported for every hook; a hook over it is flagged in the report.
 #   LATENCY_GATE_P95_MS    what fails a test. Shared CI runners (GitHub's ubuntu runners) add noise the
 #                          plugin doesn't cause: a neighbour's load, or a GIL handoff after one of the
 #                          rare syscalls a turn makes, can lift one trial's p95 by a few ms (seen:
 #                          pre_llm_call 4.1 ms on a PR run, under 3 ms on the push run of the same
-#                          commit). Nick accepted ~5 ms p95, so that is the gate.
+#                          commit). The accepted budget is ~5 ms p95, so that is the gate.
 # A test warms up (one untimed turn), then runs up to LATENCY_TRIALS trials and stops at the first whose
 # every hook is under the gate; a regression that is real stays over it in all of them. The best whole
 # trial is judged, never the best of each hook from different trials.

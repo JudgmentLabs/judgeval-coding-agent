@@ -560,7 +560,8 @@ def command(action: str, cwd: str, key: str, env: dict | None = None, aliases: t
 
 
 def copy_session_mode(key: str, alias: str, env: dict | None = None) -> None:
-    """Hermes rotated conversation ``key`` to session id ``alias``: a resume under the new id keeps its on/off."""
+    """Hermes rotated conversation ``key`` to session id ``alias``: a resume under the new id keeps its on/off.
+    It only ever creates the alias's file: a mode /judgment already wrote there is newer and stays."""
     env = dict(os.environ if env is None else env)
     source = optin.session_override_path(Path("/"), key, env)
     target = optin.session_override_path(Path("/"), alias, env)
@@ -568,6 +569,13 @@ def copy_session_mode(key: str, alias: str, env: dict | None = None) -> None:
         mode = source.read_text(encoding="utf-8").strip()
     except OSError:
         return
-    if mode in ("on", "off") and not target.exists():
-        optin.write_session_mode(Path("/"), alias, mode, env)
-        forget_cache()
+    if mode not in ("on", "off"):
+        return
+    _private_dir(target.parent)
+    try:
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(mode + "\n")
+    forget_cache()

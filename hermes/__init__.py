@@ -195,6 +195,7 @@ _ctx = {"ctx": None}
 
 def requester() -> tuple:
     """(key, other session ids) of the conversation a /judgment command came from, or ('', ()) when Hermes doesn't say.
+    Call it holding ``_lock``.
 
     Hermes passes a plugin command only its arguments (hermes_cli/plugins.py register_command). The
     interactive CLI runs one conversation and its PluginManager holds it (``_cli_ref``, cli.py), so
@@ -211,18 +212,21 @@ def requester() -> tuple:
         return "", ()
     if not sid:
         return "", ()
-    with _lock:
-        key = tracker.key_of(sid) or sid
-        if tracker.kind_of(key) is Kind.CHILD:
-            return "", ()
-        return key, tuple(sorted(tracker.aliases_of(key) - {key}))
+    key = tracker.key_of(sid) or sid
+    if tracker.kind_of(key) is Kind.CHILD:
+        return "", ()
+    return key, tuple(sorted(tracker.aliases_of(key) - {key}))
 
 
 def judgment_command(raw_args: str = "") -> str:
     try:
         words = (raw_args or "").split()
-        key, aliases = requester()
-        return core.command(words[0] if words else "status", workspace(), key, aliases=aliases)
+        folder = workspace()
+        # One step with the tracker: a rotation lands before this (its id is among the aliases) or after it (its copy
+        # of the mode, queued by that step, then reads what this wrote).
+        with _lock:
+            key, aliases = requester()
+            return core.command(words[0] if words else "status", folder, key, aliases=aliases)
     except Exception as exc:
         return f"Judgment tracing: the command failed ({type(exc).__name__})."
 

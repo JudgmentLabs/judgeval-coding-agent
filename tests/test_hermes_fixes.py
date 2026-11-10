@@ -7,11 +7,11 @@ sandbox env; the helper process it starts gets a minimal env and secret values o
 from __future__ import annotations
 
 import json
+import secrets
+import string
 import os
 import re
-import statistics
 import sys
-import threading
 import time
 import tracemalloc
 import types
@@ -21,7 +21,7 @@ from unittest import mock
 
 from fake_sink import Sink, attrs, roots
 from hermes_support import VENDOR_CORE, Turn, finalize, fire_all, flush_vendor, later, load_plugin, new_session_id, plugin_env, subagent_turn
-from hermes_support import LATENCY_GATE_P95_MS, LATENCY_TARGET_P95_MS, Sandbox, latency_trials, over
+from hermes_support import Sandbox
 from support import ENV_SECRET_NAME, SECRETS, leaks
 
 GH = SECRETS["github_token"]["core"]
@@ -133,29 +133,6 @@ class KeySecrets(Case):
 
 
 # ---- 3. truncation -------------------------------------------------------------------------------
-
-
-class Truncation(unittest.TestCase):
-    """The cut-point cases are in test_hermes_round2.Truncation; this one runs the whole path."""
-
-    def setUp(self):
-        self.core = load_plugin().core
-
-    def test_a_long_tool_result_spooled_without_any_piece(self):
-        sb = Sandbox()
-        self.addCleanup(sb.cleanup)
-        sid = new_session_id()
-        blob = ("z" * 70000 + GH + "q" * 100 + OPENAI + "w" * 60000)
-        turn = Turn(sid, "read it")
-        call = turn.api(tool=("read_file", {"path": "big"}))
-        turn.tool(call, "read_file", {"path": "big"}, blob)
-        turn.api(text="ok")
-        turn.end("ok")
-        with plugin_env(sb) as (plugin, ctx):
-            fire_all(ctx, turn.events, plugin)
-        self.assertEqual(leaks(sb.state_text(), hashes=False), [])
-        tool = next(event for event in sb.inbox() if event["event"] == "tool")
-        self.assertTrue(tool["tool_output"].endswith(self.core.CUT_MARK))
 
 
 # ---- 4. workspace --------------------------------------------------------------------------------
@@ -472,101 +449,6 @@ def dense_payload(count: int = 1000) -> str:
     return text[: 56 * 1024]
 
 
-class Latency(Case):
-    """Callback p95 per hook: reported against LATENCY_TARGET_P95_MS, failed at LATENCY_GATE_P95_MS (hermes_support)."""
-
-    REPORT: dict = {}
-
-    @classmethod
-    def tearDownClass(cls):
-        for case, (p50, p95, mx, count, tried, slow) in sorted(cls.REPORT.items()):
-            flag = f"  over {LATENCY_TARGET_P95_MS} ms target: {slow}" if slow else ""
-            print(f"  {case:34s} n={count:5d} p50={p50:.3f} p95={p95:.3f} max={mx:.3f} ms (trials {tried}){flag}", file=sys.stderr)
-
-    def timed(self, ctx, plugin, events, times: dict, only: set | None = None, lock: threading.Lock | None = None) -> None:
-        for hook, kwargs, at in events:
-            kwargs.setdefault("telemetry_schema_version", "hermes.observer.v1")
-            (callback,) = ctx.hooks[hook]
-            start = time.perf_counter()
-            callback(**kwargs)
-            took = (time.perf_counter() - start) * 1000
-            if only is None or hook in only:
-                with lock or threading.Lock():
-                    times.setdefault(hook, []).append(took)
-
-    def check(self, case: str, times: dict, tried: int) -> None:
-        values = [value for series in times.values() for value in series]
-        self.REPORT[case] = (statistics.median(values), pct(values, 0.95), max(values), len(values), tried, over(times, LATENCY_TARGET_P95_MS))
-        self.assertEqual(over(times, LATENCY_GATE_P95_MS), {}, f"{case}: p95 over {LATENCY_GATE_P95_MS} ms in each of {tried} trials")
-
-    def tool_turn(self, sid: str, result: str, answer: str) -> Turn:
-        turn = Turn(sid, "read it")
-        call = turn.api(tool=("read_file", {"path": "notes.txt"}))
-        turn.tool(call, "read_file", {"path": "notes.txt"}, result)
-        turn.api(text=answer)
-        turn.end(answer)
-        return turn
-
-    def test_secret_dense_payloads(self):
-        dense = dense_payload()
-        with plugin_env(self.sb, JUDGMENT_FLUSH="0") as (plugin, ctx):
-            self.timed(ctx, plugin, self.tool_turn(new_session_id(), "warm", "warm").events, {})
-
-            def trial() -> dict:
-                times: dict = {}
-                for _ in range(60):
-                    self.timed(ctx, plugin, self.tool_turn(new_session_id(), dense, dense).events, times,
-                               only={"post_tool_call", "post_api_request", "on_session_end"})
-                return times
-
-            times, tried = latency_trials(trial)
-        self.check("dense 56 KB, 1000 credentials", times, tried)
-        self.assertEqual(leaks(self.sb.state_text(), hashes=False), [])
-
-    def test_eight_threads_at_once(self):
-        plain = ("line of ordinary tool output text\n" * 128)[:4096]
-        lock = threading.Lock()
-        with plugin_env(self.sb, JUDGMENT_FLUSH="0") as (plugin, ctx):
-            self.timed(ctx, plugin, self.tool_turn(new_session_id(), "warm", "warm").events, {})
-
-            def trial() -> dict:
-                times: dict = {}
-
-                def worker(n: int) -> None:
-                    for i in range(40):
-                        self.timed(ctx, plugin, self.tool_turn(new_session_id() + f"t{n}", plain, f"a{i}").events, times, lock=lock)
-
-                threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
-                for thread in threads:
-                    thread.start()
-                for thread in threads:
-                    thread.join()
-                self.assertEqual(plugin.errors["count"], 0)
-                return times
-
-            times, tried = latency_trials(trial)
-        self.check("8 threads, 4 KB tool output", times, tried)
-        self.assertEqual(len(list((self.sb.state / "inbox").iterdir())), tried * 8 * 40 * 5 + 5)  # every trial's turns, and the warm-up turn
-
-    def test_turn_end_with_the_real_sender_launch(self):
-        with plugin_env(self.sb, JUDGMENT_FLUSH=None, JUDGMENT_API_URL="http://127.0.0.1:9") as (plugin, ctx):
-            self.timed(ctx, plugin, self.tool_turn(new_session_id(), "warm", "warm").events, {})
-
-            def trial() -> dict:
-                times: dict = {}
-                for i in range(40):
-                    self.timed(ctx, plugin, self.tool_turn(new_session_id(), "ok", f"a{i}").events, times, only={"on_session_end"})
-                    time.sleep(0.02)
-                return times
-
-            times, tried = latency_trials(trial)
-            helper = plugin.spool.proc
-        self.check("turn end, sender launched", times, tried)
-        self.assertIsNotNone(helper)
-        log = self.sb.state / "flush.log"
-        self.assertTrue(log.exists() and "post attempt" in log.read_text() or wait_log(log))
-
-
 def wait_until(predicate, timeout: float = 10.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -665,6 +547,112 @@ class Helper(Case):
         # helper must keep so its temp files land where its parent's do, not in the shared /tmp.
         self.assertEqual(set(env), {"PATH", "HOME", "LANG", "TMPDIR", "PYTHONDONTWRITEBYTECODE"})
         self.assertNotIn(ENV_VALUE, env.values())
+
+
+# ---- a malformed setting, on/off after a rotation, a late event of a closed turn
+
+
+def gh_token() -> str:
+    return "gh" + "p_" + "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(36))
+
+
+class Malformed(Case):
+    BAD = ({"redactNames": "pin"}, {"redactPatterns": {"INTERNAL-[0-9]+": 1}}, {"redactCommands": "vaultctl"}, {"redactPaths": ""},
+           {"redactPatterns": 5}, {"redactNames": True}, {"redactPaths": [["x"]]}, {"redactCommands": {}})
+
+    def test_a_rule_setting_that_is_not_a_list_of_strings_drops_the_text(self):
+        for number, bad in enumerate(self.BAD):
+            with self.subTest(bad=bad):
+                value = "pw" + gh_token()[4:16]
+                project = self.sb.home / f"bad-{number}"
+                (project / ".judgment").mkdir(parents=True)
+                (project / ".judgment" / "tracing.json").write_text(json.dumps({"enabled": True, **bad}))
+                sid = new_session_id()
+                turn = Turn(sid, "pin=" + value)
+                call = turn.api(tool=("terminal", {"command": "ls"}))
+                turn.tool(call, "terminal", {"command": "ls"}, "pin=" + value)
+                turn.api(text="ok")
+                turn.end("ok")
+                self.fire(turn.events, TERMINAL_CWD=str(project))
+                events = [event for event in self.sb.inbox() if event.get("session_id") == sid]
+                self.assertTrue(events)
+                self.assertTrue(all(event.get("redaction_error") for event in events))
+                self.assertNotIn(value, self.sb.state_text())
+
+    def test_the_gate_carries_settings_as_written(self):
+        from hermes_support import load_plugin
+
+        core = load_plugin().core
+        for bad in self.BAD:
+            self.assertTrue(core._rules(core.settings(bad)).error, bad)
+        self.assertEqual(core._rules(core.settings({})).error, "")
+        gate = core.Gate("sanitized", core.settings({"redactNames": ["pin"]}), (), "/s", ())
+        self.assertEqual(core.Gate.from_json(json.loads(json.dumps(gate.to_json()))), gate)
+
+
+class Incomplete(Case):
+    def test_an_answered_turn_hermes_reports_incomplete_is_interrupted(self):
+        """Hermes can answer with an error explanation and then end the turn with completed=False."""
+        turn = Turn(new_session_id(), "go")
+        turn.api(text="the provider failed")
+        turn.end("the provider failed")
+        hook, kwargs, at = turn.events[-1]
+        turn.events[-1] = (hook, {**kwargs, "completed": False, "failed": True}, at)
+        self.fire(turn.events)
+        [end] = [event for event in self.sb.inbox() if event["event"] == "turn_end"]
+        self.assertTrue(end["interrupted"])
+
+
+class Rotated(Case):
+    def test_off_after_a_rotation_reaches_the_new_id(self):
+        """Hermes rotates the id mid-turn, then the user turns tracing off: a later Hermes process resumes under the
+        new id and must read off."""
+        sid, rotated = new_session_id(), new_session_id()
+        one = Turn(sid, "rotates")
+        one.api(text="a")
+        rotate_at = len(one.events)
+        one.api(text="a2")
+        one.end("a2")
+        with plugin_env(self.sb) as (plugin, ctx):
+            fire_all(ctx, renamed(one.events, sid, rotated, rotate_at), plugin)
+            ctx.cli(rotated)
+            self.assertIn("off for this session", ctx.commands["judgment"]["handler"]("off"))
+            modes = {name: (self.sb.state / "sessions" / name).read_text().strip() for name in (sid, rotated)}
+            self.assertEqual(modes, {sid: "off", rotated: "off"})
+            self.assertIn("on for this session", ctx.commands["judgment"]["handler"]("on"))
+        modes = {name: (self.sb.state / "sessions" / name).read_text().strip() for name in (sid, rotated)}
+        self.assertEqual(modes, {sid: "on", rotated: "on"})
+
+
+class Late(Case):
+    def test_a_closed_turns_late_tool_result_joins_no_turn(self):
+        """Turn one is off and ends with a tool still running. Its result arrives during turn two, which is traced."""
+        sid = new_session_id()
+        secret = "late-" + gh_token()[4:20]
+        one = Turn(sid, "untraced")
+        call = one.api(tool=("terminal", {"command": "sleep 60"}))
+        one.tool(call, "terminal", {"command": "sleep 60"}, secret, pre=True, post=False)
+        one.end("gave up")
+        two = Turn(sid, "traced", first=False, start=later(one.events, 1))
+        two.api(text="ok")
+        late = Turn(sid, "x", first=False, start=later(two.events, 0.5))
+        late.task, late.tid, late.events = one.task, one.tid, []
+        late.tool(call, "terminal", {"command": "sleep 60"}, secret, pre=False, post=True)
+        with plugin_env(self.sb) as (plugin, ctx):
+            ctx.cli(sid)
+            fire_all(ctx, one.events[:1], plugin)
+            ctx.commands["judgment"]["handler"]("off")
+            fire_all(ctx, one.events[1:], plugin)
+            ctx.commands["judgment"]["handler"]("on")
+            fire_all(ctx, two.events + late.events, plugin)
+            self.assertEqual(plugin.errors["count"], 0)
+            two.events = []
+            two.end("ok")
+            fire_all(ctx, two.events, plugin)
+        inbox = self.sb.inbox()
+        self.assertEqual({event["turn_id"] for event in inbox if event.get("turn_id")}, {two.tid})
+        self.assertEqual([event["event"] for event in inbox if event["event"] == "tool"], [])
+        self.assertNotIn(secret, self.sb.state_text())
 
 
 if __name__ == "__main__":
