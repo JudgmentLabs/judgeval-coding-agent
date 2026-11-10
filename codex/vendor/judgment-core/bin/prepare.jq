@@ -114,27 +114,37 @@ def jp_pairs($rules; $l):
 # A project's redactNames name as secretNames spells a name: each part lower, UPPER, or Capitalized, joined by _, -, ., or nothing.
 def jp_word: ascii_downcase | split("_") | map("(?:" + . + "|" + ascii_upcase + "|" + (.[:1] | ascii_upcase) + .[1:] + ")") | jp_join("[_.-]?");
 # The rules this event runs (redact.ruleset): the built-in rules redactDisable keeps, the name rules over the built-in names
-# and redactNames, and the project's redactPatterns, redactPaths, and redactCommands; redactAllow as a set. A disabled id no
-# built-in rule has, or a name that is not parts joined by _, fails closed, as a regex that does not compile does.
+# redactNames keeps (!name drops one) and its own, and the project's redactPatterns, redactPaths, and redactCommands; a
+# redactPaths !glob excepts the words it matches from every path rule; secretNames.allow and redactAllow as a set. A
+# disabled id or a !name no built-in has, a name that is not parts joined by _, or a rule setting that is not a list of
+# strings fails closed, as a regex that does not compile does.
 def jp_rules($c; $r):
-  # A list setting's nonempty strings. Anything else, in the list or instead of it, is skipped, as optin.load_project does.
+  # A list setting's nonempty strings. Anything else in a trim (redactAllow, redactDisable) is skipped.
   def setting($k): $c[$k] | if type == "array" then [.[] | strings | if . == "" then empty else . end] else [] end;
-  (setting("redactDisable") | map({(.): true}) | add // {}) as $off
+  def glob: "(?<![^\\n/:])" + ([explode[] | [.] | implode | $r.sensitive.glob[.] // .] | jp_join("")) + "(?![^\\n])";
+  if [("redactPatterns", "redactPaths", "redactCommands", "redactNames") as $k | $c[$k]
+      | if . == null or (type == "array" and ([.[] | strings] | length) == length) then empty else 1 end] != [] then error("redaction limit") else . end
+  | (setting("redactDisable") | map({(.): true}) | add // {}) as $off
   | if [$off | keys_unsorted[] | if $r.ids[.] then empty else 1 end] != [] then error("redaction limit") else . end
-  | setting("redactNames") as $names
-  | if [$names[] | if jp_test("(?<![\\s\\S])[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)*(?![\\s\\S])") then empty else 1 end] != [] then error("redaction limit") else . end
-  | (if $names == [] then $r.names.builtin else $r.names.builtin + "|" + ($names | map(jp_word) | jp_join("|")) end) as $alt
-  | def named($n): $n | {id, placeholder, re: (.parts[0] + "(?:" + $alt + ")" + .parts[1])} + if $names == [] then {needs} else {} end;
+  | setting("redactNames") as $entries
+  | [$entries[] | if startswith("!") then .[1:] else empty end] as $dropped
+  | [$entries[] | if startswith("!") then empty else . end] as $names
+  | if ($dropped - $r.names.list) != [] or [$names[] | if jp_test("(?<![\\s\\S])[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)*(?![\\s\\S])") then empty else 1 end] != []
+    then error("redaction limit") else . end
+  | ($entries == []) as $builtin
+  | (if $builtin then $r.names.builtin else $r.names.list - $dropped + $names | map(jp_word) | jp_join("|") end) as $alt
+  | setting("redactPaths") as $globs
+  | def named($n): $n | {id, placeholder, re: (.parts[0] + "(?:" + $alt + ")" + .parts[1])} + if $builtin then {needs} else {} end;
     def kept: [.[] | if $off[.id] then empty else . end];
     {patterns: (($r.patterns + [named($r.names.assignment)] | kept)
                 + [setting("redactPatterns")[] | {id: "custom", re: ., placeholder: "[REDACTED:custom]"}]),
      members: ([named($r.names.field)] | kept),
      paths: (($r.sensitive.paths | kept)
-             + [setting("redactPaths")[] | ("(?<![^\\n/:])" + ([explode[] | [.] | implode | $r.sensitive.glob[.] // .] | jp_join("")) + "(?![^\\n])")
-                | {id: "custom_path", re: ., trigger: ("(?<![^\\n])[^\\n]*?(?:" + . + ")[^\\n]*")}]),
+             + [$globs[] | if startswith("!") then empty else glob | {id: "custom_path", re: ., trigger: ("(?<![^\\n])[^\\n]*?(?:" + . + ")[^\\n]*")} end]),
+     unless: [$globs[] | if startswith("!") then .[1:] | glob else empty end],
      commands: (($r.sensitive.commands | kept)
                 + [setting("redactCommands")[] | {id: "custom_command", re: ($r.sensitive.command.prefix + "(?:" + . + ")" + $r.sensitive.command.unless)}]),
-     allow: (setting("redactAllow") | map({(.): true}) | add // {})};
+     allow: ($r.allow + setting("redactAllow") | map({(.): true}) | add // {})};
 # The pairs whose redacted text (the found text after its kept prefix) redactAllow does not name.
 def jp_allow($allow): [.[] | if $allow[.[0][((.[1] | length) - ("[REDACTED:" + .[2] + "]" | length)):]] then empty else . end];
 # {rule, trigger} for the first sensitive command, then path, the tool input names, or null. Path rules see one token per line:
@@ -152,7 +162,9 @@ def jp_sensitive($x; $r):
           if (.prompt | split("@") | length) > $r.limits.mentions + 1 then error("redaction limit") else . end
           | [.prompt | jp_lines($s.mention.split) | split("\n")[] | if startswith("@") then .[1:] | jp_lines($s.mention.end) | split("\n")[0] // "" else "" end
              | if . == "" then empty else . end] | jp_join("\n")
-        else "" end)) as $words
+        else "" end)
+     # Without the words a redactPaths !glob matches.
+     | if $x.unless == [] then . else split("\n") | [.[] | . as $w | if [$x.unless[] as $u | $w | jp_test($u) | if . then 1 else empty end] != [] then empty else . end] | jp_join("\n") end) as $words
   | first(
       # Each command is its own command line: a quote one leaves open never hides the next one's command.
       ($x.commands[] | . as $p | if [$kv[] | if .[0] == "command" then .[1] else empty end | if jp_holds($p.needs) and jp_test($p.re) then 1 else empty end] != []

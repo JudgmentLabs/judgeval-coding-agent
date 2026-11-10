@@ -58,6 +58,16 @@ def _strings(value: object) -> list[str]:
 
 # The project's redaction settings (judgment_core.redact.ruleset says what each does). Each is a list of strings.
 REDACT_KEYS = ("redactPatterns", "redactPaths", "redactCommands", "redactNames", "redactAllow", "redactDisable")
+# The ones that add rules: one that is not a list of strings is kept as written, so redact.ruleset fails closed on it.
+_STRICT_KEYS = ("redactPatterns", "redactPaths", "redactCommands", "redactNames")
+
+
+def _setting(key: str, value: object) -> object:
+    if key in _STRICT_KEYS and value is not None and not (isinstance(value, list) and all(isinstance(item, str) for item in value)):
+        return value
+    return _strings(value)
+
+
 _CLOSED = {"enabled": False, "capture": "sanitized", "sessionDefault": "on", "environment": "production", **{key: [] for key in REDACT_KEYS}}
 
 
@@ -78,7 +88,7 @@ def load_project(path: Path) -> dict:
         "capture": resolve_capture(data),
         "sessionDefault": "off" if session_default == "off" else "on",
         "environment": environment.strip(),
-        **{key: _strings(data.get(key)) for key in REDACT_KEYS},
+        **{key: _setting(key, data.get(key)) for key in REDACT_KEYS},
     }
 
 

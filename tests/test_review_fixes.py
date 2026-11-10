@@ -221,8 +221,8 @@ class StringToolInputTests(unittest.TestCase):
 
 
 class SensitiveAccessTests(unittest.TestCase):
-    """Finding 5: cat credentials, /usr/bin/env, and env -0 were missed. Known limits: env with options or by its path is
-    not seen (wrapped-command), and a search for the word credentials blanks the turn (mention-blanks)."""
+    """Finding 5: cat credentials, /usr/bin/env, and env -0 were missed. Known limits: env with options is not seen
+    (wrapped-command), and a search for the word credentials blanks the turn (mention-blanks)."""
 
     SENSITIVE = [
         ({"command": "cat credentials"}, "credentials_file"),
@@ -232,6 +232,7 @@ class SensitiveAccessTests(unittest.TestCase):
         ({"command": ["bash", "-lc", "env"]}, "env_dump"),
         ({"command": "grep -rn credentials src/"}, "credentials_file"),
         ({"command": "git log --grep credentials"}, "credentials_file"),
+        ({"command": "/usr/bin/env"}, "env_dump"),
     ]
     NOT_SENSITIVE = [
         {"command": "env FOO=1 make test"},
@@ -239,7 +240,6 @@ class SensitiveAccessTests(unittest.TestCase):
         {"command": "env -u HOME bash -lc make"},
         {"command": "env -i PATH=/usr/bin make"},
         {"command": "cat credentials.md.txt"},
-        {"command": "/usr/bin/env"},
         {"command": "env -0"},
         {"command": "env --null | sort -z"},
         {"command": "env -u HOME"},

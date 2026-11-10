@@ -194,10 +194,11 @@ class AssignmentMatrix(unittest.TestCase):
 
 
 # Command positions: the start, after ; & | ( ` or a newline, behind sudo.
-WRAPS = ["{}", "sudo {}", "cd repo && {}", "x=$({})", "{} | cat", 'echo "$({})"', "ls; {}", "cat <<'EOF'\nx\nEOF\n{}", "a || {}", "x=`{}`"]
+WRAPS = ["{}", "sudo {}", "cd repo && {}", "x=$({})", "{} | cat", 'echo "$({})"', "ls; {}", "cat <<'EOF'\nx\nEOF\n{}", "a || {}", "x=`{}`",
+         "FOO=1 {}", "bash -c '{}'", "command {}", "nohup {}", "sudo -u root {}", "if x; then {}; fi", "{{ {}; }}"]
 # Known limit (wrapped-command): behind any other wrapper the command is not seen. Secret-named environment values in the
 # output are still redacted (env_value).
-LIMIT_WRAPS = ["FOO=1 {}", "timeout 5 {}", "env -u X {}", "bash -c '{}'", "command {}", "nohup {}"]
+LIMIT_WRAPS = ["timeout 5 {}", "env -u X {}", 'FOO="a b" {}', "sudo --user=root {}"]
 # Not a command position: quoted text, a pattern, a commit message.
 QUOTED = ["echo '{}'", 'git commit -m "{}"', "rg '{}' .", "grep -e '{}' x", "git log --grep='{}'"]
 

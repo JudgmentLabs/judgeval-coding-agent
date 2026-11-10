@@ -117,8 +117,9 @@
       "id": "r1.5-usr-bin-env",
       "route": "command",
       "input": "/usr/bin/env",
-      "expect": "leaks",
-      "limit": "wrapped-command"
+      "expect": "blanked",
+      "rule": "env_dump",
+      "source": "round 9: command.prefix reads this wrapper"
     },
     {
       "id": "r1.5-env-0",
@@ -383,22 +384,25 @@
       "id": "r4.5-bash-c-env",
       "route": "command",
       "input": "bash -c \"env\"",
-      "expect": "leaks",
-      "limit": "wrapped-command"
+      "expect": "blanked",
+      "rule": "env_dump",
+      "source": "round 9: command.prefix reads this wrapper"
     },
     {
       "id": "r4.5-command-env",
       "route": "command",
       "input": "command env",
-      "expect": "leaks",
-      "limit": "wrapped-command"
+      "expect": "blanked",
+      "rule": "env_dump",
+      "source": "round 9: command.prefix reads this wrapper"
     },
     {
       "id": "r4.5-assignment-printenv",
       "route": "command",
       "input": "FOO=1 printenv",
-      "expect": "leaks",
-      "limit": "wrapped-command"
+      "expect": "blanked",
+      "rule": "env_dump",
+      "source": "round 9: command.prefix reads this wrapper"
     },
     {
       "id": "r4.6-env-help",
@@ -421,7 +425,7 @@
       "output": "foo; printenv",
       "expect": "blanked",
       "limit": "mention-blanks",
-      "rule": "printenv"
+      "rule": "env_dump"
     },
     {
       "id": "r4.7-multiline-quoted-password",
@@ -481,6 +485,27 @@
       "id": "r5.2-env-unset-printenv",
       "route": "command",
       "input": "env --unset DEBUG printenv",
+      "expect": "leaks",
+      "limit": "wrapped-command"
+    },
+    {
+      "id": "r9.8-timeout-env",
+      "route": "command",
+      "input": "timeout 5 env",
+      "expect": "leaks",
+      "limit": "wrapped-command"
+    },
+    {
+      "id": "r9.8-quoted-assignment-env",
+      "route": "command",
+      "input": "FOO=\"a b\" env",
+      "expect": "leaks",
+      "limit": "wrapped-command"
+    },
+    {
+      "id": "r9.8-sudo-long-option-env",
+      "route": "command",
+      "input": "sudo --user=root env",
       "expect": "leaks",
       "limit": "wrapped-command"
     },
@@ -583,33 +608,33 @@
       "id": "c7458959-lc-all-printenv",
       "route": "command",
       "input": "LC_ALL=C printenv",
-      "expect": "leaks",
-      "source": "commit 7458959",
-      "limit": "wrapped-command"
+      "expect": "blanked",
+      "source": "commit 7458959; round 9: command.prefix reads this wrapper",
+      "rule": "env_dump"
     },
     {
       "id": "c7458959-sudo-u-printenv",
       "route": "command",
       "input": "sudo -u root printenv",
-      "expect": "leaks",
-      "source": "commit 7458959",
-      "limit": "wrapped-command"
+      "expect": "blanked",
+      "source": "commit 7458959; round 9: command.prefix reads this wrapper",
+      "rule": "env_dump"
     },
     {
       "id": "c7458959-lc-all-env",
       "route": "command",
       "input": "LC_ALL=C env",
-      "expect": "leaks",
-      "source": "commit 7458959",
-      "limit": "wrapped-command"
+      "expect": "blanked",
+      "source": "commit 7458959; round 9: command.prefix reads this wrapper",
+      "rule": "env_dump"
     },
     {
       "id": "c7458959-sudo-e-u-printenv",
       "route": "command",
       "input": "sudo -E -u root printenv",
-      "expect": "leaks",
-      "source": "commit 7458959",
-      "limit": "wrapped-command"
+      "expect": "blanked",
+      "source": "commit 7458959; round 9: command.prefix reads this wrapper",
+      "rule": "env_dump"
     },
     {
       "id": "r7.1-rg-n-single-file",

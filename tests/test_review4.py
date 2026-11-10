@@ -204,13 +204,14 @@ class OversizedMemberTests(unittest.TestCase):
 
 class EnvDumpWrapperTests(unittest.TestCase):
     """Finding 5: shell wrappers, command prefixes, and leading assignments hid an environment dump. A command now counts at
-    the start, after ; & | ( ` or a newline, behind an optional sudo. Known limit (wrapped-command): behind any other wrapper
-    it is not seen; the secret-named environment values in its output are still redacted (env_value)."""
+    the start, after ; & | ( ` { or a newline, behind shell keywords, assignments, sudo, sh -c, or a path (command.prefix).
+    Known limit (wrapped-command): behind any other wrapper it is not seen; the secret-named environment values in its
+    output are still redacted (env_value)."""
 
     DUMPS = ['echo "$(env)"', 'echo "$(date)"; env; echo "done"', "x=`printenv`", "cat <<'EOF' > f\nhello\nEOF\nenv", "sudo env",
-             "cd /tmp && printenv | sort", "(env)"]
-    WRAPPED = ['bash -c "env"', "command env", "FOO=1 printenv", "sh -c 'cd /tmp; env'", "sudo -u root env", "env FOO=1 env", "nohup env &",
-               "timeout 5 printenv", "if true; then env; fi", "eval 'env'", "/usr/bin/env -0 > /tmp/e", "LC_ALL=C env", "sudo -E -u root printenv"]
+             "cd /tmp && printenv | sort", "(env)", 'bash -c "env"', "command env", "FOO=1 printenv", "sh -c 'cd /tmp; env'", "sudo -u root env",
+             "nohup env &", "if true; then env; fi", "LC_ALL=C env", "sudo -E -u root printenv"]
+    WRAPPED = ["env FOO=1 env", "timeout 5 printenv", "eval 'env'", "/usr/bin/env -0 > /tmp/e"]
 
     def test_both_layers(self):
         py, _ = assert_parity(self, [tool({"command": c}) for c in self.DUMPS + self.WRAPPED])
@@ -231,11 +232,11 @@ class NonExecutingMentionTests(unittest.TestCase):
     string and a lookup (which, command -v) run nothing. Known limit (mention-blanks): a command after a separator inside
     quotes, a heredoc's lines, and a sensitive file name anywhere still blank the turn."""
 
-    MENTIONS = ["env --help", "env --version", "printenv --help", "sudo env --version", "echo 'a | env'", "git commit -m 'run env; then set'",
-                "grep -n 'printenv' src", "set -euo pipefail", "export PATH=/x:$PATH", "python -m venv .venv", 'bash -c "echo \'env\'"',
+    MENTIONS = ["env --help", "env --version", "printenv --help", "sudo env --version", "grep -n 'printenv' src", "set -euo pipefail", "export PATH=/x:$PATH", "python -m venv .venv", 'bash -c "echo \'env\'"',
                 "command -v env"]
-    BLANKED = {'echo "foo; printenv"': "printenv", "cat > f <<'EOF'\nenv\nprintenv\ncat credentials\nEOF": "env_dump",
-               'git commit -m "rotate secrets"': "secret_file", "rg secrets": "secret_file", "echo credentials": "credentials_file"}
+    BLANKED = {'echo "foo; printenv"': "env_dump", "cat > f <<'EOF'\nenv\nprintenv\ncat credentials\nEOF": "env_dump",
+               'git commit -m "rotate secrets"': "secret_file", "rg secrets": "secret_file", "echo credentials": "credentials_file",
+               "echo 'a | env'": "env_dump", "git commit -m 'run env; then set'": "env_dump"}
 
     def test_both_layers(self):
         py, _ = assert_parity(self, [tool({"command": c}) for c in self.MENTIONS + list(self.BLANKED)])
@@ -246,7 +247,7 @@ class NonExecutingMentionTests(unittest.TestCase):
         marker = "usage " + _rand(10)
         sb, sink, inbox = pi_run(self, command="env --help", output=marker)
         self.assertIn(marker, sink.text())
-        sb, sink, inbox = pi_run(self, command="echo 'a | env'", output=marker)
+        sb, sink, inbox = pi_run(self, command="command -v env", output=marker)
         self.assertIn(marker, sink.text())
 
     def test_adversarial_commands_are_linear_in_python(self):

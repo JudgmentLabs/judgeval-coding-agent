@@ -82,12 +82,6 @@ def name_needs(names: Iterable[str], suffix: str = "") -> list[str]:
     return list(dict.fromkeys(case + suffix for name in names for case in _cases(name.split("_")[-1])))
 
 
-def _split_names(regex: str) -> list[str]:
-    """A name rule's regex as the text before and after {names}, which the hook joins around the names it uses."""
-    before, after = regex.split("{names}")
-    return [before, after]
-
-
 def name_rules(names: Iterable[str]) -> list[dict]:
     """secret_assignment and secret_field for these names, as compiled rules (needs only for the built-in names)."""
     table = rules()["secretNames"]
@@ -96,7 +90,7 @@ def name_rules(names: Iterable[str]) -> list[dict]:
     out = []
     for key in ("assignment", "field"):
         item = table[key]
-        before, after = _split_names(item["re"])
+        before, after = item["re"].split("{names}")
         rule = {"id": item["id"], "re": before + "(?:" + names_re(names) + ")" + after, "placeholder": placeholder(item["id"])}
         if builtin:
             rule["needs"] = name_needs(names, item.get("needs_suffix", ""))
@@ -155,9 +149,11 @@ def compiled(table: Mapping | None = None) -> dict:
         "patterns": patterns,
         "names": {
             "builtin": names_re(names["names"]),
-            "assignment": {**assignment, "parts": _split_names(names["assignment"]["re"])},
-            "field": {**field, "parts": _split_names(names["field"]["re"])},
+            "list": names["names"],
+            "assignment": {**assignment, "parts": names["assignment"]["re"].split("{names}")},
+            "field": {**field, "parts": names["field"]["re"].split("{names}")},
         },
+        "allow": names["allow"],
         "sensitive": {
             "paths": [{**item, "trigger": trigger_re(item["re"])} for item in paths],
             "commands": commands,
@@ -227,6 +223,7 @@ def _built() -> dict:
         "commands": tuple(_rule(item) for item in done["sensitive"]["commands"]),
         "env": (_compile(done["env"]["name_re"]), int(done["env"]["min_length"])),
         "ids": frozenset(done["ids"]),
+        "allow": frozenset(done["allow"]),
     }
 
 
@@ -278,7 +275,8 @@ class Ruleset:
     commands: tuple
     members: tuple = ()
     error: str = ""  # a project setting that failed: every text is dropped, never sent raw
-    allow: frozenset = frozenset()  # redactAllow: a find whose redacted text is one of these is left alone
+    allow: frozenset = frozenset()  # secretNames.allow and redactAllow: a find whose redacted text is one of these is left alone
+    unless: tuple = ()  # redactPaths !globs: a word one of these matches is no path
 
 
 def glob_re(glob: str) -> str:
@@ -287,15 +285,23 @@ def glob_re(glob: str) -> str:
     return "(?<![^\\n/:])" + "".join(table.get(char, char) for char in glob) + "(?![^\\n])"
 
 
+# The settings that add rules. One that is not a list of strings fails the rule set closed: the project asked for a rule.
+STRICT = ("redactPatterns", "redactPaths", "redactCommands", "redactNames")
+
+
 def _setting(project: Mapping, key: str) -> list[str]:
-    """A project's list setting: its nonempty strings. Anything else in it is skipped, as optin.load_project does."""
+    """A project's list setting: its nonempty strings. Anything else in a trim (redactAllow, redactDisable) is skipped."""
     value = project.get(key)
     return [item for item in value if isinstance(item, str) and item] if isinstance(value, list) else []
 
 
+def _malformed(value: Any) -> bool:
+    return value is not None and not (isinstance(value, list) and all(isinstance(item, str) for item in value))
+
+
 @functools.lru_cache(maxsize=16)
 def _named(names: tuple) -> tuple:
-    return tuple(_rule(item) for item in name_rules(rules()["secretNames"]["names"] + list(names)))
+    return tuple(_rule(item) for item in name_rules(list(names)))
 
 
 def ruleset(project: Mapping | None = None) -> Ruleset:
@@ -304,16 +310,21 @@ def ruleset(project: Mapping | None = None) -> Ruleset:
         redactPatterns  regexes whose matches are redacted (custom)
         redactPaths     globs over whole paths that blank a turn (custom_path)
         redactCommands  regexes at a command position that blank a turn (custom_command)
-        redactNames     names whose values are redacted, as secretNames
-        redactAllow     literal texts never redacted
+        redactNames     names whose values are redacted, as secretNames; !name drops a built-in name
+        redactAllow     literal texts never redacted, on top of secretNames.allow
         redactDisable   built-in rule ids turned off
 
-    A regex that does not compile, a name that is not parts joined by _, or an id no built-in rule has fails the
-    rule set closed (``error``), as an invalid redactPatterns regex always has."""
+    A redactPaths glob after ! excepts the paths it matches from every path rule. A regex that does not compile, a name
+    that is not parts joined by _, a !name no built-in has, an id no built-in rule has, or a rule setting that is not a
+    list of strings fails the rule set closed (``error``), as an invalid redactPatterns regex always has."""
     built = _built()
     project = project or {}
     off = set(_setting(project, "redactDisable"))
-    names = tuple(_setting(project, "redactNames"))
+    builtin = rules()["secretNames"]["names"]
+    entries = _setting(project, "redactNames")
+    dropped = {name[1:] for name in entries if name.startswith("!")}
+    names = tuple(name for name in builtin if name not in dropped) + tuple(name for name in entries if not name.startswith("!"))
+    globs = _setting(project, "redactPaths")
 
     def kept(items: Iterable[Rule]) -> tuple:
         return tuple(item for item in items if item.id not in off)
@@ -321,19 +332,24 @@ def ruleset(project: Mapping | None = None) -> Ruleset:
     def failed(error: str) -> Ruleset:
         return Ruleset(built["patterns"], built["paths"], built["commands"], built["names"][1:], error=error)
 
+    bad = [key for key in STRICT if _malformed(project.get(key))]
+    if bad:
+        return failed(bad[0])
     if off - built["ids"]:
         return failed("redactDisable")
-    if not all(_NAME.fullmatch(name) for name in names):
+    if not all(_NAME.fullmatch(name) for name in names) or dropped - set(builtin):
         return failed("redactNames")
     try:
-        assignment, field = _named(names) if names else built["names"]
+        assignment, field = built["names"] if names == tuple(builtin) else _named(names)
         patterns = [Rule("custom", _compile(regex)) for regex in _setting(project, "redactPatterns")]
-        paths = [Rule("custom_path", _compile(glob_re(glob))) for glob in _setting(project, "redactPaths")]
+        paths = [Rule("custom_path", _compile(glob_re(glob))) for glob in globs if not glob.startswith("!")]
+        unless = tuple(_compile(glob_re(glob[1:])) for glob in globs if glob.startswith("!"))
         commands = [Rule("custom_command", _compile(command_re(regex))) for regex in _setting(project, "redactCommands")]
     except (re.error, RecursionError, OverflowError) as exc:
         return failed(type(exc).__name__)
     return Ruleset(kept(built["patterns"] + (assignment,)) + tuple(patterns), kept(built["paths"]) + tuple(paths),
-                   kept(built["commands"]) + tuple(commands), kept((field,)), allow=frozenset(_setting(project, "redactAllow")))
+                   kept(built["commands"]) + tuple(commands), kept((field,)), allow=built["allow"] | frozenset(_setting(project, "redactAllow")),
+                   unless=unless)
 
 
 def env_secrets(env: Mapping[str, str] | None = None, api_key: str = "") -> list[tuple[str, str]]:
@@ -483,7 +499,7 @@ def escaped(text: str, depth: int) -> str:
 
 # A string holds JSON nested deeper than the text rules read (they read a quote, and one escaped as \") when it holds an
 # escaped backslash before a quote.
-NESTED = '\\\\"'
+NESTED = '\\"'
 
 
 def _containers(text: str) -> Iterator[Any]:
@@ -536,10 +552,6 @@ def pairs(items: list[str], rs: Ruleset, secrets: list[tuple[str, str]], budget:
     if len(ordered) > budget:
         raise RedactionLimit("pairs")
     return ordered
-
-
-def apply(text: str, pairs: list[Pair]) -> str:
-    return apply_counted(text, pairs, Counter())
 
 
 def apply_counted(text: str, pairs: list[Pair], counts: Counter, numbered: bool = False) -> str:
@@ -816,9 +828,9 @@ def lines(text: str, at: list[str]) -> str:
     return text
 
 
-def words(event: Mapping, values: list[ToolValue]) -> str:
+def words(event: Mapping, values: list[ToolValue], unless: tuple = ()) -> str:
     """Mirror of prepare.jq: what path rules see, one token per line: the tokens of every tool value, then the prompt's
-    @mentions. More than limits.mentions @ signs in the prompt fail closed."""
+    @mentions, without the tokens a redactPaths !glob matches. More than limits.mentions @ signs in the prompt fail closed."""
     table = rules()["sensitive"]
     out = lines("\n".join(value.text for value in values), table["split"]) + "\n"
     prompt = event.get("prompt")
@@ -827,6 +839,8 @@ def words(event: Mapping, values: list[ToolValue]) -> str:
             raise RedactionLimit("mentions")
         mentions = [lines(word[1:], table["mention"]["end"]).split("\n")[0] for word in lines(prompt, table["mention"]["split"]).split("\n") if word.startswith("@")]
         out += "\n".join(mention for mention in mentions if mention)
+    if unless:
+        out = "\n".join(word for word in out.split("\n") if not any(glob.search(word) for glob in unless))
     return out
 
 
@@ -844,7 +858,7 @@ def sensitive(event: Mapping, rs: Ruleset) -> dict | None:
     for rule in rs.commands:
         if any(rule.applies(text) and rule.pattern.search(text) for text in commands):
             return {"rule": rule.id, "trigger": f"cmd:{rule.id}"}
-    blob = words(event, values)
+    blob = words(event, values, rs.unless)
     for rule in rs.paths:
         if rule.applies(blob) and rule.pattern.search(blob):
             return {"rule": rule.id, "trigger": _whole_word(rule.pattern.pattern).search(blob).group(0)}

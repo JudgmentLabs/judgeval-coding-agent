@@ -140,7 +140,7 @@ class EnvLongOptionTests(unittest.TestCase):
 
 class SecretCliPositionTests(unittest.TestCase):
     """Finding 3: secret_cli matched its words anywhere, so a commit message or a search pattern naming one blanked the turn.
-    It now counts only at a command position (the start, after ; & | ( ` or a newline, behind sudo). Known limits: behind
+    It now counts only at a command position (sensitive.command.prefix). Known limits: behind
     another wrapper or with options between its words it is not seen (WRAPPED); a heredoc line and a bare secret or
     secrets word still blank the turn (BLANKED, mention-blanks)."""
 
@@ -150,12 +150,12 @@ class SecretCliPositionTests(unittest.TestCase):
             "kubectl get secret -o yaml", "kubectl get secrets -o json", "kubectl describe secret db", "kubectl get secret/db -o json",
             "sudo gh auth token", "x=$(gh auth token)", 'echo "$(gh auth token)"', "cd repo && gh auth token",
             "ls; kubectl get secret -o json", "TOKEN=`gh auth token`", "cat <<'EOF'\nx\nEOF\ngh auth token",
-            "gh auth token | pbcopy", "cat <<EOF\ngh auth token\nEOF"]
-    WRAPPED = ["aws --profile p configure get aws_secret_access_key", "bash -c 'gh auth token'", "FOO=1 gh auth token", "env -u X gh auth token",
-               "/usr/local/bin/gh auth token", "timeout 5 vault kv get secret/x"]
+            "gh auth token | pbcopy", "cat <<EOF\ngh auth token\nEOF", "bash -c 'gh auth token'", "FOO=1 gh auth token",
+            "/usr/local/bin/gh auth token"]
+    WRAPPED = ["aws --profile p configure get aws_secret_access_key", "env -u X gh auth token", "timeout 5 vault kv get secret/x"]
     BLANKED = {"cat <<'EOF'\ngh auth token\nEOF": "secret_cli", "git log --grep='kubectl get secret'": "secret_file",
                "git commit -m 'docs: kubectl get secrets'": "secret_file", "kubectl -n prod get secret db -o yaml": "secret_file",
-               "sudo -u root kubectl get secret -o yaml": "secret_file"}
+               "sudo -u root kubectl get secret -o yaml": "secret_cli"}
     MENTIONS = ['git commit -m "fix gh auth token documentation"', "rg 'aws configure get' .", "echo gh auth token",
                 "grep -e 'gh auth token' x", "printf '%s\\n' 'vault read x'", "rg -g '*.md' 'op read'",
                 'echo "run: gcloud auth print-access-token"', "gh auth status", "aws configure list", "kubectl get pods", "man gh",
