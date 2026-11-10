@@ -66,10 +66,14 @@ _CLOSED = {"enabled": False, "capture": "sanitized", "sessionDefault": "on", "en
 
 
 def load_project(path: Path) -> dict:
-    """The project's settings. Read as the hook's jq reads the file: a byte order mark is skipped, and the first JSON
-    document is the file."""
+    """The project's settings. Read as the hook's jq reads the file: a byte order mark is skipped, the first JSON
+    document is the file, and every document after it must parse too."""
     try:
-        data, _end = json.JSONDecoder().raw_decode(path.read_text(encoding="utf-8-sig").lstrip())
+        text = path.read_text(encoding="utf-8-sig").strip()
+        data, end = json.JSONDecoder().raw_decode(text)
+        while text[end:].strip():
+            end += len(text[end:]) - len(text[end:].lstrip())
+            end = json.JSONDecoder().raw_decode(text, end)[1]
     except (OSError, ValueError):
         return dict(_CLOSED)
     if not isinstance(data, dict):

@@ -16,7 +16,7 @@ Everything is plain data through pure stages:
     tool_values    ToolValue(kind, text) for each string under a path, command, or patch key of the tool input
     words          what path rules read: the tokens of every tool value and the prompt's @mentions, one per line
     sensitive      the sensitive path or command a tool call names, as {rule, trigger}, or None
-    findings       Finding(rule, start, end, kept): each rule's matches, and the p group's, as spans of the unchanged blob, one
+    findings       Finding(rule, start, end, kept): each rule's matches as spans of the unchanged blob, one
                    finditer per window (linear: no match is searched for twice)
     layers         the strings and keys of JSON nested deeper in a string than the rules read, one list per depth
     pairs          findings -> Pair(found, replacement, rule), one per distinct found text, longest first; a
@@ -187,65 +187,14 @@ def _field_sets(fields: Mapping) -> dict:
 # ---------------------------------------------------------------- compiled rules
 
 
-# What Oniguruma's \\s matches. Python's also takes U+001C to U+001F, so a value would end at one in the sender only.
-_BLANKS = "\t\n\x0b\x0c\r \x85\xa0\u1680" + "".join(map(chr, range(0x2000, 0x200B))) + "\u2028\u2029\u202f\u205f\u3000"
-_SIMPLE = {"\\n": "\n", "\\t": "\t", "\\r": "\r", "\\f": "\x0c", "\\v": "\x0b"}
-
-
-def _set(chars: Iterable[str]) -> str:
-    return "".join(f"\\u{ord(char):04x}" for char in chars)
-
-
-def _class(negated: bool, items: list[str]) -> str:
-    """One character class with \\s and \\S spelled out as Oniguruma reads them."""
-    rest = [item for item in items if item not in ("\\s", "\\S")]
-    if "\\S" not in items:
-        return "[" + ("^" if negated else "") + "".join(_set(_BLANKS) if item == "\\s" else item for item in items) + "]"
-    if "\\s" in items:
-        return "(?!)" if negated else "[\\s\\S]"  # every character, in both engines
-    if not negated:
-        return "(?:[^" + _set(_BLANKS) + "]|[" + "".join(rest) + "])" if rest else "[^" + _set(_BLANKS) + "]"
-    # [^\S...]: a blank that is none of the rest.
-    plain = [_SIMPLE.get(item, item) for item in rest]
-    if all(len(item) == 1 for item in plain):
-        return "[" + _set(char for char in _BLANKS if char not in plain) + "]"
-    return "(?:(?![" + "".join(rest) + "])[" + _set(_BLANKS) + "])"
-
-
-def _blanks(regex: str) -> str:
-    """The regex with every \\s and \\S, in a class or out of one, as the explicit set Oniguruma matches."""
-    out, at = [], 0
-    while at < len(regex):
-        char = regex[at]
-        if char == "\\" and at + 1 < len(regex):
-            pair = regex[at : at + 2]
-            out.append("[" + _set(_BLANKS) + "]" if pair == "\\s" else "[^" + _set(_BLANKS) + "]" if pair == "\\S" else pair)
-            at += 2
-        elif char == "[":
-            end = at + 1
-            negated = regex[end : end + 1] == "^"
-            end += negated
-            items: list[str] = []
-            while end < len(regex) and (regex[end] != "]" or not items):
-                step = 2 if regex[end] == "\\" and end + 1 < len(regex) else 1
-                items.append(regex[end : end + step])
-                end += step
-            out.append(_class(negated, items) if end < len(regex) else regex[at:])
-            at = end + 1
-        else:
-            out.append(char)
-            at += 1
-    return "".join(out)
-
-
 def _compile(regex: str) -> re.Pattern:
     """A rule's regex as Python runs it. Oniguruma names a group ``(?<p>...)`` and refers back to it as ``\\k<p>``; Python
-    spells them ``(?P<p>...)`` and ``(?P=p)``. \\s and \\S become Oniguruma's set (``_blanks``). What Python only warns
-    about (a POSIX class such as [[:alpha:]], which Oniguruma reads as one) is an error: the layers would disagree."""
+    spells them ``(?P<p>...)`` and ``(?P=p)``. What Python only warns about (a POSIX class such as [[:alpha:]], which
+    Oniguruma reads as one) is an error: the layers would disagree."""
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         try:
-            return re.compile(_blanks(_BACKREF.sub(r"(?P=\1)", _NAMED.sub(r"(?P<\1>", regex))))
+            return re.compile(_BACKREF.sub(r"(?P=\1)", _NAMED.sub(r"(?P<\1>", regex)))
         except Warning as exc:
             raise re.error(str(exc)) from exc
 
@@ -471,12 +420,12 @@ def windows(text: str) -> list[tuple[int, str, bool]]:
 
 
 class Finding(NamedTuple):
-    """One match of a rule on the unchanged text: where it is, and the part of it (the p group) that is kept."""
+    """One match of a rule on the unchanged text: where it is, and how much of it (the p group) is kept."""
 
     rule: str
     start: int
     end: int
-    kept: tuple[int, int]  # the span of the p group, empty when the rule keeps none
+    kept: int  # the length of the kept prefix (the p group), 0 when the rule keeps none
 
 
 def findings(rule: Rule, text: str, budget: int) -> list[Finding]:
@@ -489,7 +438,7 @@ def findings(rule: Rule, text: str, budget: int) -> list[Finding]:
     distinct texts fail closed too.
     """
     limits = rules()["limits"]
-    # jq keeps the first group's text when that group is named p (it counts unnamed groups too).
+    # As jq: the first group's text is kept when that group is named p (jq counts unnamed groups too) and starts the match.
     keep = rule.pattern.groupindex.get("p") == 1
     if rule.most is not None and rule.needs and text.count(rule.needs[0]) > rule.most:
         raise RedactionLimit(rule.id)
@@ -504,7 +453,7 @@ def findings(rule: Rule, text: str, budget: int) -> list[Finding]:
                 if match.start() < limits["step"]:
                     raise RedactionLimit(rule.id)
                 continue
-            kept = (start + match.start("p"), start + match.end("p")) if keep and match.group("p") else (0, 0)
+            kept = len(match.group("p") or "") if keep and match.start("p") == match.start() else 0
             out.setdefault((start + match.start(), start + match.end()), Finding(rule.id, start + match.start(), start + match.end(), kept))
             distinct.add(match.group(0))
             if len(distinct) > budget:
@@ -515,7 +464,7 @@ def findings(rule: Rule, text: str, budget: int) -> list[Finding]:
 def found(rule: Rule, text: str, budget: int | None = None) -> list[Pair]:
     """Mirror of jp_found: each distinct complete match of the rule on the unchanged text, with what it becomes."""
     budget = hook_budget() if budget is None else budget
-    pairs_ = {Pair(text[item.start : item.end], text[item.kept[0] : item.kept[1]] + placeholder(rule.id), rule.id) for item in findings(rule, text, budget)}
+    pairs_ = {Pair(text[item.start : item.end], text[item.start : item.start + item.kept] + placeholder(rule.id), rule.id) for item in findings(rule, text, budget)}
     return sorted(pairs_)
 
 

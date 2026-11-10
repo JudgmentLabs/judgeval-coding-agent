@@ -306,3 +306,64 @@ def norm(events: list[dict]) -> list[dict]:
             event["redactions"] = sorted(event["redactions"], key=lambda item: (item["field"], item["rule"]))
         out.append(event)
     return out
+
+# ---- shared by the test modules: one event, both layers, the sender's queue
+
+import unittest  # noqa: E402
+
+
+from judgment_core import redact  # noqa: E402
+
+
+def tool(tool_input, tool_output="", **extra) -> dict:
+    return {"v": 1, "harness": "pi", "event": "tool", "session_id": "s", "turn_id": "t", "tool_name": "bash", "tool_call_id": "c1",
+            "tool_input": tool_input, "tool_output": tool_output, **extra}
+
+
+def both(events: list[dict], cfg: dict | None = None, env: dict | None = None) -> tuple[list[dict], list[dict]]:
+    """Layer 1 (jq) and its Python mirror, which must agree."""
+    py, js = py_sanitize(events, cfg, env), jq_sanitize(events, cfg, env)
+    return py, js
+
+
+def stamp(sb: Sandbox, url: str) -> dict:
+    return {"export_fp": hashlib.sha256(SECRETS["judgment_key"]["core"].encode()).hexdigest()[:32], "export_project": "proj-test-1",
+            "export_url": url, "export_org": "org-test-1", "project_root": str(sb.project), "environment": "production", "capture": "sanitized"}
+
+
+def inject(sb: Sandbox, events: list[dict]) -> None:
+    """Events straight into the inbox, as text the sender reads that the hook never saw (transcript enrichment)."""
+    folder = sb.state / "inbox"
+    folder.mkdir(parents=True, exist_ok=True)
+    base = time.time_ns()
+    for number, event in enumerate(events):
+        path = folder / f"9.{number}.json"
+        path.write_text(json.dumps(event))
+        os.utime(path, ns=(base + number * 1000, base + number * 1000))
+
+
+def pieces(secret: str, size: int = 8) -> list[str]:
+    return [secret[i : i + size] for i in range(0, len(secret) - size + 1)]
+
+
+def filler(n: int) -> str:
+    """Ordinary words, no rule's literal in them."""
+    words = ("alpha", "beta", "gamma", "delta", "omega", "build", "step", "done")
+    out, i = [], 0
+    while sum(len(word) + 1 for word in out) < n:
+        out.append(words[i % len(words)])
+        i += 1
+    return " ".join(out)[:n]
+
+
+def assert_parity(test: unittest.TestCase, events: list[dict], cfg: dict | None = None, env: dict | None = None) -> tuple[list[dict], list[dict]]:
+    py, js = both(events, cfg, env)
+    test.assertEqual(norm(py), norm(js))
+    for out in py + js:
+        redact.outcome(out)  # raises on an impossible state
+    return py, js
+
+
+def leaked(secret: str, *texts: str, size: int = 8) -> list[str]:
+    """Pieces of the secret found in any of the texts."""
+    return [piece for piece in pieces(secret, size) for text in texts if piece in text]

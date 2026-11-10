@@ -97,7 +97,7 @@ def jp_found($p; $l):
       | (. + [$w | if length <= $l.dense
                    then _match_impl($p.re; "g"; false)[] | if .length > 0 then . else empty end else jp_scan($p.re; $l.pairs) end
               | if $i + 1 == $k or .offset + .length < ($w | length) then
-                  [.string, (.captures[0] | if .name == "p" then .string else null end) + $p.placeholder, $p.id]
+                  [.string, (.offset as $at | .captures[0] | if .name == "p" and .offset == $at then .string else null end) + $p.placeholder, $p.id]
                 elif .offset < $l.step then error("redaction limit")
                 else empty end]
          | unique)

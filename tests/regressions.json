@@ -1,6 +1,6 @@
 {
   "_comment": [
-    "Every concrete case the Codex reviews of capture: sanitized described (rounds 1-8) and commit 7458959, one row each.",
+    "Every concrete case the Codex reviews of capture: sanitized described (rounds 1-11) and commit 7458959, one row each.",
     "tests/test_regressions.py generates the regression matrix from these rows: each row in both layers (jq and Python, which",
     "must agree), and each row of a tool route also through the real hook of every adapter (claude, codex, cursor, pi) and",
     "then the sender's own pass over what the hook wrote. A rule table that regresses fails here, whichever table it is.",
@@ -1031,6 +1031,122 @@
       "expect": "leaks",
       "limit": "unlisted-cli",
       "source": "round 8: the command list covers gh auth token only"
+    },
+    {
+      "id": "r10.2-secret-after-unicode-escape",
+      "route": "output",
+      "input": "{\"log\": \"a\\u0000<<github>>\"}",
+      "expect": "redacted",
+      "source": "round 10"
+    },
+    {
+      "id": "r10.2-password-after-escaped-ampersand",
+      "route": "output",
+      "input": "{\"Args\":[\"--dsn=x?sslmode=disable\\u0026password=<<alpha>>\"]}",
+      "expect": "redacted",
+      "source": "round 10"
+    },
+    {
+      "id": "r10.2-secret-after-ansi-color",
+      "route": "output",
+      "input": "\u001b[1;32m<<github>>\u001b[0m and \u001b[1mpassword=<<alpha>>",
+      "expect": "redacted",
+      "source": "round 10"
+    },
+    {
+      "id": "r10.3-allowed-find-hides-no-custom-find",
+      "route": "output",
+      "input": "x token=true y",
+      "expect": "redacted",
+      "absent": [
+        "token=true"
+      ],
+      "cfg": {
+        "redactPatterns": [
+          "[a-z_]*token=[a-z]+"
+        ]
+      },
+      "layers_only": "the row needs its own tracing.json, which the adapters' shared sandbox does not have",
+      "source": "round 10"
+    },
+    {
+      "id": "r10.5-env-with-fd-redirect",
+      "route": "command",
+      "input": "env 2>&1 | grep -i key",
+      "expect": "blanked",
+      "rule": "env_dump",
+      "source": "round 10"
+    },
+    {
+      "id": "r10.5-env-with-input-redirect",
+      "route": "command",
+      "input": "env </dev/null",
+      "expect": "blanked",
+      "rule": "env_dump",
+      "source": "round 10"
+    },
+    {
+      "id": "r10.6-typed-default",
+      "route": "output",
+      "input": "password: str = \"<<alpha>>\"",
+      "expect": "leaks",
+      "limit": "value-stops",
+      "source": "round 10"
+    },
+    {
+      "id": "r10.7-shell-by-path",
+      "route": "command",
+      "input": "/bin/sh -c 'env'",
+      "expect": "blanked",
+      "rule": "env_dump",
+      "source": "round 10"
+    },
+    {
+      "id": "r10.10-markdown-bold-name",
+      "route": "output",
+      "input": "**Password:** <<alpha>>\n**password**: <<opaque>>",
+      "expect": "redacted",
+      "source": "round 10"
+    },
+    {
+      "id": "r10.10-backticked-name",
+      "route": "output",
+      "input": "`password`: <<alpha>>",
+      "expect": "redacted",
+      "source": "round 10"
+    },
+    {
+      "id": "r10.11-dash-h-is-read-as-help",
+      "route": "command",
+      "input": "gh auth token -h github.com",
+      "expect": "leaks",
+      "limit": "command-word-order",
+      "source": "round 10"
+    },
+    {
+      "id": "r11.3-stars-are-part-of-a-value",
+      "route": "output",
+      "input": "password=**None and token=**<<alpha>>",
+      "expect": "redacted",
+      "absent": [
+        "**None"
+      ],
+      "source": "round 11"
+    },
+    {
+      "id": "r11.6-env-with-two-digit-fd",
+      "route": "command",
+      "input": "env 10>/dev/null",
+      "expect": "blanked",
+      "rule": "env_dump",
+      "source": "round 11"
+    },
+    {
+      "id": "r11.8-m-after-a-digit-is-no-boundary",
+      "route": "output",
+      "input": "model1mpassword_hint and 30mtoken_count",
+      "expect": "unchanged",
+      "source": "round 11"
     }
   ],
   "limits": [

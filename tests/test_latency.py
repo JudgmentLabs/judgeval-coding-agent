@@ -44,6 +44,9 @@ def cases(size: int) -> list[tuple[str, dict]]:
     rules = [("output", rule) for rule in done["patterns"] + [done["names"]["assignment"], done["names"]["field"]]]
     rules += [("command", rule) for rule in done["sensitive"]["paths"] + done["sensitive"]["commands"]]
     out = {("output", 'f(password="pw") ' + "''" * (size // 2) + ' "'): "finding d: quote pairs after a value"}
+    # Rounds 10 and 11: a command start that does not stop the help check, and one inside a prefix token.
+    out[("command", fill("$(gh auth token ", size) + " --help")] = "command starts before --help"
+    out[("command", fill("{", size) + "gh auth status")] = "braces before a command"
     for kind, rule in rules:
         need = (rule.get("needs") or ["key"])[0]
         for sep in ("=", ": "):
