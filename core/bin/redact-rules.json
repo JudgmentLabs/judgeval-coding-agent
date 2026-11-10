@@ -372,11 +372,7 @@
       "(?:env|printenv)(?![^\\s;&|)<>`'\"])|''|\"\")"
     ],
     "sh_opts": [
-      "(?:[^\\S\\n]+-{1,2}[A-Za-z][A-Za-z0-9-]{0,31}(?:=",
-      {
-        "def": "sh_word"
-      },
-      "|[^\\S\\n]+(?!-)",
+      "(?:[^\\S\\n]+-{1,2}[A-Za-z][A-Za-z0-9-]{0,31}(?:(?:=|[^\\S\\n]+(?!-))",
       {
         "def": "sh_word"
       },
@@ -399,7 +395,8 @@
       "is linear (one finditer per rule and window, its finds kept as spans of the unchanged text), so it allows `sender_pairs`.",
       "JSON nested in a string deeper than its rules read (a string holding \\\\\\\" ) is decoded, up to `depth` layers; what each",
       "layer holds is replaced as encoded where it sits. Deeper nesting, or a find whose encoding is not in the text, fails.",
-      "A tool input whose patch texts hold more than `patch_headers` header lines fails too."
+      "A tool input whose patch texts hold more than `patch_headers` header lines fails too.",
+      "A secret_cli row's flags are looked for among the first `cli_args` arguments of its command (redact.cli_regex)."
     ],
     "window": 16384,
     "step": 8192,
@@ -408,7 +405,8 @@
     "dense": 8192,
     "sender_pairs": 4096,
     "depth": 4,
-    "patch_headers": 4096
+    "patch_headers": 4096,
+    "cli_args": 32
   },
   "patterns": [
     {
@@ -562,19 +560,32 @@
         "Passphrase",
         "credential",
         "CREDENTIAL",
-        "Credential"
+        "Credential",
+        "auth",
+        "AUTH",
+        "Auth"
       ],
       "re": [
         "(?<p>(?:",
         {
           "def": "secret_name"
         },
-        ")\\\\?[\\\"']?\\s{0,5}(?::=|=>|[:=])\\s{0,5}\\\\?[\\\"']?)",
+        ")\\\\?[\\\"']?\\s{0,5}(?::=|=>|[:=])\\s{0,5}\\\\?[\\\"']?",
+        "|(?:",
+        {
+          "gen": "shaped_text"
+        },
+        ")\\\\?[\\\"']?\\s{0,5}(?::=|=>|[:=])\\s{0,5}\\\\?[\\\"']?",
+        "(?!",
+        {
+          "gen": "shaped_not"
+        },
+        "))",
         {
           "def": "secret_value"
         }
       ],
-      "pre": "(?:key|KEY|Key|secret|SECRET|Secret|token|TOKEN|Token|password|PASSWORD|Password|passwd|PASSWD|Passwd|passphrase|PASSPHRASE|Passphrase|credentials|CREDENTIALS|Credentials|credential|CREDENTIAL|Credential)\\\\?[\"']?\\s{0,5}(?::=|=>|[:=])"
+      "pre": "(?:key|KEY|Key|auth|AUTH|Auth|secret|SECRET|Secret|token|TOKEN|Token|password|PASSWORD|Password|passwd|PASSWD|Passwd|passphrase|PASSPHRASE|Passphrase|credentials|CREDENTIALS|Credentials|credential|CREDENTIAL|Credential)\\\\?[\"']?\\s{0,5}(?::=|=>|[:=])"
     },
     {
       "_comment": [
@@ -609,7 +620,10 @@
           "gen": "literal"
         },
         ")(?:\\\\\"|\"|'))",
-        "(?:(?<=\\\\\\\")(?:[^\\\"\\\\\\n]|\\\\\\\\(?:\\\\\\\\|\\\\\\\"|[^\\\"\\\\\\n]))+(?:(?=\\\\\\\")|(?![\\s\\S]))|(?<=\\\")(?<!\\\\\\\")(?:(?:[^\\\"\\\\\\s]|\\\\[^\\s])+\\\\?[^\\S\\n]*\\n(?:[^\\\"\\\\]|\\\\[\\s\\S])*|(?:[^\\\"\\\\\\n]|\\\\[^\\n])+)(?:(?=\\\")|(?![\\s\\S]))|(?<=')(?:(?:[^'\\\\\\s]|\\\\[^\\s])+\\\\?[^\\S\\n]*\\n(?:[^'\\\\]|\\\\[\\s\\S])*|(?:[^'\\\\\\n]|\\\\[^\\n])+)(?:(?=')|(?![\\s\\S])))"
+        "(?:(?<=\\\\\\\")(?:[^\\\"\\\\\\n]|\\\\\\\\(?:\\\\\\\\|\\\\\\\"|[^\\\"\\\\\\n]))+(?:(?=\\\\\\\")|(?![\\s\\S]))|(?<=\\\")(?<!\\\\\\\")(?:(?:[^\\\"\\\\\\s]|\\\\[^\\s])+\\\\?[^\\S\\n]*\\n(?:[^\\\"\\\\]|\\\\[\\s\\S])*|(?:[^\\\"\\\\\\n]|\\\\[^\\n])+)(?:(?=\\\")|(?![\\s\\S]))|(?<=')(?:(?:[^'\\\\\\s]|\\\\[^\\s])+\\\\?[^\\S\\n]*\\n(?:[^'\\\\]|\\\\[\\s\\S])*|(?:[^'\\\\\\n]|\\\\[^\\n])+)(?:(?=')|(?![\\s\\S])))",
+        {
+          "gen": "assign_after"
+        }
       ],
       "pre": [
         "(?:",
@@ -638,13 +652,16 @@
   "sensitive": {
     "_comment": [
       "A tool call that reads one of these paths, or dumps the environment, blanks its whole turn.",
-      "keys: the tool input members whose string (or list of strings) values are paths or commands, at any depth.",
+      "keys: the tool input members whose string (or list of strings) values are paths or commands, at any depth, by kind.",
       "split: the characters that end a word of those values. Path rules see one word per line. Command rules see the values, one per line.",
       "mention: an @word in the prompt is a path too. A word starts after one of mention.split and ends at one of mention.end.",
       "glob: how a redactPaths glob becomes a regex, one character at a time. * is any run of characters, / included, and ? is one.",
       "A path word starts after a newline, a /, or a : (a Git revision path: HEAD:.env). A rule scans one component, never",
       "past a / or a :, so a word of many colons costs linear work. A secrets or credentials name without an extension counts",
-      "after a / or a :, or as a command's operand.",
+      "after a / or a :, as a definite path, or as a command's operand.",
+      "definite: a word that can only be a path (a patch target, or a whole value under a key of kind path) is also seen as",
+      "definite.prefix + itself when relative (not starting with one of definite.absolute): ./credentials, a bare name in the",
+      "working folder. A command's words are not definite: git commit -m credentials names no file.",
       "Command rules read each value on its own with the shell tokenizer (defs sh_*): a command counts only at a command",
       "position, behind wrappers and assignments, and not in quoted text, a quoted heredoc's body, or a lookup (which,",
       "command -v, --help, --version). A bare credentials or secrets operand is a read for any command but a search tool's",
@@ -717,11 +734,13 @@
         "re": "(?:(?<=[/:])credentials|(?<![^\\n/:])[A-Za-z0-9_.-]*credentials\\.(?:json|ya?ml|toml|ini|csv|xml|db))(?![^\\n])",
         "examples": [
           "~/.aws/credentials",
-          "gcp-credentials.json"
+          "gcp-credentials.json",
+          "credentials"
         ],
         "not": [
           "src/credentials.py",
-          "docs/credentials.md"
+          "docs/credentials.md",
+          "credentials.md"
         ]
       },
       {
@@ -734,11 +753,15 @@
         "re": "(?:(?<![^\\n/:])(?=[^\\n/:]*(?![^\\n]))(?=[^\\n/:]*\\.)(?![^\\n/:]*\\.(?:py|pyi|js|mjs|cjs|ts|tsx|jsx|go|rs|java|kt|rb|php|cs|c|h|cc|cpp|hpp|swift|scala|sh|bash|zsh|ps1|md|mdx|rst|html|css|scss|sql|proto|lock|map|snap|svg|png|jpg|ipynb)(?![^\\n]))[^\\n/:]*(?:secret|SECRET|Secret)[^\\n/:]*|(?<=[/:])(?:secrets?|SECRETS?|Secrets?))(?![^\\n])",
         "examples": [
           "secrets.yaml",
-          "config/secret.json"
+          "config/secret.json",
+          "secrets",
+          "secret",
+          "Secrets"
         ],
         "not": [
           "src/secrets.py",
-          "lib/secret_manager.ts"
+          "lib/secret_manager.ts",
+          "secrets.py"
         ]
       },
       {
@@ -865,8 +888,10 @@
           "A CLI that prints a stored credential: a table of rows, one per invocation that prints one, composed by redact.cli_regex",
           "into one rule. Each row: cmd (the command word), words (its subcommands, each a regex for one word, options allowed",
           "between them), operand (the next word must be one of these: aws configure get region prints no credential), with (one",
-          "of these arguments must follow), alone (no further subcommand word). Every row also requires that none of `unless`",
-          "follows (help and version requests print no credential). The rule reads the command with the shell tokenizer, like the",
+          "of these arguments must be given), alone (no further subcommand word). Every row also requires that none of `unless`",
+          "is given (help and version requests print no credential). Flags belong to the whole invocation: `with` and `unless` are",
+          "looked for among all of the command's arguments, before and after its subcommands and operand (kubectl get -o json",
+          "secret db, gh --help auth token), up to limits.cli_args of them. The rule reads the command with the shell tokenizer, like the",
           "env rules: only at a command position (behind wrappers, assignments, sudo, env, sh -c), never in a quoted argument, a",
           "search pattern, a commit message, echo's arguments, or a quoted heredoc's body. examples and not: invocations the",
           "generated test matrix (tests/test_matrix.py) checks in both layers, each also behind wrappers and as a mention.",
@@ -897,7 +922,8 @@
               "gh auth token --help",
               "gh auth token -h",
               "gh auth status",
-              "gh auth login"
+              "gh auth login",
+              "gh --help auth token"
             ]
           },
           {
@@ -913,7 +939,8 @@
             ],
             "examples": [
               "gh auth status --show-token",
-              "gh auth status -t"
+              "gh auth status -t",
+              "gh auth -t status"
             ],
             "not": [
               "gh auth status",
@@ -1145,7 +1172,8 @@
             ],
             "examples": [
               "security find-generic-password -s x -w",
-              "security find-internet-password -gs host"
+              "security find-internet-password -gs host",
+              "security find-generic-password -w -s x"
             ],
             "not": [
               "security find-generic-password -s x",
@@ -1243,13 +1271,18 @@
               "kubectl get secret/db -o json",
               "kubectl -n prod get secret db -o yaml",
               "kubectl get secrets -ojsonpath={.items}",
-              "kubectl get secret db --output=json"
+              "kubectl get secret db --output=json",
+              "kubectl get -o yaml secret db",
+              "kubectl get -o jsonpath={.data.cookie} secret session",
+              "kubectl -o json get secret/db"
             ],
             "not": [
               "kubectl get secrets",
               "kubectl get secret db",
               "kubectl get pods -o yaml",
-              "kubectl get secret -o yaml --help"
+              "kubectl get secret -o yaml --help",
+              "kubectl get -o yaml pods",
+              "kubectl get --help secret db -o yaml"
             ]
           },
           {
@@ -1354,24 +1387,31 @@
       }
     ],
     "keys": {
-      "file_path": true,
-      "filePath": true,
-      "path": true,
-      "paths": true,
-      "file": true,
-      "files": true,
-      "filename": true,
-      "notebook_path": true,
-      "target_file": true,
-      "target_notebook": true,
-      "absolute_path": true,
-      "relative_path": true,
-      "source": true,
-      "destination": true,
-      "command": true,
-      "cmd": true,
-      "commands": true,
-      "script": true
+      "file_path": "path",
+      "filePath": "path",
+      "path": "path",
+      "paths": "path",
+      "file": "path",
+      "files": "path",
+      "filename": "path",
+      "notebook_path": "path",
+      "target_file": "path",
+      "target_notebook": "path",
+      "absolute_path": "path",
+      "relative_path": "path",
+      "source": "path",
+      "destination": "path",
+      "command": "command",
+      "cmd": "command",
+      "commands": "command",
+      "script": "command"
+    },
+    "definite": {
+      "prefix": "./",
+      "absolute": [
+        "/",
+        "~"
+      ]
     },
     "glob": {
       "*": "[^\\n]*",
@@ -1429,10 +1469,11 @@
         "Patch inputs are path sources too: Codex's apply_patch arrives as {\"input\": patch} (its transcript and its hook), and",
         "any tool may pass a unified diff. The patch-header parser reads the values under keys (at any depth) and every path or",
         "command value (apply_patch <<'EOF' in a shell). For each header row, each line that starts with its prefix names a",
-        "target: the rest of the line up to line (a diff's tab and timestamp cut off), its surrounding double quotes removed (git",
-        "quotes odd names), split at blanks when words (diff --git a/x b/x). skip: not a path. Each target is one path word,",
-        "strip: git's a/ and b/ prefixes, one, from the start of a target.",
-        "checked by the path rules before anything is redacted: a patch that touches .env blanks its turn, one that touches",
+        "target: the rest of the line, of line's characters (a diff's tab and timestamp cut off), its surrounding double quotes",
+        "removed (git quotes odd names), without one of strip (git's a/ and b/), split at blanks when words (diff --git a/x b/x).",
+        "skip: not a path. scripts/gen_redact.py composes line, strip, and the quotes into one regex, target, so the hook reads a",
+        "target with one match and walks no table. Each target is a definite path (sensitive.definite), checked by the path",
+        "rules before anything is redacted: a patch that touches .env or credentials blanks its turn, one that touches",
         "src/app.py does not. Only header lines count: a patch's body that mentions .env is text. More than limits.patch_headers",
         "headers in one event fail closed."
       ],
@@ -1477,7 +1518,7 @@
           "prefix": "copy to "
         }
       ],
-      "line": "[^\\t\\r\\n]*",
+      "line": "[^\\t\\r\\n]",
       "skip": {
         "/dev/null": true
       },
@@ -1625,6 +1666,10 @@
       "and Capitalized parts joined by _, -, ., or nothing (api_key, API-KEY, apiKey, ApiKey). names match as the whole key, or as its",
       "end after a separator or a camelCase boundary (db_password, smtpPassword, X-Api-Key). whole match only as the whole key (in text: the whole identifier, after a flag's -- or a member's . too).",
       "Generic words are left out on purpose: token, key, auth (max_tokens, token_count, tokenizer, sort_key). Those keep the shape test.",
+      "shaped: generic words that keep the shape test (secret_assignment, the second secret_field) and count only as the whole",
+      "identifier, never as an end (sort_key, monkey, oauth stay names): {\"key\": \"<credential-shaped>\"} loses its value, \"key\": \"name\"",
+      "and \"auth\": \"oauth2\" do not. They are never in names or whole, which take any value.",
+      "shaped_not: what a shaped key also never loses: a lowercase snake_case name (\"key\": \"user_id_2024_v1\"), which code uses as one.",
       "A structured member {\"<key>\": \"<string>\"} under such a key loses any nonempty string value but a reference or placeholder",
       "(literals below); booleans, numbers, and null stay. In text, <name> = \"<quoted>\" loses the quoted value the same way."
     ],
@@ -1656,7 +1701,12 @@
       "proxy_authorization",
       "credential",
       "credentials"
-    ]
+    ],
+    "shaped": [
+      "key",
+      "auth"
+    ],
+    "shaped_not": "[a-z][a-z0-9]{1,63}(?:_[a-z0-9]{1,64}){1,16}(?![A-Za-z0-9_\\-+/.~!@#%^*])"
   },
   "literals": {
     "_comment": [
@@ -1807,14 +1857,25 @@
         "Credential\":\"",
         "credentials\":\"",
         "CREDENTIALS\":\"",
-        "Credentials\":\""
+        "Credentials\":\"",
+        "auth\":\"",
+        "AUTH\":\"",
+        "Auth\":\""
       ],
       "json_re": [
-        "(?<p>(?<=[{,])\"",
+        "(?<p>(?<=[{,])\"(?:",
         {
           "def": "secret_key"
         },
-        "\":\")",
+        "\":\"|",
+        {
+          "gen": "shaped_word"
+        },
+        "\":\"(?!",
+        {
+          "gen": "shaped_not"
+        },
+        ")))",
         {
           "def": "secret_value"
         },
@@ -1828,10 +1889,11 @@
   ],
   "assignment": {
     "_comment": [
-      "The assignment recognizer quoted_secret runs: <context><key><close><operator><opening quote><value>. Rows, composed by",
-      "redact.generated() into the fragments assign_ctx, assign_close, and assign_op (scripts/gen_redact.py writes them out).",
-      "A quote after the operator is a value's OPENING quote only when the key sits in code, which one of these contexts says:",
-      "  line         the key starts its line (after indentation, a list bullet or comment mark, keywords, $), itself quoted or not",
+      "The assignment recognizer quoted_secret runs: <context><key><close><operator><opening quote><value><after>. Rows, composed by",
+      "redact.generated() into the fragments assign_ctx, assign_close, assign_op, and assign_after (scripts/gen_redact.py writes them",
+      "out). A quote after the operator is a value's OPENING quote only when the key sits in code, which one of these contexts says:",
+      "  line         the key starts its line (after a location, indentation, a list bullet or comment mark, keywords, $), itself",
+      "               quoted or not. A location is what grep, rg, nl, and cat -n put before a line they print (locations below)",
       "  quoted_key   the key is a whole quoted string (\"password\": ...), its quote right before it (zero width: the span starts",
       "               at the key, as secret_assignment's does)",
       "  escaped_key  the same, quoted with an escaped quote (\\\"password\\\":\\\"...\\\" in JSON encoded in a string)",
@@ -1839,10 +1901,15 @@
       "  code         after code punctuation ({ ( [ , ;) or a shell assignment word, then optional keywords: f(x, password=\"...\")",
       "Each context sets its group. close: a quoting context's group (lq, kq, ke) must match again right after the key, so a",
       "quote the key opened closes before the operator; the others match empty. Only then is ok set, and every value needs ok.",
+      "after: a check made after the value, only when its context was read (\\k<group> matches only a group that took part).",
+      "code's: the punctuation was outside quoted text. A regex cannot look back over a line, so this looks forward: the value is",
+      "one string, so the rest of its line after the closing quote must hold whole strings only (\"...\", '...', `...`; an",
+      "apostrophe between letters is no quote). print(\"username, password:\", username, password, \"done\") reads `, username,",
+      "password, ` as a value whose closing quote opens \"done\", so the rest, done\"), is not whole and nothing is redacted. A",
+      "line with more than after_bound characters left is taken as code (the check stays bounded, never quadratic).",
       "So the states are: no context (nothing matches), context open (key read, its quote not yet closed), ok (operator and",
-      "opening quote may follow). Impossible: ok without a context, or a key whose own quote is still open at the operator.",
-      "That is the case of a string holding the key: print(\"password:\", pw, \"done\"), log(\"Enter password: \", pw). The quote after",
-      "the colon closes that string, so nothing is read as a value, on one line or many. Known limit: a key mid-line after a",
+      "opening quote may follow), value read, checked (after). Impossible: ok without a context, a key whose own quote is still",
+      "open at the operator, or a code-context value whose line goes on inside a string. Known limit: a key mid-line after a",
       "plain word (The new password: \"x\") has no context; a credential-shaped value there is still secret_assignment's."
     ],
     "keywords": [
@@ -1869,12 +1936,41 @@
       ":",
       "="
     ],
+    "locations": [
+      {
+        "id": "line_number",
+        "re": "(?:[^\\s\"'`:]{1,255}[:-])?[0-9]{1,9}[:-]",
+        "_comment": "grep -n, rg -n: 12:, config.yml:12:, and a context line's config.yml-12-",
+        "examples": [
+          "12:",
+          "config.yml:12:",
+          "config.yml-12-"
+        ]
+      },
+      {
+        "id": "file",
+        "re": "[^\\s\"'`:]{1,255}:",
+        "_comment": "grep -r without -n: config.yml:",
+        "examples": [
+          "./config/app.yml:"
+        ]
+      },
+      {
+        "id": "numbered",
+        "re": "[^\\S\\n]{0,16}[0-9]{1,9}\\t",
+        "_comment": "nl, cat -n: blanks, the number, a tab",
+        "examples": [
+          "    12\t",
+          "3\t"
+        ]
+      }
+    ],
     "contexts": [
       {
         "id": "line",
         "group": "lq",
         "closes": true,
-        "re": "(?<![^\\n])[^\\S\\n]{0,64}(?:(?:[-*+#]|//)[^\\S\\n]{0,8})?{keywords}\\$?(?<lq>[\"']?)"
+        "re": "(?<![^\\n]){location}[^\\S\\n]{0,64}(?:(?:[-*+#]|//)[^\\S\\n]{0,8})?{keywords}\\$?(?<lq>[\"']?)"
       },
       {
         "id": "quoted_key",
@@ -1897,9 +1993,12 @@
       {
         "id": "code",
         "group": "cx",
-        "re": "(?:[{(\\[,;]|(?<![^\\s])[A-Za-z_][A-Za-z0-9_]{0,63}=[^\\s'\"`;&|()<>\\\\]{0,256})[^\\S\\n]{0,8}{keywords}\\$?(?<cx>)"
+        "re": "(?:[{(\\[,;]|(?<![^\\s])[A-Za-z_][A-Za-z0-9_]{0,63}=[^\\s'\"`;&|()<>\\\\]{0,256})[^\\S\\n]{0,8}{keywords}\\$?(?<cx>)",
+        "after": "{line_whole}"
       }
     ],
-    "key_prefix": "[A-Za-z0-9_.-]{0,64}?"
+    "key_prefix": "[A-Za-z0-9_.-]{0,64}?",
+    "after_bound": 1024,
+    "line_whole": "(?=[^\\n]{{bound}}|(?:\\\\?[\"'`]|(?![\\s\\S]))(?:[^\"'`\\\\\\n]|\\\\[^\\n]|(?<=[A-Za-z])'(?=[A-Za-z])|\"(?:[^\"\\\\\\n]|\\\\[^\\n])*\"|(?:(?<![A-Za-z])|(?![A-Za-z]))'(?:[^'\\\\\\n]|\\\\[^\\n])*'|`(?:[^`\\\\\\n]|\\\\[^\\n])*`)*(?:\\n|(?![\\s\\S])))"
   }
 }

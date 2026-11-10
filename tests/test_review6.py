@@ -110,7 +110,9 @@ class PatchTargetTests(unittest.TestCase):
         py = assert_parity(self, [tool({"input": patch}, "Success")])[0][0]
         self.assertNotIn("sensitive", py)
         self.assertEqual(leaked(key, json.dumps(py)), [])
-        self.assertEqual(py["tool_input"]["input"], patch.replace(key, "[REDACTED:anthropic_key]"))
+        # key= is a shaped key since review 7 (finding 5): the credential-shaped value goes with the assignment's span, which
+        # is longer than the anthropic_key match, as it does under token=.
+        self.assertEqual(py["tool_input"]["input"], patch.replace(key, "[REDACTED:secret_assignment]"))
 
     def test_targets_are_plain_records(self):
         text = codex_patch(("Update File", "a b/.env"), ("Move to", "x.py")) + "\n" + unified("lib/k.pem") + '\n--- "a/q z"\n+++ /dev/null'

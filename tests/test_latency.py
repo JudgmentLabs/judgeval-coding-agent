@@ -49,6 +49,11 @@ def adversarial() -> list[tuple[str, str]]:
         ("words", fill("hello world ")),
         ("one long word", "a" * SIZE),
         ("@mentions", fill("@a ")),
+        # Review 7: the code context's check after each value (bounded by assignment.after_bound), and line locations.
+        ("code values on one line", fill(', password="ab"')),
+        ("code values, open quote", fill(', password="ab" "')),
+        ("long locations", fill("a" * 300 + ":12:password: \"x\"\n")),
+        ("location digits", fill("1234567890:")),
     ]
     rules = list(table["patterns"]) + list(table["members"]) + table["sensitive"]["paths"] + table["sensitive"]["commands"]
     for rule in rules:
