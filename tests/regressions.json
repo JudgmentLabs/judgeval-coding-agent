@@ -19,7 +19,7 @@
     "           error       the rules failed (an invalid user regex): the text is dropped, every generated secret with it",
     "           leaks       the row's limit lets a generated secret through: at least one is still there, the event neither",
     "                       sensitive nor dropped (an explicit known limit, not a defect)",
-    "  limit    the id of a documented known limit (limits below; docs/trace-format.md, Known limits) the row's expect follows",
+    "  limit    the id of a known limit (limits below, each described in README.md, Known limits) the row's expect follows",
     "  env, cfg, output, keep (strings that must stay), absent (literal secrets that must go), numbers (members made numbers),",
     "  layers (the input serialized into a member of each name in turn: JSON nested in a string), encode (the text",
     "  JSON-encoded n more times), wrap (the text put into wrap at {}).",
@@ -1004,16 +1004,16 @@
       "source": "round 8: the command list covers gh auth token only"
     }
   ],
-  "limits": {
-    "value-stops": "A quoted value is redacted up to its closing quote, a newline, a comma, or a backslash; a bare value up to a blank, a quote, a comma, ; ) ] } or a backslash. The rest of a value that holds one of these stays.",
-    "reference-value": "A reference, placeholder, constant, or expression after a secret name (api_key = config.api_key, password: ${DB_PASSWORD}, secret: false) is redacted like a value.",
-    "code-after-name": "A format placeholder or a $reference right after a secret name and a colon or = inside a string (\"secret: %s\", \"password: \"$PASSWORD) is taken for the value and redacted.",
-    "key-auth-unformatted": "A value under key, auth, or authorization, or after one in text, is redacted only when a format rule knows it (a GitHub token, a Bearer token).",
-    "wrapped-command": "A sensitive command behind any wrapper but a plain sudo (bash -c, env, VAR=1, timeout, command, nohup, sudo with options, an absolute path), and env with options, is not seen. Secret-named environment values in its output are still redacted.",
-    "command-word-order": "A CLI with options between its subcommand words (kubectl get -o yaml secret, gh auth -t status) is not seen as that command.",
-    "cli-any-args": "A listed CLI blanks its turn whatever it was asked for (aws configure get region, kubectl get secret without -o).",
-    "mention-blanks": "A sensitive file name, or a sensitive command after ; & | ( ` or a newline, anywhere in a tool's path, command, or patch input blanks the turn: a search for the word, a commit message, a patch body, quoted text, a heredoc's lines.",
-    "space-separated": "A value given as --password hunter2 (no : or =) is not redacted.",
-    "unlisted-cli": "Only the listed CLI invocations blank the turn. Another that prints a credential (gh auth status --show-token, npm token list) does not; a format rule may still redact what it prints."
-  }
+  "limits": [
+    "cli-any-args",
+    "code-after-name",
+    "command-word-order",
+    "key-auth-unformatted",
+    "mention-blanks",
+    "reference-value",
+    "space-separated",
+    "unlisted-cli",
+    "value-stops",
+    "wrapped-command"
+  ]
 }

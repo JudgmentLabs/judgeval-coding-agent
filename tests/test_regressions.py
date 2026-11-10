@@ -230,6 +230,12 @@ class TableTests(unittest.TestCase):
     def test_every_round_has_rows(self):
         self.assertEqual(matrix_size()["rounds"], ["c7458959", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8"])
 
+    def test_every_limit_is_documented(self):
+        """The README's Known limits list names every limit a row may cite, so a reviewer can tell a limit from a defect."""
+        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+        known = readme[readme.index("### Known limits") :]
+        self.assertEqual([name for name in LIMITS if f"(`{name}`)" not in known], [])
+
     def test_every_limit_is_used(self):
         self.assertEqual(sorted(set(LIMITS) - {row.get("limit") for row in ROWS}), ["space-separated"])
 
