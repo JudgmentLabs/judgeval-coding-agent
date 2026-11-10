@@ -202,7 +202,11 @@ class Sandbox:
 
     def inbox(self) -> list[dict]:
         folder = self.state / "inbox"
-        return [json.loads(path.read_text()) for path in sorted(folder.iterdir())] if folder.is_dir() else []
+        """The inbox in the order the sender reads it (flush._inbox): by write time, then name. A name starts with the
+        hook's process id, which wraps around and gains digits, so names alone do not sort in the order written."""
+        if not folder.is_dir():
+            return []
+        return [json.loads(path.read_text()) for path in sorted(folder.iterdir(), key=lambda path: (path.stat().st_mtime_ns, path.name))]
 
     def cleanup(self) -> None:
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -269,7 +273,15 @@ def py_sanitize(events: list[dict], cfg: dict | None = None, env: dict | None = 
     env = env or clean_env()
     rs = redact.ruleset(cfg or {})
     secrets = redact.env_secrets(env)
-    return [redact.sanitize_event(event, rs, secrets) for event in events]
+    return [_checked(redact.sanitize_event(event, rs, secrets)) for event in events]
+
+
+def _checked(event: dict) -> dict:
+    """The event, once redact.outcome accepts its state: no layer may leave text in a sensitive or failed event."""
+    from judgment_core import redact
+
+    redact.outcome(event)
+    return event
 
 
 _STAMPS = ("capture", "environment", "project_root")
@@ -281,7 +293,7 @@ def jq_sanitize(events: list[dict], cfg: dict | None = None, env: dict | None = 
     cleaned = []
     for event, result in zip(events, out):
         result = {key: value for key, value in result.items() if key not in _STAMPS and not (key == "ts" and "ts" not in event)}
-        cleaned.append(result)
+        cleaned.append(result if (cfg or {}).get("capture") == "full" or (cfg or {}).get("redact") is False else _checked(result))
     return cleaned
 
 

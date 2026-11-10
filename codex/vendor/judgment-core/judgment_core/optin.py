@@ -11,6 +11,8 @@ import os
 import re
 from pathlib import Path
 
+from judgment_core import redact
+
 OFF_VALUES = {"0", "false", "no", "off"}
 
 
@@ -52,29 +54,23 @@ def resolve_capture(data: dict) -> str:
     return "sanitized"
 
 
-def _strings(value: object) -> list[str]:
-    return [item for item in value if isinstance(item, str) and item] if isinstance(value, list) else []
+# The project's redaction settings, as written: judgment_core.redact.ruleset reads them and says what each does. It is
+# the one place that decides what a malformed value means, so nothing here reshapes one.
+REDACT_KEYS = tuple(redact.settings())
 
 
-# The project's redaction settings (judgment_core.redact.ruleset says what each does). Each is a list of strings.
-REDACT_KEYS = ("redactPatterns", "redactPaths", "redactCommands", "redactNames", "redactAllow", "redactDisable")
-# The ones that add rules: one that is not a list of strings is kept as written, so redact.ruleset fails closed on it.
-_STRICT_KEYS = ("redactPatterns", "redactPaths", "redactCommands", "redactNames")
-
-
-def _setting(key: str, value: object) -> object:
-    if key in _STRICT_KEYS and value is not None and not (isinstance(value, list) and all(isinstance(item, str) for item in value)):
-        return value
-    return _strings(value)
-
-
-_CLOSED = {"enabled": False, "capture": "sanitized", "sessionDefault": "on", "environment": "production", **{key: [] for key in REDACT_KEYS}}
+# A file that cannot be read is no opt-in, and its rules are unknown: every rule setting is malformed, so a turn already
+# recorded under it loses its text in the sender (redact.ruleset fails closed) instead of going out under the built-in rules alone.
+_CLOSED = {"enabled": False, "capture": "sanitized", "sessionDefault": "on", "environment": "production",
+           **{key: False if kind == "rule" else None for key, kind in redact.settings().items()}}
 
 
 def load_project(path: Path) -> dict:
+    """The project's settings. Read as the hook's jq reads the file: a byte order mark is skipped, and the first JSON
+    document is the file."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        data, _end = json.JSONDecoder().raw_decode(path.read_text(encoding="utf-8-sig").lstrip())
+    except (OSError, ValueError):
         return dict(_CLOSED)
     if not isinstance(data, dict):
         return dict(_CLOSED)
@@ -88,7 +84,7 @@ def load_project(path: Path) -> dict:
         "capture": resolve_capture(data),
         "sessionDefault": "off" if session_default == "off" else "on",
         "environment": environment.strip(),
-        **{key: _setting(key, data.get(key)) for key in REDACT_KEYS},
+        **{key: data.get(key) for key in REDACT_KEYS},
     }
 
 

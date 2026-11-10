@@ -353,13 +353,16 @@ class ProjectRuleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "tracing.json"
             path.write_text(json.dumps({**settings, "redactAllow": ["e", 4, ""]}))
+            # Every setting arrives as written: redact.ruleset alone decides what a malformed one means.
+            written = {**settings, "redactAllow": ["e", 4, ""], "redactNames": ["d", 4]}
+            path.write_text(json.dumps(written))
             loaded = optin.load_project(path)
-            self.assertEqual({key: loaded[key] for key in settings}, settings)
-            # A rule setting that is not a list of strings stays as written, so the rule set fails closed on it.
-            path.write_text(json.dumps({**settings, "redactNames": ["d", 4]}))
-            self.assertEqual(optin.load_project(path)["redactNames"], ["d", 4])
+            self.assertEqual({key: loaded[key] for key in settings}, written)
+            self.assertEqual(set(optin.REDACT_KEYS), set(settings))
+            self.assertEqual(redact.ruleset(loaded).error, "redactNames")
             path.write_text("{")
-            self.assertEqual({key: optin.load_project(path)[key] for key in settings}, {key: [] for key in settings})
+            # A file that cannot be read has unknown rules: the rule set fails closed (test_review10).
+            self.assertTrue(redact.ruleset(optin.load_project(path)).error)
 
 
 class GateTests(unittest.TestCase):

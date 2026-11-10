@@ -9,7 +9,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from judgment_core import __version__
+from judgment_core import __version__, redact
 from judgment_core.config import credentials_mode_warning, load_credentials
 from judgment_core.optin import find_optin, load_project, session_status, tracing_forced_off
 
@@ -82,6 +82,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"file: {found[1]}")
         print(f"capture: {project['capture']}")
         print(f"sessionDefault: {project['sessionDefault']}")
+        error = redact.ruleset(project).error if project["capture"] == "sanitized" else ""
+        if error:
+            # Nothing else says so: the events are still recorded, without their text.
+            print(f"redaction: a redact setting in this file cannot work ({error}), so every event loses its text")
     print(f"session: {mode}")
     if tracing_forced_off():
         print("JUDGMENT_TRACING=0")
