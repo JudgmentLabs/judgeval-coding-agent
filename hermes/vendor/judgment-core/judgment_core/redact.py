@@ -16,7 +16,7 @@ Everything is plain data through pure stages:
     tool_values    ToolValue(kind, text) for each string under a path, command, or patch key of the tool input
     words          what path rules read: the tokens of every tool value and the prompt's @mentions, one per line
     sensitive      the sensitive path or command a tool call names, as {rule, trigger}, or None
-    findings       Finding(rule, start, end, kept): each rule's matches as spans of the unchanged blob, one
+    findings       Finding(rule, start, end, kept): each rule's matches, and the p group's, as spans of the unchanged blob, one
                    finditer per window (linear: no match is searched for twice)
     layers         the strings and keys of JSON nested deeper in a string than the rules read, one list per depth
     pairs          findings -> Pair(found, replacement, rule), one per distinct found text, longest first; a
@@ -42,6 +42,7 @@ import functools
 import json
 import os
 import re
+import warnings
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -146,6 +147,7 @@ def compiled(table: Mapping | None = None) -> dict:
         "version": table["version"],
         "limits": {key: value for key, value in table["limits"].items() if key != "_comment"},
         "env": {"name_re": table["env"]["name_re"], "min_length": table["env"]["min_length"]},
+        "strict": [key for key, kind in table["settings"].items() if kind == "rule"],
         "patterns": patterns,
         "names": {
             "builtin": names_re(names["names"]),
@@ -185,9 +187,67 @@ def _field_sets(fields: Mapping) -> dict:
 # ---------------------------------------------------------------- compiled rules
 
 
+# What Oniguruma's \\s matches. Python's also takes U+001C to U+001F, so a value would end at one in the sender only.
+_BLANKS = "\t\n\x0b\x0c\r \x85\xa0\u1680" + "".join(map(chr, range(0x2000, 0x200B))) + "\u2028\u2029\u202f\u205f\u3000"
+_SIMPLE = {"\\n": "\n", "\\t": "\t", "\\r": "\r", "\\f": "\x0c", "\\v": "\x0b"}
+
+
+def _set(chars: Iterable[str]) -> str:
+    return "".join(f"\\u{ord(char):04x}" for char in chars)
+
+
+def _class(negated: bool, items: list[str]) -> str:
+    """One character class with \\s and \\S spelled out as Oniguruma reads them."""
+    rest = [item for item in items if item not in ("\\s", "\\S")]
+    if "\\S" not in items:
+        return "[" + ("^" if negated else "") + "".join(_set(_BLANKS) if item == "\\s" else item for item in items) + "]"
+    if "\\s" in items:
+        return "(?!)" if negated else "[\\s\\S]"  # every character, in both engines
+    if not negated:
+        return "(?:[^" + _set(_BLANKS) + "]|[" + "".join(rest) + "])" if rest else "[^" + _set(_BLANKS) + "]"
+    # [^\S...]: a blank that is none of the rest.
+    plain = [_SIMPLE.get(item, item) for item in rest]
+    if all(len(item) == 1 for item in plain):
+        return "[" + _set(char for char in _BLANKS if char not in plain) + "]"
+    return "(?:(?![" + "".join(rest) + "])[" + _set(_BLANKS) + "])"
+
+
+def _blanks(regex: str) -> str:
+    """The regex with every \\s and \\S, in a class or out of one, as the explicit set Oniguruma matches."""
+    out, at = [], 0
+    while at < len(regex):
+        char = regex[at]
+        if char == "\\" and at + 1 < len(regex):
+            pair = regex[at : at + 2]
+            out.append("[" + _set(_BLANKS) + "]" if pair == "\\s" else "[^" + _set(_BLANKS) + "]" if pair == "\\S" else pair)
+            at += 2
+        elif char == "[":
+            end = at + 1
+            negated = regex[end : end + 1] == "^"
+            end += negated
+            items: list[str] = []
+            while end < len(regex) and (regex[end] != "]" or not items):
+                step = 2 if regex[end] == "\\" and end + 1 < len(regex) else 1
+                items.append(regex[end : end + step])
+                end += step
+            out.append(_class(negated, items) if end < len(regex) else regex[at:])
+            at = end + 1
+        else:
+            out.append(char)
+            at += 1
+    return "".join(out)
+
+
 def _compile(regex: str) -> re.Pattern:
-    """Oniguruma names a group ``(?<p>...)`` and refers back to it as ``\\k<p>``. Python spells them ``(?P<p>...)`` and ``(?P=p)``."""
-    return re.compile(_BACKREF.sub(r"(?P=\1)", _NAMED.sub(r"(?P<\1>", regex)))
+    """A rule's regex as Python runs it. Oniguruma names a group ``(?<p>...)`` and refers back to it as ``\\k<p>``; Python
+    spells them ``(?P<p>...)`` and ``(?P=p)``. \\s and \\S become Oniguruma's set (``_blanks``). What Python only warns
+    about (a POSIX class such as [[:alpha:]], which Oniguruma reads as one) is an error: the layers would disagree."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        try:
+            return re.compile(_blanks(_BACKREF.sub(r"(?P=\1)", _NAMED.sub(r"(?P<\1>", regex))))
+        except Warning as exc:
+            raise re.error(str(exc)) from exc
 
 
 class RedactionLimit(ValueError):
@@ -285,8 +345,10 @@ def glob_re(glob: str) -> str:
     return "(?<![^\\n/:])" + "".join(table.get(char, char) for char in glob) + "(?![^\\n])"
 
 
-# The settings that add rules. One that is not a list of strings fails the rule set closed: the project asked for a rule.
-STRICT = ("redactPatterns", "redactPaths", "redactCommands", "redactNames")
+def settings() -> dict[str, str]:
+    """The redaction settings of tracing.json, each "rule" or "trim" (``settings`` in redact-rules.json). A rule setting
+    that is not a list of strings fails the rule set closed: the project asked for a rule."""
+    return {key: kind for key, kind in rules()["settings"].items() if key != "_comment"}
 
 
 def _setting(project: Mapping, key: str) -> list[str]:
@@ -332,7 +394,7 @@ def ruleset(project: Mapping | None = None) -> Ruleset:
     def failed(error: str) -> Ruleset:
         return Ruleset(built["patterns"], built["paths"], built["commands"], built["names"][1:], error=error)
 
-    bad = [key for key in STRICT if _malformed(project.get(key))]
+    bad = [key for key, kind in settings().items() if kind == "rule" and _malformed(project.get(key))]
     if bad:
         return failed(bad[0])
     if off - built["ids"]:
@@ -409,12 +471,12 @@ def windows(text: str) -> list[tuple[int, str, bool]]:
 
 
 class Finding(NamedTuple):
-    """One match of a rule on the unchanged text: where it is, and how much of it (the p group) is kept."""
+    """One match of a rule on the unchanged text: where it is, and the part of it (the p group) that is kept."""
 
     rule: str
     start: int
     end: int
-    kept: int  # the length of the kept prefix (the p group), 0 when the rule keeps none
+    kept: tuple[int, int]  # the span of the p group, empty when the rule keeps none
 
 
 def findings(rule: Rule, text: str, budget: int) -> list[Finding]:
@@ -427,9 +489,8 @@ def findings(rule: Rule, text: str, budget: int) -> list[Finding]:
     distinct texts fail closed too.
     """
     limits = rules()["limits"]
-    # jq keeps the first named group's text when it is p. Oniguruma does not count unnamed groups once a group is named.
-    named = rule.pattern.groupindex
-    keep = bool(named) and min(named.values()) == named.get("p")
+    # jq keeps the first group's text when that group is named p (it counts unnamed groups too).
+    keep = rule.pattern.groupindex.get("p") == 1
     if rule.most is not None and rule.needs and text.count(rule.needs[0]) > rule.most:
         raise RedactionLimit(rule.id)
     parts = [(0, text, True)] if rule.whole else windows(text)
@@ -443,7 +504,7 @@ def findings(rule: Rule, text: str, budget: int) -> list[Finding]:
                 if match.start() < limits["step"]:
                     raise RedactionLimit(rule.id)
                 continue
-            kept = len(match.group("p") or "") if keep else 0
+            kept = (start + match.start("p"), start + match.end("p")) if keep and match.group("p") else (0, 0)
             out.setdefault((start + match.start(), start + match.end()), Finding(rule.id, start + match.start(), start + match.end(), kept))
             distinct.add(match.group(0))
             if len(distinct) > budget:
@@ -454,7 +515,7 @@ def findings(rule: Rule, text: str, budget: int) -> list[Finding]:
 def found(rule: Rule, text: str, budget: int | None = None) -> list[Pair]:
     """Mirror of jp_found: each distinct complete match of the rule on the unchanged text, with what it becomes."""
     budget = hook_budget() if budget is None else budget
-    pairs_ = {Pair(text[item.start : item.end], text[item.start : item.start + item.kept] + placeholder(rule.id), rule.id) for item in findings(rule, text, budget)}
+    pairs_ = {Pair(text[item.start : item.end], text[item.kept[0] : item.kept[1]] + placeholder(rule.id), rule.id) for item in findings(rule, text, budget)}
     return sorted(pairs_)
 
 
@@ -926,17 +987,21 @@ def outcome(event: Mapping) -> str:
     error wins over sensitive, which wins over redacted. Impossible: text in a sensitive or error event, or a label or
     tool name in an error event. Those raise ValueError.
     """
-    # tool_calls survive stripping as ids (and names, but not in an error event): checked on their own below.
+    # tool_calls survive stripping as ids (and names, but not in an error event): checked on their own.
     text = [key for key, value in event.items() if key != "tool_calls" and not field_class(key)["strip"] and value not in ("", None)]
+    calls = event.get("tool_calls") or []
+
+    def more_than(allowed: set) -> bool:
+        return not isinstance(calls, list) or any(not isinstance(call, Mapping) or set(call) - allowed for call in calls)
+
     if event.get("redaction_error"):
-        labels = [key for key in event if field_class(key)["redact"]]
-        names = [call for call in event.get("tool_calls") or [] if isinstance(call, Mapping) and "name" in call]
-        if text or labels or names:
-            raise ValueError(f"error event keeps {sorted(set(text + labels)) or 'tool names'}")
+        labels = [key for key in event if key != "tool_calls" and field_class(key)["redact"]]
+        if text or labels or more_than({"id"}):
+            raise ValueError(f"error event keeps {sorted(set(text + labels)) or 'tool calls'}")
         return "error"
     if event.get("sensitive"):
-        if text:
-            raise ValueError(f"sensitive event keeps {sorted(text)}")
+        if text or more_than({"id", "name"}):
+            raise ValueError(f"sensitive event keeps {sorted(text) or 'tool calls'}")
         return "sensitive"
     return "redacted" if event.get("redactions") else "clean"
 

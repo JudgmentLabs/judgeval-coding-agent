@@ -4,7 +4,10 @@
     "scripts/gen_redact.py derives core/bin/redact-compiled.json (what jq loads: every regex composed) from it.",
     "Redaction is by format, plus three short data lists: secretNames (a value after one of these names), sensitivePaths and",
     "sensitiveCommands (a tool call that touches one blanks its turn). Nothing here parses code, shell, or patches.",
-    "Regexes use what Oniguruma and Python re agree on: (?<name>...) for a named group (p: the text it holds is kept);",
+    "Regexes use what Oniguruma and Python re agree on: (?<name>...) for a named group (p, when it is the first group: the text",
+    "it holds is kept); \\s and \\S, which redact._compile spells out for Python (its own count U+001C to U+001F as blanks);",
+    "An identifier boundary also holds right after an escape a JSON string or a terminal writes before a word: \\n \\r \\t \\b \\f,",
+    "\\uXXXX, and the m that ends an ANSI color code.",
     "no ^ or $ (use (?<![\\s\\S]) and (?![\\s\\S]) for the ends of a whole value); [0-9] and [A-Za-z], not \\d and \\w;",
     "no (?i), because Oniguruma compiles it slowly and jq compiles a regex on every call. Words are spelled lower, UPPER, and Capitalized.",
     "Linear time: no repeat inside a repeat over characters both can take, and no two unbounded repeats over overlapping",
@@ -38,6 +41,20 @@
     "sender_pairs": 4096,
     "depth": 4
   },
+  "settings": {
+    "_comment": [
+      "The redaction settings a project's tracing.json may hold, and what a malformed one does. Each is a list of strings.",
+      "rule: it adds rules, so a value that is not a list of strings fails the rule set closed (every event loses its text).",
+      "trim: it only takes rules or finds away, so anything that is not a nonempty string in a list is skipped.",
+      "Both layers, and every adapter that forwards a project's settings, read the keys from here."
+    ],
+    "redactPatterns": "rule",
+    "redactPaths": "rule",
+    "redactCommands": "rule",
+    "redactNames": "rule",
+    "redactAllow": "trim",
+    "redactDisable": "trim"
+  },
   "patterns": [
     {
       "id": "private_key",
@@ -53,22 +70,22 @@
       "needs": [
         "eyJ"
       ],
-      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrt]))eyJ[A-Za-z0-9_-]{8,}\\.eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]*"
+      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))eyJ[A-Za-z0-9_-]{8,}\\.eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]*"
     },
     {
       "id": "anthropic_key",
       "needs": [
         "sk-ant-"
       ],
-      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrt]))sk-ant-[A-Za-z0-9_-]{20,}"
+      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))sk-ant-[A-Za-z0-9_-]{20,}"
     },
     {
       "id": "openai_key",
       "needs": [
         "sk-"
       ],
-      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrt]))sk-(?:proj-|svcacct-|admin-)?(?=[A-Za-z0-9_-]{0,256}?[A-Za-z0-9_]{16})[A-Za-z0-9_-]{20,}",
-      "pre": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrt]))sk-"
+      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))sk-(?:proj-|svcacct-|admin-)?(?=[A-Za-z0-9_-]{0,256}?[A-Za-z0-9_]{16})[A-Za-z0-9_-]{20,}",
+      "pre": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))sk-"
     },
     {
       "id": "aws_access_key_id",
@@ -78,7 +95,7 @@
         "ABIA",
         "ACCA"
       ],
-      "re": "(?:(?<![A-Za-z0-9])|(?<=\\\\[nrt]))(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}(?![0-9A-Za-z])"
+      "re": "(?:(?<![A-Za-z0-9])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}(?![0-9A-Za-z])"
     },
     {
       "id": "github_token",
@@ -89,14 +106,14 @@
         "ghs_",
         "ghr_"
       ],
-      "re": "(?:(?<![A-Za-z0-9_])|(?<=\\\\[nrt]))gh[pousr]_[A-Za-z0-9]{36,}"
+      "re": "(?:(?<![A-Za-z0-9_])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))gh[pousr]_[A-Za-z0-9]{36,}"
     },
     {
       "id": "github_pat",
       "needs": [
         "github_pat_"
       ],
-      "re": "(?:(?<![A-Za-z0-9_])|(?<=\\\\[nrt]))github_pat_[A-Za-z0-9_]{22,}"
+      "re": "(?:(?<![A-Za-z0-9_])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))github_pat_[A-Za-z0-9_]{22,}"
     },
     {
       "id": "slack_token",
@@ -108,7 +125,7 @@
         "xoxs-",
         "xoxe-"
       ],
-      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrt]))xox[abprse]-(?=[A-Za-z0-9-]{0,255}[0-9])[A-Za-z0-9-]{10,}"
+      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))xox[abprse]-(?=[A-Za-z0-9-]{0,255}[0-9])[A-Za-z0-9-]{10,}"
     },
     {
       "id": "slack_webhook",
@@ -122,7 +139,7 @@
       "needs": [
         "AIza"
       ],
-      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrt]))AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"
+      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"
     },
     {
       "id": "stripe_key",
@@ -132,7 +149,7 @@
         "rk_live_",
         "rk_test_"
       ],
-      "re": "(?:(?<![A-Za-z0-9_])|(?<=\\\\[nrt]))(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}"
+      "re": "(?:(?<![A-Za-z0-9_])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}"
     },
     {
       "_comment": [
@@ -142,7 +159,7 @@
       "needs": [
         "://"
       ],
-      "re": "(?<p>(?:(?<![A-Za-z0-9+.-])|(?<=\\\\[nrt]))[A-Za-z][A-Za-z0-9+.-]{1,20}://[^\\s/:@'\\\"<>\\[\\]]{0,128}:)(?!(?:\\[REDACTED:[A-Za-z0-9_:.-]{1,128}\\](?:#[0-9]{1,6})?|\\$\\{[A-Za-z_][A-Za-z0-9_]{0,127}\\}|\\$[A-Za-z_][A-Za-z0-9_]{0,127}|\\{\\{\\s{0,4}[.A-Za-z_][A-Za-z0-9_.]{0,127}\\s{0,4}\\}\\}|%[A-Za-z_][A-Za-z0-9_]{0,63}%|\\*{1,64}|x{3,64}|X{3,64}|password|PASSWORD|Password|pass|PASS|Pass|passwd|PASSWD|Passwd|pwd|PWD|Pwd|secret|SECRET|Secret|changeme|CHANGEME|Changeme)@)[^\\s/@'\\\"<>]+(?=@)"
+      "re": "(?<p>(?:(?<![A-Za-z0-9+.-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))[A-Za-z][A-Za-z0-9+.-]{1,20}://[^\\s/:@'\\\"<>\\[\\]]{0,128}:)(?!(?:\\[REDACTED:[A-Za-z0-9_:.-]{1,128}\\](?:#[0-9]{1,6})?|\\$\\{[A-Za-z_][A-Za-z0-9_]{0,127}\\}|\\$[A-Za-z_][A-Za-z0-9_]{0,127}|\\{\\{\\s{0,4}[.A-Za-z_][A-Za-z0-9_.]{0,127}\\s{0,4}\\}\\}|%[A-Za-z_][A-Za-z0-9_]{0,63}%|\\*{1,64}|x{3,64}|X{3,64}|password|PASSWORD|Password|pass|PASS|Pass|passwd|PASSWD|Passwd|pwd|PWD|Pwd|secret|SECRET|Secret|changeme|CHANGEME|Changeme)@)[^\\s/@'\\\"<>]+(?=@)"
     },
     {
       "id": "authorization_header",
@@ -156,7 +173,7 @@
         "-Token",
         "-TOKEN"
       ],
-      "re": "(?<p>(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrt]))(?:(?:proxy|PROXY|Proxy)-(?:authorization|AUTHORIZATION|Authorization)|(?:authorization|AUTHORIZATION|Authorization)|(?:x|X)-(?:api|API|Api)-(?:key|KEY|Key)|(?:api|API|Api)-(?:key|KEY|Key)|(?:x|X)-(?:auth|AUTH|Auth)-(?:token|TOKEN|Token))\\\\?[\\\"']?\\s{0,5}[:=]\\s{0,5}\\\\?[\\\"']?(?:(?:basic|BASIC|Basic|bearer|BEARER|Bearer|token|TOKEN|Token|digest|DIGEST|Digest|bot|BOT|Bot|apikey|APIKEY|Apikey)\\s+)?)(?!\\$|<|\\{\\{|%)(?=[A-Za-z._~+/=-]{0,255}[0-9+/=])[A-Za-z0-9._~+/=-]{12,}"
+      "re": "(?<p>(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))(?:(?:proxy|PROXY|Proxy)-(?:authorization|AUTHORIZATION|Authorization)|(?:authorization|AUTHORIZATION|Authorization)|(?:x|X)-(?:api|API|Api)-(?:key|KEY|Key)|(?:api|API|Api)-(?:key|KEY|Key)|(?:x|X)-(?:auth|AUTH|Auth)-(?:token|TOKEN|Token))\\\\?[\\\"']?\\s{0,5}[:=]\\s{0,5}\\\\?[\\\"']?(?:(?:basic|BASIC|Basic|bearer|BEARER|Bearer|token|TOKEN|Token|digest|DIGEST|Digest|bot|BOT|Bot|apikey|APIKEY|Apikey)\\s+)?)(?!\\$|<|\\{\\{|%)(?=[A-Za-z._~+/=-]{0,255}[0-9+/=])[A-Za-z0-9._~+/=-]{12,}"
     },
     {
       "id": "bearer_token",
@@ -165,7 +182,7 @@
         "BEARER",
         "Bearer"
       ],
-      "re": "(?<p>(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrt]))(?:bearer|BEARER|Bearer)\\s+)(?!\\$|<|\\{\\{|%)(?=[A-Za-z._~+/=-]{0,255}[0-9])[A-Za-z0-9._~+/=-]{16,}"
+      "re": "(?<p>(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))(?:bearer|BEARER|Bearer)\\s+)(?!\\$|<|\\{\\{|%)(?=[A-Za-z._~+/=-]{0,255}[0-9])[A-Za-z0-9._~+/=-]{16,}"
     }
   ],
   "secretNames": {
@@ -193,14 +210,14 @@
     ],
     "assignment": {
       "_comment": [
-        "secret_assignment, in text: {names} at an identifier boundary, an optional closing quote (escaped any number of times, as",
-        "nested JSON writes it), : or = (also := and =>), then the value: quoted (up to its quote, a newline, a comma, or a",
+        "secret_assignment, in text: {names} at an identifier boundary, an optional closing quote, backtick, or Markdown ** (the",
+        "quote escaped any number of times, as nested JSON writes it), : or = (also := and =>), an optional closing **, then the value: quoted (up to its quote, a newline, a comma, or a",
         "backslash; not starting with a blank or + ) ; ] }, which follow a string that just closed: \"password: \" + pw), or bare",
         "(up to a blank, a quote, a comma, ; ) ] } or a backslash; not starting with = [ { ( or :).",
         "Only the value is replaced. A value that is already a placeholder is left alone."
       ],
       "id": "secret_assignment",
-      "re": "(?<p>(?:(?<![A-Za-z0-9])|(?<=\\\\[nrt])|(?<=[a-z0-9])(?=[A-Z])){names}\\\\{0,31}[\"']?[^\\S\\n]{0,32}(?::=|=>|[:=])[^\\S\\n]{0,32}\\\\{0,31}[\"'`]?)(?!\\[REDACTED:)(?:(?<=\")[^\"\\s,\\\\+);\\]}][^\"\\n,\\\\]*|(?<=')[^'\\s,\\\\+);\\]}][^'\\n,\\\\]*|(?<=`)[^`\\s,\\\\+);\\]}][^`\\n,\\\\]*|(?<![\"'`])[^\\s\"'`,;\\\\)\\]}=\\[{(:][^\\s\"'`,;\\\\)\\]}]*)"
+      "re": "(?<p>(?:(?<![A-Za-z0-9])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m)|(?<=[a-z0-9])(?=[A-Z])){names}\\\\{0,31}(?:[\"'`]|\\*{1,2})?[^\\S\\n]{0,32}(?::=|=>|[:=])\\*{0,2}[^\\S\\n]{0,32}\\\\{0,31}[\"'`]?)(?!\\[REDACTED:)(?:(?<=\")[^\"\\s,\\\\+);\\]}][^\"\\n,\\\\]*|(?<=')[^'\\s,\\\\+);\\]}][^'\\n,\\\\]*|(?<=`)[^`\\s,\\\\+);\\]}][^`\\n,\\\\]*|(?<![\"'`])[^\\s\"'`,;\\\\)\\]}=\\[{(:][^\\s\"'`,;\\\\)\\]}]*)"
     },
     "field": {
       "_comment": [
@@ -254,9 +271,9 @@
       "! globs. A glob holding a / matches the token's last components (.kube/config). * is any run of characters but / and :,",
       "? one such character. A token is a mention: a read, a write, a patch header, or a word in a patch's body all count. Over-blanking",
       "is the accepted direction: it loses one turn's text and never leaks.",
-      "Commands: each command string is matched on its own. A command counts at the start of the string or after ; & | ( `",
-      "or a newline, behind an optional sudo (command.prefix). One with --help, -h, or --version before the next ; & | ) `",
-      "or newline does not count (command.unless).",
+      "Commands: each command string is matched on its own. A command counts at the start of the string or after ; & | ( { `",
+      "or a newline, behind an optional sudo (command.prefix). One with --help, -h, or --version before the next ; & | ( ) { `",
+      "or newline does not count (command.unless): the help check stops where a command can start, so it is linear.",
       "glob: how a project's redactPaths glob becomes a regex, one character at a time. There * is any run of characters, / included."
     ],
     "keys": {
@@ -334,8 +351,8 @@
       "|": "\\|"
     },
     "command": {
-      "prefix": "(?:(?<![\\s\\S])|(?<=[;&|\\n(`{]))[^\\S\\n]*(?:(?:then|do|else|time|exec|command|nohup|!)[^\\S\\n]+)?(?:[A-Za-z_][A-Za-z0-9_]*=[^\\s;&|`()\"']*[^\\S\\n]+)*(?:sudo(?:[^\\S\\n]+-[A-Za-z]+(?:[^\\S\\n]+[^\\s;&|`)-][^\\s;&|`)]*)?)*[^\\S\\n]+)?(?:(?:ba|z|da|k)?sh[^\\S\\n]+-[A-Za-z]*c[^\\S\\n]+[\"']?)?(?:[^\\s;&|`()\"']*/)?",
-      "unless": "(?![^;&|\\n)`]*[^\\S\\n](?:--help|-h|--version)(?![^\\s;&|)`\"']))"
+      "prefix": "(?:(?<![\\s\\S])|(?<=[;&|\\n(`{]))[^\\S\\n]*(?:(?:then|do|else|time|exec|command|nohup|!)[^\\S\\n]+)?(?:[A-Za-z_][A-Za-z0-9_]*=[^\\s;&|`()\"']*[^\\S\\n]+)*(?:sudo(?:[^\\S\\n]+-[A-Za-z]+(?:[^\\S\\n]+[^\\s;&|`)-][^\\s;&|`)]*)?)*[^\\S\\n]+)?(?:(?:/(?:usr/)?(?:local/)?bin/)?(?:ba|z|da|k)?sh[^\\S\\n]+-[A-Za-z]*c[^\\S\\n]+[\"']?)?(?:[^\\s;&|`()\"']*/)?",
+      "unless": "(?![^;&|\\n)`({]*[^\\S\\n](?:--help|-h|--version)(?![^\\s;&|)`\"']))"
     },
     "paths": [
       {
@@ -546,7 +563,7 @@
           "typeset"
         ],
         "re": [
-          "(?:env|printenv|set|export(?:[^\\S\\n]+-p)?)[^\\S\\n]*(?=[;&|\\n)`>\"']|(?![\\s\\S]))",
+          "(?:env|printenv|set|export(?:[^\\S\\n]+-p)?)[^\\S\\n]*(?=[0-9]?[<>]|[;&|\\n)`\"']|(?![\\s\\S]))",
           "(?:declare|typeset)[^\\S\\n]+-[A-Za-z]{0,8}[px][A-Za-z]{0,8}(?![A-Za-z0-9_-])"
         ],
         "examples": [
