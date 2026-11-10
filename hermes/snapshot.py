@@ -10,12 +10,14 @@ Budgets are data (``Budget``); ``CALLBACK`` is the one a callback spends. One fi
 
     value --take--> the value itself         str, int, float, bool, None: immutable, nothing to copy
                 \-> bytes (marshal)          a dict/list within budget: plain JSON types, copied in C
-                \-> Omitted(reason)          over budget (nodes, chars): dropped whole, never cut
-    a tree with other types (provider objects, tuples, non-str keys) or nested past ``depth``
-        --copy--> the same budget, spent by a plain Python copy (unknown objects as their str, deeper
-        nesting as "…"), then marshal
+                \-> Omitted(reason)          over budget (nodes, chars, depth): dropped whole, never cut
+    a tree with other types (provider objects, tuples, non-str keys)
+        --copy--> the same budget, spent by a plain Python copy (unknown objects as their str), then marshal
 
-Impossible: a snapshot over its budget; part of a value (a cut); a reference to Hermes's object in a record;
+Every budget dimension ends the same way, in Omitted: a tree nested too deep is not cut at its depth (a
+deep ``{"path": ".env"}`` would lose the evidence that makes its turn sensitive), it is omitted whole.
+
+Impossible: a snapshot over its budget; part of a value (a cut, at any budget, depth included); a reference to Hermes's object in a record;
 an Omitted crossing the pipe (spooler.bound turns it into the OMITTED marker, named in ``omitted``, and the
 helper treats an omitted input as sensitive: its turn is blanked, as for a .env read).
 
@@ -35,13 +37,12 @@ from typing import Any
 class Budget:
     nodes: int  # members of every dict and list, counted before they are visited
     chars: int  # characters of every string and key (numbers, bools, null: 8 each)
-    depth: int  # nesting a snapshot keeps; deeper structure is replaced whole by "…"
+    depth: int  # containers nested below the root a snapshot may hold; deeper, the value is omitted whole
 
 
 # What one callback may spend on one field. 8192 members is ~0.6 ms of walk plus ~0.1 ms of copy at p95 on
 # Python 3.13 (tests/bench_hermes.py); 512 KB is the most the helper redacts in one field (spooler.FIELD_CAP).
 CALLBACK = Budget(nodes=8192, chars=512 * 1024, depth=12)
-DEEP = "…"
 
 
 class Omitted:
@@ -58,7 +59,7 @@ class Omitted:
 
 _SCALAR = (int, float, bool, type(None))
 _PLAIN = 0  # all plain: marshal can copy it as is
-_COPY = -1  # holds another type or nests too deep: copy it in Python
+_COPY = -1  # holds another type: copy it in Python
 
 
 def _measure(value: Any, budget: Budget) -> int | Omitted:
@@ -96,11 +97,11 @@ def _measure(value: Any, budget: Budget) -> int | Omitted:
         if not deeper:
             return chars
         level = deeper
-    return _COPY  # nested past budget.depth
+    return Omitted("depth")
 
 
 def _copy(value: Any, budget: Budget) -> Any:
-    """A plain copy, spending the same budget: unknown objects as their str, nesting past budget.depth as "…"."""
+    """A plain copy, spending the same budget (raises _Over): unknown objects as their str."""
     spent = [0, 0]  # nodes, chars
 
     def visit(item: Any, depth: int) -> Any:
@@ -113,8 +114,8 @@ def _copy(value: Any, budget: Budget) -> Any:
         elif not isinstance(item, (dict, list, tuple)):
             out = str(item)
             spent[1] += len(out)
-        elif depth >= budget.depth:
-            return DEEP
+        elif depth > budget.depth:  # the same limit _measure applies
+            raise _Over("depth")
         else:
             spent[0] += len(item)
             if spent[0] > budget.nodes:

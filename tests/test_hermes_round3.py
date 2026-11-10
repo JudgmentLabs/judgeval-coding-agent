@@ -112,15 +112,26 @@ class Snapshot(unittest.TestCase):
         for _ in range(20):
             cursor["d"] = {}
             cursor = cursor["d"]
-        value = {"t": (1, 2), 3: "int key", "o": Thing(), "deep": deep}
+        value = {"t": (1, 2), 3: "int key", "o": Thing()}
         out = marshal.loads(self.snap.take(value))
-        self.assertEqual(out["t"], [1, 2])
-        self.assertEqual(out["3"], "int key")
-        self.assertEqual(out["o"], "thing")
-        depth, cursor = 0, out["deep"]
-        while isinstance(cursor, dict):
-            cursor, depth = cursor["d"], depth + 1
-        self.assertEqual(cursor, self.snap.DEEP, "nesting past the budget's depth is replaced whole")
+        self.assertEqual(out, {"t": [1, 2], "3": "int key", "o": "thing"})
+        self.assertEqual(self.snap.take({**value, "deep": deep}).reason, "depth", "the copy path omits deep nesting too")
+
+    def test_depth_is_a_budget_like_the_others(self):
+        """At the limit: kept whole, by either path. One level past it: omitted whole, never cut to a stub."""
+        budget = self.snap.Budget(nodes=100, chars=10_000, depth=3)
+
+        def nest(levels: int, leaf: object) -> dict:
+            value: object = leaf
+            for _ in range(levels):
+                value = {"d": value}
+            return value
+
+        for leaf in ({}, (1,)):  # (1,) takes the copy path
+            self.assertIsInstance(self.snap.take(nest(3, leaf), budget), bytes)
+            over = self.snap.take(nest(4, leaf), budget)
+            self.assertIsInstance(over, self.snap.Omitted)
+            self.assertEqual(over.reason, "depth")
 
     def test_the_copy_path_spends_the_same_budget(self):
         budget = self.snap.Budget(nodes=50, chars=10_000, depth=12)
@@ -162,6 +173,21 @@ class Structured(Case):
         self.assertEqual(attrs(roots(spans)[0])["judgment.redacted_rule"], load_plugin().core.OVERSIZE_RULE)
         self.assertNotIn("PRIVATE-NOTE", self.sink.text())
         self.assertNotIn("r0000001", self.sink.text(), "the blanked turn sends none of its arguments")
+
+    def test_deeply_nested_sensitive_path_blanks_the_turn(self):
+        """Codex round 4: depth past the budget used to become "…", dropping the .env path that made the read
+        sensitive while keeping its private output. Now it is an omission: the turn is blanked, with a reason."""
+        args: dict = {"path": ".env"}
+        for _ in range(20):
+            args = {"nested": args}
+        self.fire(self.tool_turn(args, "PRIVATE-NOTE-" + "x" * 40).events)
+        tool = next(event for event in self.sb.inbox() if event["event"] == "tool")
+        self.assertTrue(tool["sensitive"])
+        self.assertEqual(tool["sensitive_rule"], load_plugin().core.OVERSIZE_RULE)
+        self.assertNotIn("tool_input", tool)
+        # The model's JSON-text copy of the arguments is parsed whole in the helper, so the turn names .env itself.
+        self.assertIn(attrs(roots(self.flushed())[0])["judgment.redacted_rule"], {"dotenv", load_plugin().core.OVERSIZE_RULE})
+        self.assertNotIn("PRIVATE-NOTE", self.sink.text())
 
     def test_structured_arguments_within_budget_arrive_whole(self):
         args = rows(1_000)
