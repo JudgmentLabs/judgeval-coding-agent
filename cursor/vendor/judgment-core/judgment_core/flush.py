@@ -21,7 +21,9 @@ import gzip
 import hashlib
 import json
 import os
+import signal
 import socket
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -331,12 +333,6 @@ def _destination(events: list[dict], env: dict | None) -> tuple[str, dict[str, s
     return "send", {"JUDGMENT_API_KEY": key, "JUDGMENT_PROJECT_ID": project, "JUDGMENT_API_URL": url or DEFAULT_API_URL, "JUDGMENT_ORG_ID": org}
 
 
-# Metadata capture keeps names, models, tokens, cost, timing, and ids. The list is in core/bin/redact-rules.json.
-def _metadata_only(event: dict) -> dict:
-    """The event without its text. Transcript enrichment has already run, so this is what gets sent and kept."""
-    return redact.strip_text(event, redact.metadata_fields())
-
-
 def turn_capture(events: list[dict]) -> str:
     """The strictest capture any event was recorded under. An event with no stamp, from an older build, is sanitized."""
     modes = {event.get("capture") for event in events}
@@ -375,22 +371,25 @@ class _Redactor:
         return redact.redact_event(event, self.rules([event]), self.secrets)
 
     def text(self, value: str, rs: redact.Ruleset) -> str:
-        return redact.redact_string(value, rs, self.secrets)[0]
+        return redact.redact_text(value, rs, self.secrets)
 
 
 def _sanitize(state: Path, key: str, item: dict, events: list[dict], prepared: list[dict], redactor: _Redactor) -> tuple[list[dict], dict | None]:
-    """Redact the enriched turn, and find whether it touched a sensitive file. A blanked turn stays blanked.
+    """Find whether the enriched turn touched a sensitive file, then redact it. A blanked turn stays blanked.
 
-    The turn file is rewritten when this changes what it holds, so the redacted or blanked
-    version is all that stays on disk.
+    Detection runs first, on the text as read: a placeholder can hide what made a path sensitive
+    (.env.<token> becomes .env.[REDACTED:...]). The turn file is rewritten when this changes what
+    it holds, so the redacted or blanked version is all that stays on disk.
     """
     rs = redactor.rules(events)
-    prepared = [redact.redact_event(event, rs, redactor.secrets) for event in prepared]
     blank = item.get("blanked") or redact.first_sensitive(prepared, rs, redactor.secrets, redactor.home)
+    prepared = [redact.redact_event(event, rs, redactor.secrets) for event in prepared]
     stored = [redact.redact_event(event, rs, redactor.secrets) for event in events]
     if blank:
         item["blanked"] = blank
         stored = [redact.strip_text(event) for event in stored]
+        # Spans are built from the whole turn and lose their text there. A free-form name would be a span name.
+        prepared = [redact.unblank(event) for event in prepared]
     if stored != events:
         _private_write(_turn_file(state, key), "".join(json.dumps(event, ensure_ascii=False, default=str) + "\n" for event in stored))
     return prepared, blank
@@ -510,13 +509,14 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
             redaction = None
             rs = redactor.rules(events)
             if capture == "metadata":
-                prepared = [_metadata_only(event) for event in prepared]
+                # Transcript enrichment has already run, so this is what gets sent and kept.
+                prepared = [redact.metadata_event(event, rs, redactor.secrets) for event in prepared]
                 redaction = redact.turn_redaction(prepared)
             elif capture == "sanitized":
                 prepared, blank = _sanitize(state, key, item, events, prepared, redactor)
                 redaction = redact.turn_redaction(prepared, blank)
-            # A blanked or metadata turn is no later turn's context.
-            quiet = capture == "metadata" or bool(blank)
+            # A blanked or metadata turn is no later turn's context. Nor is one whose rules failed.
+            quiet = capture == "metadata" or bool(blank) or (capture != "full" and bool(rs.error))
             summary = turn_summary(prepared)
             if summary:
                 item["start"] = summary["start"]
@@ -524,6 +524,7 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
             # Earlier turns may hold text from before the project switched to metadata.
             assert creds is not None
             dest = f"{creds['JUDGMENT_API_URL']} {creds['JUDGMENT_ORG_ID']} {creds['JUDGMENT_PROJECT_ID']}"
+            # Rules that failed drop every text in the request, the earlier turns' included.
             history = [] if quiet else _history(index, key, dest)
             if capture != "full":
                 # Summaries stored by an older build were never redacted.
@@ -594,7 +595,22 @@ def _prune(state: Path, index: dict) -> None:
         _private_write(state / "index.json", json.dumps(index))
 
 
-def main() -> None:
+def _detach() -> None:
+    """Leave the hook's session, so an agent that kills its hooks' process group or session misses this.
+
+    The hook ignores SIGHUP before it starts this, and starts it in its own process group where it can.
+    setsid() fails for a process group leader, which is then already out of the hook's group.
+    """
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        os.setsid()
+    except OSError:
+        pass
+
+
+def main(argv: list[str] | None = None) -> None:
+    if "--detach" in (sys.argv[1:] if argv is None else argv):
+        _detach()
     if tracing_forced_off():
         return
     state = state_dir()

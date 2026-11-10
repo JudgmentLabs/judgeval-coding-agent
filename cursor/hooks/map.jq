@@ -1,12 +1,11 @@
 include "prepare";
 
 def trimmed:
-  if type == "string" then gsub("^\\s+|\\s+$"; "") else "" end;
+  if type == "string" then jp_trim else "" end;
 
 def strip_copy($gid):
-  if $gid | test("-[0-9]+-[A-Za-z0-9]{4}$") then
-    strip_copy($gid | sub("-[0-9]+-[A-Za-z0-9]{4}$"; ""))
-  else $gid end;
+  ($gid | jp_before("-[0-9]+-[A-Za-z0-9]{4}")) as $base
+  | if $base == null then $gid else strip_copy($base) end;
 
 def turn_key:
   # A thought is delivered twice. The copy's generation id ends in the routed
@@ -16,9 +15,9 @@ def turn_key:
   | (if $gid == "" then "" else strip_copy($gid) end) as $base
   | (if $base == "" then ""
      elif $model != "" and ($base | endswith($model)) then
-       ($base[0:($base | length) - ($model | length)] | gsub("[\\-_:]+$"; ""))
-     elif ($base | test(":(auto-smart|grok-[^:]+)$")) then
-       ($base | sub(":(auto-smart|grok-[^:]+)$"; ""))
+       ($base[0:($base | length) - ($model | length)] | jp_before("[\\-_:]*"))
+     elif ($base | jp_before(":(?:auto-smart|grok-[^:]+)")) != null then
+       ($base | jp_before(":(?:auto-smart|grok-[^:]+)"))
      else $base end) as $key
   | if $key == "" then (.conversation_id // .session_id // "") else $key end;
 
@@ -59,7 +58,7 @@ def sub_id:
   + ((.task // .description // "") | explode | reduce .[] as $c (7; (. * 31 + $c) % 4294967291) | tostring);
 
 (.prompt | trimmed) as $prompt
-| if $event == "beforeSubmitPrompt" and ($prompt | test("^/judgment(\\s+(on|off|status))?$")) then
+| if $event == "beforeSubmitPrompt" and ($prompt | jp_test("^/judgment(\\s+(on|off|status))?$")) then
     {
       kind: "command",
       name: (($prompt | split(" "))[1] // "status"),

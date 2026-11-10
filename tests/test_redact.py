@@ -42,7 +42,7 @@ class PatternTests(unittest.TestCase):
             with self.subTest(rule=rule):
                 self.assertNotIn(SECRETS[key]["core"], json.dumps(out))
                 self.assertIn(f"[REDACTED:{rule}]" if rule != "bearer_token" else "[REDACTED:", out["tool_output"])
-                self.assertTrue(out["redactions"])
+                self.assertTrue(redact.census(out))
 
     def test_assignments_in_json_shell_and_aws_forms(self):
         for key in ("json_api_key", "export_token", "aws_secret"):
@@ -73,13 +73,13 @@ class PatternTests(unittest.TestCase):
             for field in ("v", "harness", "event", "session_id", "turn_id", "model", "ts", "usage", "export_fp", "tool_call_id"):
                 self.assertEqual(out[field], event[field])
             self.assertEqual(out["tool_calls"][0]["id"], "c")
-            self.assertEqual({item["field"] for item in out["redactions"]}, {"prompt", "output", "received", "tool_results", "tool_calls", "messages", "error"})
+            self.assertEqual({item["field"] for item in redact.census(out)}, {"prompt", "output", "received", "tool_results", "tool_calls", "messages", "error"})
 
     def test_audit_trail_has_rule_field_count_and_no_secret(self):
         events = [tool_event(secret_blob(), prompt="key " + SECRETS["openai_key"]["core"])]
         env = clean_env(**{ENV_SECRET_NAME: SECRETS["env_value"]["core"], "JUDGMENT_API_KEY": SECRETS["judgment_key"]["core"]})
         for out in (py_sanitize(events, env=env)[0], jq_sanitize(events, env=env)[0]):
-            audit = out["redactions"]
+            audit = redact.census(out)
             for item in audit:
                 self.assertEqual(set(item), {"rule", "field", "count"})
                 self.assertGreater(item["count"], 0)
@@ -118,7 +118,7 @@ class EnvTests(unittest.TestCase):
         }
         redacted = {"JUDGMENT_API_KEY": "short123", "SERVICE_PASSWORD": "Pw-" + SECRETS["env_value"]["core"][:10], "GITHUB_TOKEN": SECRETS["github_token"]["core"]}
         env = self.env(**keep, **redacted)
-        py_names = sorted(name for name, _ in redact.env_secrets(env))
+        py_names = sorted({name for name, _ in redact.env_secrets(env)})
         self.assertEqual(py_names, sorted(redacted))
         event = tool_event(" | ".join(list(keep.values()) + list(redacted.values())))
         for out in (py_sanitize([event], env=env)[0], jq_sanitize([event], env=env)[0]):
@@ -126,12 +126,12 @@ class EnvTests(unittest.TestCase):
                 self.assertIn(value, out["tool_output"])
             for name in redacted:
                 self.assertIn(f"[REDACTED:env:{name}]", out["tool_output"])
-            self.assertEqual(sorted(item["rule"] for item in out["redactions"]), sorted(f"env:{name}" for name in redacted))
+            self.assertEqual(sorted(item["rule"] for item in redact.census(out)), sorted(f"env:{name}" for name in redacted))
 
     def test_names_with_odd_characters_and_casings(self):
         env = self.env(**{"npm_config_//registry.example.com/:_authToken": "npm_" + SECRETS["env_value"]["core"], "githubToken": "Gh" + SECRETS["env_value"]["core"][:12],
                           "AUTHORIZATION_HEADER": "Basic " + SECRETS["env_value"]["core"][:16], "MONKEY_ISLAND": "Guybrush123", "XAUTHORITY_X": "Cookie12345"})
-        names = sorted(name for name, _ in redact.env_secrets(env))
+        names = sorted({name for name, _ in redact.env_secrets(env)})
         self.assertEqual(names, sorted(["npm_config_//registry.example.com/:_authToken", "githubToken", "AUTHORIZATION_HEADER"]))
         event = tool_event(" ".join(env[name] for name in names) + " Guybrush123 Cookie12345")
         self.assertEqual(norm(py_sanitize([event], env=env)), norm(jq_sanitize([event], env=env)))
@@ -194,8 +194,9 @@ class SensitiveTests(unittest.TestCase):
         events = [tool_event("", tool_input=item) for item in inputs]
         rs = redact.ruleset(cfg or {})
         py = [redact.sensitive(event, rs) for event in events]
-        py = [None if hit is None else {**hit, "trigger": redact.show_trigger(hit["trigger"], rs, [], "/home/tester")} for hit in py]
-        js = [out.get("sensitive_rule") and {"rule": out["sensitive_rule"], "trigger": out["sensitive_trigger"]} or None for out in jq_sanitize(events, cfg=cfg)]
+        py = [None if hit is None else {**hit, "trigger": redact.show_trigger(hit["trigger"], "/home/tester")} for hit in py]
+        js = [out.get("sensitive_rule") and {"rule": out["sensitive_rule"], "trigger": redact.show_trigger(out["sensitive_trigger"], "/home/tester")} or None
+              for out in jq_sanitize(events, cfg=cfg)]
         return py, js
 
     def test_sensitive_paths_and_env_dumps(self):
@@ -294,12 +295,13 @@ class GateTests(unittest.TestCase):
         rs = redact.ruleset()
         open_rs = redact.Ruleset(tuple(replace(rule, needs=()) for rule in rs.patterns), rs.paths, rs.commands)
         for text in self.corpus():
-            self.assertEqual(redact.redact_string(text, rs, []), redact.redact_string(text, open_rs, []))
+            self.assertEqual(redact.redact_text(text, rs, []), redact.redact_text(text, open_rs, []))
 
-    def test_env_needs_cover_the_env_rule(self):
-        table = redact.rules()["env"]
-        for name, _ in redact.env_secrets(clean_env(GITHUB_TOKEN="x" * 20, npm_config__authToken="Ab12345678", Some_Private_Thing="Zz98765432")):
-            self.assertTrue(any(need in name for need in table["needs"]), name)
+    def test_member_rule_needs_cover_its_keys(self):
+        member, key_re, _ = redact._member()
+        for key in ("api_key", "x-api-key", "DB_PASSWORD", "clientSecret", "refresh_token", "Credentials", "passphrase"):
+            self.assertTrue(key_re.search(key), key)
+            self.assertTrue(member.applies(key), key)
 
 
 CAPTURE_MATRIX = [

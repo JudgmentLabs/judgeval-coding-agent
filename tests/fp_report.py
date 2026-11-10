@@ -53,6 +53,10 @@ CORPUS: list[tuple[str, str]] = [
     ("python dict", "config = {'token_limit': 1000, 'secret_rotation_days': 30}"),
     ("env var names", "export PATH=$PATH:/usr/local/bin\nexport NODE_ENV=production"),
     ("unicode", "Résumé — naïve café: token budget ✓"),
+    ("member expressions", "api_key = config2.api_key\ntoken = response_v2.token\nsecret = settings.SECRET_KEY_V2\npassword = form2.cleaned_data"),
+    ("versioned identifiers", "api_key = api_key_v2\ntoken: tokenV2\naccess_token = self.client_v3.auth.token"),
+    ("structured members", '{"token": "the", "max_tokens": 4096, "key": "user_id_2024_v1", "password_hint": "ask Pat", "api_key": "${API_KEY}"}'),
+    ("env commands", "env FOO=1 make test && /usr/bin/env python3 run.py\ngrep -rn credentials src/"),
 ]
 
 
