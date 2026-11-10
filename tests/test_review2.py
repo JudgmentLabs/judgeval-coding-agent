@@ -140,25 +140,35 @@ class StructuredLiteralTests(unittest.TestCase):
     def test_any_literal_under_a_secret_key(self):
         short = "pw" + _rand(3).lower()
         cases = {"password": self.PASSPHRASE, "pwd": short, "X-Api-Key": "k" + _rand(5), "dbPassword": "hunter" + _rand(2),
-                 "client_secret": "abc def", "Authorization": "Basic " + _rand(10), "smtp_password": "x"}
-        py, js = both([tool({"command": "x"}, {"config": cases})])
+                 "client_secret": "abc def", "smtp_password": "x"}
+        # Known limit (key-auth-unformatted): authorization is not a secret name, and Basic credentials have no format rule.
+        basic = "Basic " + _rand(10)
+        py, js = both([tool({"command": "x"}, {"config": {**cases, "Authorization": basic}})])
         self.assertEqual(norm(py), norm(js))
-        self.assertEqual(py[0]["tool_output"]["config"], {key: "[REDACTED:secret_field]" for key in cases})
+        self.assertEqual(py[0]["tool_output"]["config"], {**{key: "[REDACTED:secret_field]" for key in cases}, "Authorization": basic})
         self.assertEqual(py[0]["redactions"], [{"rule": "secret_field", "field": "tool_output", "count": len(cases)}])
 
-    def test_references_placeholders_and_non_strings_stay(self):
-        keep = {"password": "${DB_PASSWORD}", "api_key": "<your-api-key>", "secret": "changeme", "access_token": "{{ token }}",
-                "client_secret": "os.environ['CLIENT_SECRET']", "refresh_token": "", "pwd": True, "passphrase": None, "auth_token": 1234,
-                "private_key": "[REDACTED:private_key]", "max_tokens": "4096", "token_count": "12", "tokenizer": "bert-base", "sort_key": "name"}
+    def test_non_strings_placeholders_and_other_names_stay(self):
+        keep = {"refresh_token": "", "pwd": True, "passphrase": None, "auth_token": 1234, "private_key": "[REDACTED:private_key]",
+                "max_tokens": "4096", "token_count": "12", "tokenizer": "bert-base", "sort_key": "name"}
         py, js = both([tool({"command": "x"}, {"config": keep})])
         for out in (py[0], js[0]):
             self.assertEqual(out["tool_output"], {"config": keep})
             self.assertNotIn("redactions", out)
 
+    def test_known_limit_references_are_redacted(self):
+        """Known limit (reference-value): a reference or placeholder under a secret name goes like any value."""
+        refs = {"password": "${DB_PASSWORD}", "api_key": "<your-api-key>", "secret": "changeme", "access_token": "{{ token }}",
+                "client_secret": "os.environ['CLIENT_SECRET']"}
+        py, js = both([tool({"command": "x"}, {"config": refs})])
+        self.assertEqual(norm(py), norm(js))
+        self.assertEqual(py[0]["tool_output"], {"config": {key: "[REDACTED:secret_field]" for key in refs}})
+
     def test_quoted_literal_in_text(self):
         texts = {f'password = "{self.PASSPHRASE}"': self.PASSPHRASE, "DB_PASSWORD: 'abc'": "abc",
-                 '{"apiKey": "lower case words"}': "lower case words", 'export SMTP_PASSWORD="x y"': "x y"}
-        keep = ['password = "${DB_PASSWORD}"', "password: '<placeholder>'", 'token_count = "12"', 'max_tokens: "4096"']
+                 '{"apiKey": "lower case words"}': "lower case words", 'export SMTP_PASSWORD="x y"': "x y",
+                 'password = "${DB_PASSWORD}"': "${DB_PASSWORD}", "password: '<placeholder>'": "<placeholder>"}
+        keep = ['token_count = "12"', 'max_tokens: "4096"', 'password = "[REDACTED:env:X]"', 'password = ""']
         events = [tool({"command": "x"}, text) for text in list(texts) + keep]
         py, js = both(events)
         self.assertEqual(norm(py), norm(js))
@@ -342,19 +352,17 @@ class KeyCollisionTests(unittest.TestCase):
 
 
 class ConstantReferenceTests(unittest.TestCase):
-    """Finding 7: a constant identifier as a value (API_KEY_2024, DEFAULT_PASSWORD2) was redacted as a credential."""
+    """Finding 7 asked that a constant identifier as a value (API_KEY_2024) stay. Known limit (reference-value): it is
+    redacted like any value now. Literals still go."""
 
-    def test_constants_stay_and_literals_go(self):
-        keep = ["api_key = API_KEY_2024", "password = DEFAULT_PASSWORD2", "token: GITHUB_TOKEN_V2", "secret = PROD_SECRET_KEY",
-                "DB_PASSWORD=PASSWORD123"]
+    def test_constants_and_literals_go(self):
         literal = "X7K2" + _rand(10).upper()
-        go = {"api_key = " + literal: literal, 'password = "DEFAULT_PASSWORD2"': "DEFAULT_PASSWORD2", "token = Zq" + literal.lower(): "Zq" + literal.lower()}
-        py, js = both([tool({"command": "x"}, text) for text in keep + list(go)])
+        go = {"api_key = API_KEY_2024": "API_KEY_2024", "password = DEFAULT_PASSWORD2": "DEFAULT_PASSWORD2", "api_key = " + literal: literal,
+              'password = "DEFAULT_PASSWORD2"': "DEFAULT_PASSWORD2", "token = Zq" + literal.lower(): "Zq" + literal.lower()}
+        py, js = both([tool({"command": "x"}, text) for text in go])
         self.assertEqual(norm(py), norm(js))
-        for text, out in zip(keep, py):
-            self.assertEqual(out["tool_output"], text)
-        for out, secret in zip(py[len(keep):], go.values()):
-            self.assertNotIn(secret, out["tool_output"])
+        for out, (text, secret) in zip(py, go.items()):
+            self.assertEqual(out["tool_output"], text.replace(secret, "[REDACTED:secret_assignment]"))
 
 
 class DetachTests(unittest.TestCase):

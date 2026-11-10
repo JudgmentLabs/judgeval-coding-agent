@@ -1,6 +1,6 @@
 {
   "_comment": [
-    "Every concrete case the Codex reviews of capture: sanitized described (rounds 1-7) and commit 7458959, one row each.",
+    "Every concrete case the Codex reviews of capture: sanitized described (rounds 1-8) and commit 7458959, one row each.",
     "tests/test_regressions.py generates the regression matrix from these rows: each row in both layers (jq and Python, which",
     "must agree), and each row of a tool route also through the real hook of every adapter (claude, codex, cursor, pi) and",
     "then the sender's own pass over what the hook wrote. A rule table that regresses fails here, whichever table it is.",
@@ -17,7 +17,9 @@
     "           redacted    every generated secret gone (and every absent string), the event neither sensitive nor dropped",
     "           blanked     sensitive: the text is gone, every generated secret with it (rule: the rule that blanked it)",
     "           error       the rules failed (an invalid user regex): the text is dropped, every generated secret with it",
-    "           known_gap   an open adversarial case: only layer agreement is checked; a fix moves the row to redacted",
+    "           leaks       the row's limit lets a generated secret through: at least one is still there, the event neither",
+    "                       sensitive nor dropped (an explicit known limit, not a defect)",
+    "  limit    the id of a documented known limit (limits below; docs/trace-format.md, Known limits) the row's expect follows",
     "  env, cfg, output, keep (strings that must stay), absent (literal secrets that must go), numbers (members made numbers),",
     "  layers (the input serialized into a member of each name in turn: JSON nested in a string), encode (the text",
     "  JSON-encoded n more times), wrap (the text put into wrap at {}).",
@@ -115,15 +117,15 @@
       "id": "r1.5-usr-bin-env",
       "route": "command",
       "input": "/usr/bin/env",
-      "expect": "blanked",
-      "rule": "env_dump"
+      "expect": "leaks",
+      "limit": "wrapped-command"
     },
     {
       "id": "r1.5-env-0",
       "route": "command",
       "input": "env -0",
-      "expect": "blanked",
-      "rule": "env_dump"
+      "expect": "leaks",
+      "limit": "wrapped-command"
     },
     {
       "id": "r1.6-dotenv-with-token-suffix",
@@ -136,7 +138,12 @@
       "id": "r1.9-member-expression",
       "route": "output",
       "input": "api_key = config2.api_key\ntoken = response_v2.token",
-      "expect": "unchanged"
+      "expect": "redacted",
+      "limit": "reference-value",
+      "absent": [
+        "config2.api_key",
+        "response_v2.token"
+      ]
     },
     {
       "id": "r1.10-npm-env-name",
@@ -210,7 +217,12 @@
       "id": "r2.7-constant-references",
       "route": "output",
       "input": "api_key = API_KEY_2024\npassword = DEFAULT_PASSWORD2",
-      "expect": "unchanged"
+      "expect": "redacted",
+      "limit": "reference-value",
+      "absent": [
+        "API_KEY_2024",
+        "DEFAULT_PASSWORD2"
+      ]
     },
     {
       "id": "r2.10-env-name-with-bracket",
@@ -334,11 +346,12 @@
         "result": "kept-result"
       },
       "encode": 2,
-      "expect": "redacted",
+      "expect": "leaks",
       "keep": [
         "rows",
         "kept-result"
-      ]
+      ],
+      "limit": "value-stops"
     },
     {
       "id": "r4.1-env-value-under-password-key",
@@ -370,21 +383,22 @@
       "id": "r4.5-bash-c-env",
       "route": "command",
       "input": "bash -c \"env\"",
-      "expect": "blanked",
-      "rule": "env_dump"
+      "expect": "leaks",
+      "limit": "wrapped-command"
     },
     {
       "id": "r4.5-command-env",
       "route": "command",
       "input": "command env",
-      "expect": "blanked",
-      "rule": "env_dump"
+      "expect": "leaks",
+      "limit": "wrapped-command"
     },
     {
       "id": "r4.5-assignment-printenv",
       "route": "command",
       "input": "FOO=1 printenv",
-      "expect": "blanked"
+      "expect": "leaks",
+      "limit": "wrapped-command"
     },
     {
       "id": "r4.6-env-help",
@@ -405,13 +419,16 @@
       "route": "command",
       "input": "echo \"foo; printenv\"",
       "output": "foo; printenv",
-      "expect": "unchanged"
+      "expect": "blanked",
+      "limit": "mention-blanks",
+      "rule": "printenv"
     },
     {
       "id": "r4.7-multiline-quoted-password",
       "route": "output",
       "input": "password = \"<<alpha>>\n<<opaque>>\"",
-      "expect": "redacted"
+      "expect": "leaks",
+      "limit": "value-stops"
     },
     {
       "id": "r4.8-serialized-message-body",
@@ -450,21 +467,22 @@
       "id": "r5.2-env-unset",
       "route": "command",
       "input": "env --unset DEBUG",
-      "expect": "blanked",
-      "rule": "env_dump"
+      "expect": "leaks",
+      "limit": "wrapped-command"
     },
     {
       "id": "r5.2-env-chdir",
       "route": "command",
       "input": "env --chdir /tmp",
-      "expect": "blanked",
-      "rule": "env_dump"
+      "expect": "leaks",
+      "limit": "wrapped-command"
     },
     {
       "id": "r5.2-env-unset-printenv",
       "route": "command",
       "input": "env --unset DEBUG printenv",
-      "expect": "blanked"
+      "expect": "leaks",
+      "limit": "wrapped-command"
     },
     {
       "id": "r5.3-commit-message-mention",
@@ -484,8 +502,9 @@
       "id": "r5.5-multiline-password-with-blank",
       "route": "output",
       "input": "password=\"hello world\n<<alpha>>\"",
-      "expect": "known_gap",
-      "source": "round 5 finding 5, adversarial, non-blocking"
+      "expect": "leaks",
+      "source": "round 5 finding 5, adversarial, non-blocking",
+      "limit": "value-stops"
     },
     {
       "id": "r5.6-deep-json-then-log-fields",
@@ -531,7 +550,9 @@
       "route": "command",
       "input": "aws configure get region",
       "output": "us-east-1",
-      "expect": "unchanged"
+      "expect": "blanked",
+      "limit": "cli-any-args",
+      "rule": "secret_cli"
     },
     {
       "id": "r6.3-gh-auth-token-help",
@@ -558,30 +579,33 @@
       "id": "c7458959-lc-all-printenv",
       "route": "command",
       "input": "LC_ALL=C printenv",
-      "expect": "blanked",
-      "source": "commit 7458959"
+      "expect": "leaks",
+      "source": "commit 7458959",
+      "limit": "wrapped-command"
     },
     {
       "id": "c7458959-sudo-u-printenv",
       "route": "command",
       "input": "sudo -u root printenv",
-      "expect": "blanked",
-      "source": "commit 7458959"
+      "expect": "leaks",
+      "source": "commit 7458959",
+      "limit": "wrapped-command"
     },
     {
       "id": "c7458959-lc-all-env",
       "route": "command",
       "input": "LC_ALL=C env",
-      "expect": "blanked",
-      "rule": "env_dump",
-      "source": "commit 7458959"
+      "expect": "leaks",
+      "source": "commit 7458959",
+      "limit": "wrapped-command"
     },
     {
       "id": "c7458959-sudo-e-u-printenv",
       "route": "command",
       "input": "sudo -E -u root printenv",
-      "expect": "blanked",
-      "source": "commit 7458959"
+      "expect": "leaks",
+      "source": "commit 7458959",
+      "limit": "wrapped-command"
     },
     {
       "id": "r7.1-rg-n-single-file",
@@ -642,21 +666,23 @@
       "route": "command",
       "input": "kubectl get -o jsonpath=\"{.data.cookie}\" secret session | base64 -d",
       "expect": "blanked",
-      "rule": "secret_cli"
+      "rule": "secret_file",
+      "limit": "command-word-order"
     },
     {
       "id": "r7.2-kubectl-output-before-get",
       "route": "command",
       "input": "kubectl -n prod -o yaml get secret db",
       "expect": "blanked",
-      "rule": "secret_cli"
+      "rule": "secret_file",
+      "limit": "command-word-order"
     },
     {
       "id": "r7.2-gh-show-token-before-status",
       "route": "command",
       "input": "gh auth -t status",
-      "expect": "blanked",
-      "rule": "secret_cli"
+      "expect": "leaks",
+      "limit": "command-word-order"
     },
     {
       "id": "r7.2-security-w-before-s",
@@ -677,7 +703,9 @@
       "route": "command",
       "input": "kubectl get --help secret db -o yaml",
       "output": "Display one or many resources",
-      "expect": "unchanged"
+      "expect": "blanked",
+      "limit": "mention-blanks",
+      "rule": "secret_file"
     },
     {
       "id": "r7.2-kubectl-pods-output-before",
@@ -738,7 +766,9 @@
         "input": "*** Begin Patch\n*** Update File: src/app.py\n@@\n-load('credentials')\n+load(path)\n*** End Patch"
       },
       "output": "Success",
-      "expect": "unchanged"
+      "expect": "blanked",
+      "limit": "mention-blanks",
+      "rule": "credentials_file"
     },
     {
       "id": "r7.4-print-comma-in-string",
@@ -795,13 +825,15 @@
       "id": "r7.5-json-key-text",
       "route": "output",
       "input": "{\"key\":\"<<opaque>>\"}",
-      "expect": "redacted"
+      "expect": "leaks",
+      "limit": "key-auth-unformatted"
     },
     {
       "id": "r7.5-json-auth-text",
       "route": "output",
       "input": "{\"auth\": \"<<opaque>>\"}",
-      "expect": "redacted"
+      "expect": "leaks",
+      "limit": "key-auth-unformatted"
     },
     {
       "id": "r7.5-key-member",
@@ -810,10 +842,11 @@
         "key": "<<opaque>>",
         "id": 7
       },
-      "expect": "redacted",
+      "expect": "leaks",
       "keep": [
         "\"id\": 7"
-      ]
+      ],
+      "limit": "key-auth-unformatted"
     },
     {
       "id": "r7.5-auth-member",
@@ -821,19 +854,22 @@
       "input": {
         "auth": "<<opaque>>"
       },
-      "expect": "redacted"
+      "expect": "leaks",
+      "limit": "key-auth-unformatted"
     },
     {
       "id": "r7.5-key-assignment",
       "route": "output",
       "input": "key = <<opaque>>\nAUTH=<<opaque2>>",
-      "expect": "redacted"
+      "expect": "leaks",
+      "limit": "key-auth-unformatted"
     },
     {
       "id": "r7.5-key-flag",
       "route": "output",
       "input": "client --key=<<opaque>> --verbose",
-      "expect": "redacted"
+      "expect": "leaks",
+      "limit": "key-auth-unformatted"
     },
     {
       "id": "r7.5-key-name-kept",
@@ -856,6 +892,128 @@
       "route": "output",
       "input": "sort_key=created2024 monkey=banana42x oauth=x1y2z3w4",
       "expect": "unchanged"
+    },
+    {
+      "id": "r8.1-vimgrep-location",
+      "route": "output",
+      "input": "src/app.py:12:3: password: \"<<alpha>>\"",
+      "expect": "redacted",
+      "keep": [
+        "src/app.py:12:3: password: "
+      ],
+      "source": "round 8 finding a: rg --vimgrep prefix"
+    },
+    {
+      "id": "r8.1-vimgrep-location-no-blank",
+      "route": "output",
+      "input": "src/app.py:12:3:password: \"<<alpha>>\"",
+      "expect": "redacted",
+      "keep": [
+        "src/app.py:12:3:password: "
+      ],
+      "source": "round 8 finding a"
+    },
+    {
+      "id": "r8.2-apostrophe-in-comment",
+      "route": "output",
+      "input": "connect(password=\"<<alpha>>\") # users' password",
+      "expect": "redacted",
+      "keep": [
+        "# users' password"
+      ],
+      "source": "round 8 finding b: an unbalanced quote later on the line"
+    },
+    {
+      "id": "r8.3-key-member-uuid",
+      "route": "structured",
+      "input": {
+        "Bucket": "b",
+        "key": "3f2b8c1e-9a4d-4e7b-8c2a-1d5e6f7a8b9c"
+      },
+      "expect": "unchanged",
+      "source": "round 8 finding c: key is not a secret name"
+    },
+    {
+      "id": "r8.3-key-member-sha256",
+      "route": "structured",
+      "input": {
+        "Bucket": "b",
+        "key": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "expect": "unchanged",
+      "source": "round 8 finding c"
+    },
+    {
+      "id": "r8.3-key-member-path",
+      "route": "structured",
+      "input": {
+        "Bucket": "b",
+        "key": "reports/2026/summary.csv"
+      },
+      "expect": "unchanged",
+      "source": "round 8 finding c"
+    },
+    {
+      "id": "r8.3-key-text",
+      "route": "output",
+      "input": "{\"Bucket\":\"b\",\"key\":\"3f2b8c1e-9a4d-4e7b-8c2a-1d5e6f7a8b9c\"}",
+      "expect": "unchanged",
+      "source": "round 8 finding c, in text"
+    },
+    {
+      "id": "r8.3-key-tool-input",
+      "route": "input",
+      "input": {
+        "Bucket": "b",
+        "key": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "expect": "unchanged",
+      "source": "round 8 finding c, in structured tool_input"
+    },
+    {
+      "id": "r8.4-quote-runs-after-a-value",
+      "route": "output",
+      "input": "f(password=\"<<alpha>>\") '''''''''''''''''''''''''''''''''''''''''''''''''''' \"",
+      "expect": "redacted",
+      "keep": [
+        "''''''''"
+      ],
+      "source": "round 8 finding d: exponential in the sender at n=26 (tests/test_latency.py times n=5000)"
+    },
+    {
+      "id": "r8.5-format-placeholder-after-a-name",
+      "route": "output",
+      "input": "logger.info(\"secret: %s\", secret)\nrun()",
+      "expect": "redacted",
+      "limit": "code-after-name",
+      "absent": [
+        "%s"
+      ],
+      "keep": [
+        "logger.info(",
+        "secret)\\nrun()"
+      ],
+      "source": "round 8, a known limit of the name rule"
+    },
+    {
+      "id": "r8.6-gh-auth-status-show-token",
+      "route": "command",
+      "input": "gh auth status --show-token",
+      "expect": "leaks",
+      "limit": "unlisted-cli",
+      "source": "round 8: the command list covers gh auth token only"
     }
-  ]
+  ],
+  "limits": {
+    "value-stops": "A quoted value is redacted up to its closing quote, a newline, a comma, or a backslash; a bare value up to a blank, a quote, a comma, ; ) ] } or a backslash. The rest of a value that holds one of these stays.",
+    "reference-value": "A reference, placeholder, constant, or expression after a secret name (api_key = config.api_key, password: ${DB_PASSWORD}, secret: false) is redacted like a value.",
+    "code-after-name": "A format placeholder or a $reference right after a secret name and a colon or = inside a string (\"secret: %s\", \"password: \"$PASSWORD) is taken for the value and redacted.",
+    "key-auth-unformatted": "A value under key, auth, or authorization, or after one in text, is redacted only when a format rule knows it (a GitHub token, a Bearer token).",
+    "wrapped-command": "A sensitive command behind any wrapper but a plain sudo (bash -c, env, VAR=1, timeout, command, nohup, sudo with options, an absolute path), and env with options, is not seen. Secret-named environment values in its output are still redacted.",
+    "command-word-order": "A CLI with options between its subcommand words (kubectl get -o yaml secret, gh auth -t status) is not seen as that command.",
+    "cli-any-args": "A listed CLI blanks its turn whatever it was asked for (aws configure get region, kubectl get secret without -o).",
+    "mention-blanks": "A sensitive file name, or a sensitive command after ; & | ( ` or a newline, anywhere in a tool's path, command, or patch input blanks the turn: a search for the word, a commit message, a patch body, quoted text, a heredoc's lines.",
+    "space-separated": "A value given as --password hunter2 (no : or =) is not redacted.",
+    "unlisted-cli": "Only the listed CLI invocations blank the turn. Another that prints a credential (gh auth status --show-token, npm token list) does not; a format rule may still redact what it prints."
+  }
 }

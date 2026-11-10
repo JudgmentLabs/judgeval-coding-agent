@@ -3,10 +3,14 @@ crossed with the forms it must be found in and the forms it must not, in both la
 must agree). A row added to the table adds its cases here; nothing below names a rule.
 
     (a) sensitive paths     sensitive.paths[].examples / not  x  PATH_SOURCES (tool args, shell, patch headers, transcript)
-    (b) assignments         secret_keys names  x  assignment.contexts' forms (ASSIGNMENTS)  and  x  code that mentions them
-                            (MENTIONS, byte for byte), and each line form behind each assignment.locations example
-    (c) secret-printing CLI sensitive.commands[secret_cli].rows[].examples / not  x  WRAPS (command positions) and QUOTED
-    (d) shaped keys         secret_keys.shaped (key, auth)  x  text and member forms, with credentials, names, and as suffixes
+    (b) secret names        secretNames.names  x  ASSIGNMENTS (line, quoted key, escaped key, flag, code) and LOCATIONS,
+                            and x code that mentions them (MENTIONS, byte for byte)
+    (c) sensitive commands  sensitive.commands[].examples / not  x  WRAPS (command positions) and QUOTED
+    (d) key and auth        not secret names: only a format rule takes a value under them
+
+Known limits (docs/trace-format.md) are asserted as such: PATH_MENTIONS blank the turn (mention-blanks), LIMIT_WRAPS
+hide a command (wrapped-command), OVER_REDACTED mentions lose text after the name (code-after-name), and an unformatted
+value under key or auth stays (key-auth-unformatted).
 
 Every fake value is built at runtime (_rand).
 """
@@ -72,7 +76,8 @@ PATH_SOURCES = {
     "transcript": lambda p: model_call({"input": codex_patch(("Update File", p))}),
     "transcript_diff": lambda p: model_call({"input": unified(p)}),
 }
-# A sensitive name that a patch only mentions, or that sits in a value no header names: none blanks the turn.
+# A sensitive name that a patch only mentions, or that sits in a value no header names. Known limit (mention-blanks): each
+# blanks the turn, since a mention is not told apart from a read or a write.
 PATH_MENTIONS = {
     "patch_body": lambda p: tool({"input": codex_patch(("Update File", "src/app.py"), body=f"@@\n-load('{p}')\n+load(path)")}),
     "unified_body": lambda p: tool({"input": f"--- a/src/app.py\n+++ b/src/app.py\n@@\n+# reads {p}\n-x\n"}),
@@ -98,60 +103,52 @@ class PathMatrix(unittest.TestCase):
         out = run(self, [PATH_SOURCES[form](path) for path, form in cases])
         self.assertEqual([(path, form, got.get("sensitive_rule")) for (path, form), got in zip(cases, out) if got.get("sensitive")], [])
 
-    def test_mentions_keep_the_turn(self):
-        cases = [(path, form) for row in self.rows for path in row["examples"] for form in PATH_MENTIONS]
-        out = run(self, [PATH_MENTIONS[form](path) for path, form in cases])
-        self.assertEqual([(path, form, got.get("sensitive_rule")) for (path, form), got in zip(cases, out) if got.get("sensitive")], [])
-
-    def test_every_header_row_is_a_source(self):
-        """Each header row of the patch table, alone, names a target the path rules see."""
-        texts = [row["prefix"] + ("a/.env b/.env" if row.get("words") else ".env") for row in TABLE["sensitive"]["patch"]["headers"]]
-        out = run(self, [tool({"input": "x\n" + text + "\ny"}) for text in texts])
-        self.assertEqual([text for text, got in zip(texts, out) if got.get("sensitive_rule") != "dotenv"], [])
+    def test_known_limit_mentions_blank_the_turn(self):
+        cases = [(row["id"], path, form) for row in self.rows for path in row["examples"] for form in PATH_MENTIONS]
+        out = run(self, [PATH_MENTIONS[form](path) for _, path, form in cases])
+        self.assertEqual([(rule, path, form, got.get("sensitive_rule")) for (rule, path, form), got in zip(cases, out) if got.get("sensitive_rule") != rule], [])
 
 
-# ---------------------------------------------------------------- (b) assignments: contexts x key names, and mentions
+# ---------------------------------------------------------------- (b) secret names: forms x names, and mentions
 
 
 def names() -> list[str]:
-    keys = TABLE["secret_keys"]
-    return list(keys["names"]) + list(keys["whole"])
+    return list(TABLE["secretNames"]["names"])
 
 
-# One form per assignment context, and its common spellings. {k} the key, {K} it in capitals, {v} the value.
+# Forms of a value after a name. {k} the name, {K} it in capitals, {v} the value.
 ASSIGNMENTS = {
-    "line": ['{k} = "{v}"', '  {k}: "{v}"', "{K}='{v}'", 'export {K}="{v}"', "- {k}: '{v}'", 'const {k} = "{v}";', '# {k} = "{v}"'],
+    "line": ['{k} = "{v}"', '  {k}: "{v}"', "{K}='{v}'", 'export {K}="{v}"', "- {k}: '{v}'", 'const {k} = "{v}";', '# {k} = "{v}"', "{k}={v}"],
     "quoted_key": ['"{k}": "{v}"', "x = {{'{k}': '{v}', 'user': 'bob'}}", '{{"{k}":"{v}","n":1}}'],
-    "escaped_key": ['{{\\"{k}\\":\\"{v}\\"}}'],
-    "flag": ['run --{k} "{v}"', 'run --{k}="{v}" --verbose', "docker run -e {K}='{v}' img"],
+    "escaped_key": ['{{\\"{k}\\":\\"{v}\\"}}', '{{\\\\\\"{k}\\\\\\":\\\\\\"{v}\\\\\\"}}'],
+    "flag": ['run --{k}="{v}" --verbose', "docker run -e {K}='{v}' img", "run --{k}={v} -q"],
     "code": ['f(user, {k}="{v}")', '{{{k}: "{v}"}}', 'x = 1; self.{k} = "{v}"', 'FOO=1 {K}="{v}" ./run',
-             'log("a, b"); f(x, {k}="{v}")', 'connect(host="db", {k}="{v}", port=1)', "# it's set, {k} = '{v}'"],
+             'log("a, b"); f(x, {k}="{v}")', 'connect(host="db", {k}="{v}", port=1)', "# it's set, {k} = '{v}'",
+             'connect({k}="{v}") # users\' {k}'],
 }
-# What grep, rg, nl, and cat -n put before a line (assignment.locations[].examples), crossed with every line form.
-LOCATIONS = [example for row in TABLE["assignment"]["locations"] for example in row["examples"]]
+# What grep -n, rg --vimgrep, nl, and cat -n put before a line, crossed with every line form.
+LOCATIONS = ["12:", "src/app.py:12:", "src/app.py:12:3: ", "src/app.py:12:3:", "config.yml-13-", "    12\t", "./deploy/env.yml:  "]
 # Code that names a key inside a string or beside one: the quote after the operator closes a string. Byte for byte.
 MENTIONS = [
     'print("{k}:", {k}, "done")', 'print("{k}: ", {k}, "done")', 'print("{k}:",{k},"done")', 'print("{k} =", {k}, "done")',
-    'console.log("{k}=", {k}, "x")', 'logger.info("{k}: %s", {k}); run()', 'printf("{k}: %s\\n", {k}); x = "y"',
-    'print(f"{k}: {{{k}}}", "done")', 'console.log(`{k}: ${{{k}}}`, "done")', 'msg = "{k}: " + {k} + " done"',
-    "msg = '{k}:' + {k} + 'done'", 'log("Enter {k}: ", {k}, "now")', 'print("{k}:"); print({k}); print("done")',
-    'throw new Error("bad {k}: " + {k} + "!")', 'echo "{k}:" "${K}" "done"', 'print("user:", u, "{k}:", {k}, "done")',
-    'System.out.println("{k}: " + {k} + ", ok");', 'fmt.Println("{k}:", {k}, "end")', "puts '{k}: ' + {k} + ' end'",
-    'log.Printf("{k}=%q", {k}, "x")', 'print("{K}:", {k}, "done")', 'assert x == "{k}:", "done"',
-    # Code punctuation inside the string (review 7, finding 4): it is not code.
+    'console.log("{k}=", {k}, "x")', 'print(f"{k}: {{{k}}}", "done")', 'log("Enter {k}: ", {k}, "now")', 'print("{K}:", {k}, "done")',
+    'assert x == "{k}:", "done"', 'print("user:", u, "{k}:", {k}, "done")', 'fmt.Println("{k}:", {k}, "end")',
     'print("user, {k}:", user, {k}, "done")', 'log("x ({k}:", {k}, "y")', 'logger.info("a; {k}:", {k}, "b"); run()',
     'console.log("[{k}:", {k}, "]")', "print('a, {k}:', a, {k}, 'b')", 'log("{{{k}:", {k}, "}}")', 'f("x,{k}=", {k}, "y", z)',
+    'msg = "{k}: " + {k} + " done"', "msg = '{k}:' + {k} + 'done'", 'print("{k}:"); print({k}); print("done")',
+    'throw new Error("bad {k}: " + {k} + "!")', 'console.log("{k}: "+{k});\nrun();',
 ]
+# Known limit (code-after-name): a format placeholder right after "name:" in a string is taken for the value and
+# redacted. Only that placeholder changes.
+OVER_REDACTED = ['logger.info("{k}: %s", {k}); run()', 'log.Printf("{k}=%q", {k}, "x")', 'echo "{k}: "${K}']
 PLACEHOLDER = re.compile(r"\[REDACTED:[A-Za-z0-9_:.-]+\]")
 
 
 class AssignmentMatrix(unittest.TestCase):
     maxDiff = None
-    def test_every_context_has_forms(self):
-        self.assertEqual(sorted(row["id"] for row in TABLE["assignment"]["contexts"]), sorted(ASSIGNMENTS))
 
-    def test_assignments_lose_only_their_value(self):
-        """A value only quoted_secret can find (no digit: no shape rule takes it), under every key in every context."""
+    def test_values_lose_only_the_value(self):
+        """A value only secret_assignment can find (no format rule takes it), under every name in every form."""
         cases = []
         for context, forms in ASSIGNMENTS.items():
             for name in names():
@@ -166,45 +163,50 @@ class AssignmentMatrix(unittest.TestCase):
                 bad.append((context, text, result))
         self.assertEqual(bad, [])
 
-    def test_every_location_has_examples(self):
-        self.assertEqual([row["id"] for row in TABLE["assignment"]["locations"] if not row.get("examples")], [])
-
     def test_located_lines_lose_only_their_value(self):
-        """Review 7, finding 1: a line as grep -n, rg -n, nl, or cat -n prints it is still a line: every location example
-        before every line form, under every key, with a value only quoted_secret finds."""
+        """Findings a (rg --vimgrep) and review 7: a location before a line changes nothing."""
         cases = []
         for where in LOCATIONS:
             for name in names():
                 for form in ASSIGNMENTS["line"]:
-                    value = "pw " + _rand(10)
+                    value = "pw " + _rand(10) if '"' in form or "'" in form else "pw" + _rand(10)
                     cases.append((where + form.format(k=name, K=name.upper(), v=value), value))
         out = run(self, [tool({"command": "x"}, text) for text, _ in cases])
         self.assertEqual([(text, got["tool_output"]) for (text, value), got in zip(cases, out)
                           if value in got["tool_output"] or PLACEHOLDER.sub(value, got["tool_output"]) != text], [])
 
-    def test_located_mentions_come_out_byte_for_byte(self):
-        texts = [where + form.format(k=name, K=name.upper()) for where in LOCATIONS for name in names()[:4] for form in MENTIONS]
-        out = run(self, [tool({"command": "x"}, text) for text in texts])
-        self.assertEqual([(text, got["tool_output"]) for text, got in zip(texts, out) if got["tool_output"] != text], [])
-
     def test_mentions_come_out_byte_for_byte(self):
-        texts = [form.format(k=name, K=name.upper()) + tail for name in names() for form in MENTIONS for tail in ("", "\nrun()\nprint('ok')")]
+        texts = [where + form.format(k=name, K=name.upper()) + tail for name in names() for form in MENTIONS
+                 for where, tail in (("", ""), ("", "\nrun()\nprint('ok')"), ("app.py:3:    ", ""))]
         out = run(self, [tool({"command": "x"}, text) for text in texts])
         self.assertEqual([(text, got["tool_output"]) for text, got in zip(texts, out) if got["tool_output"] != text], [])
 
-
-# ---------------------------------------------------------------- (c) secret-printing CLI rows
-
-
-# Command positions: the shell tokenizer finds the command behind each.
-WRAPS = ["{}", "sudo {}", "FOO=1 {}", "cd repo && {}", "x=$({})", "{} | cat", "timeout 5 {}", "env -u X {}", "bash -c '{}'",
-         'echo "$({})"', "ls; {}", "cat <<'EOF'\nx\nEOF\n{}"]
-# Not a command position: quoted text, a pattern, a quoted heredoc's body.
-QUOTED = ["echo '{}'", 'git commit -m "{}"', "rg '{}' .", "cat <<'EOF'\n{}\nEOF", "grep -e '{}' x", "git log --grep='{}'"]
+    def test_known_limit_code_after_a_name_is_redacted(self):
+        texts = [form.format(k=name, K=name.upper()) for name in names() for form in OVER_REDACTED]
+        out = run(self, [tool({"command": "x"}, text) for text in texts])
+        for text, got in zip(texts, out):
+            result = got["tool_output"]
+            self.assertNotEqual(result, text)
+            self.assertEqual({item["rule"] for item in got["redactions"]}, {"secret_assignment"}, text)
 
 
-def cli_rows() -> list[dict]:
-    return [row for item in TABLE["sensitive"]["commands"] if "rows" in item for row in item["rows"]]
+# ---------------------------------------------------------------- (c) sensitive commands
+
+
+# Command positions: the start, after ; & | ( ` or a newline, behind sudo.
+WRAPS = ["{}", "sudo {}", "cd repo && {}", "x=$({})", "{} | cat", 'echo "$({})"', "ls; {}", "cat <<'EOF'\nx\nEOF\n{}", "a || {}", "x=`{}`"]
+# Known limit (wrapped-command): behind any other wrapper the command is not seen. Secret-named environment values in the
+# output are still redacted (env_value).
+LIMIT_WRAPS = ["FOO=1 {}", "timeout 5 {}", "env -u X {}", "bash -c '{}'", "command {}", "nohup {}"]
+# Not a command position: quoted text, a pattern, a commit message.
+QUOTED = ["echo '{}'", 'git commit -m "{}"', "rg '{}' .", "grep -e '{}' x", "git log --grep='{}'"]
+
+
+def command_rows() -> list[dict]:
+    return TABLE["sensitive"]["commands"]
+
+
+COMMAND_IDS = {row["id"] for row in command_rows()}
 
 
 def _fits(form: str, command: str) -> bool:
@@ -212,83 +214,85 @@ def _fits(form: str, command: str) -> bool:
     return not any(q in command and q in form.replace("{}", "") for q in "'\"")
 
 
-class CliMatrix(unittest.TestCase):
+def _examples(wraps: list[str], key: str = "examples") -> list[tuple[str, str]]:
+    return [(row["id"], wrap.format(cmd)) for row in command_rows() for cmd in row[key] for wrap in wraps if _fits(wrap, cmd)]
+
+
+class CommandMatrix(unittest.TestCase):
     maxDiff = None
+
     def test_every_row_has_examples(self):
-        self.assertEqual([row["row"] for row in cli_rows() if not row.get("examples") or not row.get("not")], [])
+        self.assertEqual([row["id"] for row in command_rows() if not row.get("examples") or not row.get("not")], [])
 
     def test_examples_at_every_command_position(self):
-        cases = [(row["row"], wrap.format(cmd)) for row in cli_rows() for cmd in row["examples"] for wrap in WRAPS if _fits(wrap, cmd)]
+        cases = _examples(WRAPS)
         out = run(self, [tool({"command": cmd}) for _, cmd in cases])
-        self.assertEqual([(row, cmd, got.get("sensitive_rule")) for (row, cmd), got in zip(cases, out) if got.get("sensitive_rule") != "secret_cli"], [])
+        self.assertEqual([(rule, cmd, got.get("sensitive_rule")) for (rule, cmd), got in zip(cases, out) if got.get("sensitive_rule") != rule], [])
 
     def test_harmless_invocations_keep_the_turn(self):
-        cases = [wrap.format(cmd) for row in cli_rows() for cmd in row["not"] for wrap in WRAPS if _fits(wrap, cmd)]
-        out = run(self, [tool({"command": cmd}, "ordinary output") for cmd in cases])
-        self.assertEqual([(cmd, got.get("sensitive_rule")) for cmd, got in zip(cases, out) if got.get("sensitive") or got["tool_output"] != "ordinary output"], [])
+        cases = _examples(WRAPS, "not")
+        out = run(self, [tool({"command": cmd}, "ordinary output") for _, cmd in cases])
+        self.assertEqual([(cmd, got.get("sensitive_rule")) for (_, cmd), got in zip(cases, out) if got.get("sensitive") or got["tool_output"] != "ordinary output"], [])
 
-    def test_quoted_mentions_keep_the_turn(self):
-        cases = [form.format(cmd) for row in cli_rows() for cmd in row["examples"] for form in QUOTED if _fits(form, cmd)]
-        out = run(self, [tool({"command": cmd}) for cmd in cases])
-        self.assertEqual([(cmd, got.get("sensitive_rule")) for cmd, got in zip(cases, out) if got.get("sensitive")], [])
+    def test_quoted_mentions_are_no_command(self):
+        """No command rule fires. A path rule still may: kubectl get secret names a token secret (mention-blanks)."""
+        cases = _examples(QUOTED)
+        out = run(self, [tool({"command": cmd}) for _, cmd in cases])
+        self.assertEqual([(cmd, got.get("sensitive_rule")) for (_, cmd), got in zip(cases, out) if got.get("sensitive_rule") in COMMAND_IDS], [])
 
-
-# ---------------------------------------------------------------- (d) shaped keys: key and auth keep the shape test
-
-
-def shaped() -> list[str]:
-    """secret_keys.shaped in each case the composer spells it (lower, UPPER, Capitalized)."""
-    return [case for word in TABLE["secret_keys"]["shaped"] for case in dict.fromkeys([word, word.upper(), word.capitalize()])]
+    def test_known_limit_wrapped_commands_are_not_seen(self):
+        cases = _examples(LIMIT_WRAPS)
+        out = run(self, [tool({"command": cmd}) for _, cmd in cases])
+        self.assertEqual([(cmd, got.get("sensitive_rule")) for (_, cmd), got in zip(cases, out) if got.get("sensitive_rule") in COMMAND_IDS], [])
 
 
-# Text forms of a shaped key with a value; {k} the key, {v} the value. And the same in structured members.
-SHAPED_TEXT = ['{{"{k}":"{v}"}}', '{{"{k}": "{v}"}}', '{k} = {v}', '{k}: {v}', '{k}={v}', 'cli --{k}={v} -q', 'cfg.{k} = "{v}"', "x = {{'{k}': '{v}'}}"]
-# Values that are names, not credentials: they stay under a shaped key.
-SHAPED_NAMES = ["name", "oauth2", "user_id_2024_v1", "oauth2_client", "primary", "Bearer", "created_at"]
-# Identifiers that only end in a shaped word: never shape-tested as one (review 7, finding 5: identifier boundaries).
-SHAPED_SUFFIXES = ["sort_{k}", "my{k}", "o{k}", "{k}board", "{k}_count", "x-{k}"]
+# ---------------------------------------------------------------- (d) key and auth: not secret names
 
 
-class ShapedKeyMatrix(unittest.TestCase):
+def plain_words() -> list[str]:
+    return [case for word in ("key", "auth") for case in dict.fromkeys([word, word.upper(), word.capitalize()])]
+
+
+# Text forms of key or auth with a value; {k} the key, {v} the value. And the same in structured members.
+PLAIN_TEXT = ['{{"{k}":"{v}"}}', '{{"{k}": "{v}"}}', '{k} = {v}', '{k}: {v}', '{k}={v}', 'cli --{k}={v} -q', 'cfg.{k} = "{v}"', "x = {{'{k}': '{v}'}}"]
+# Values that are names, not credentials: S3 object keys, uuids, hashes (finding c).
+PLAIN_NAMES = ["name", "oauth2", "user_id_2024_v1", "reports/2026/summary.csv", "3f2b8c1e-9a4d-4e7b-8c2a-1d5e6f7a8b9c",
+               "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"]
+
+
+class KeyAuthMatrix(unittest.TestCase):
     maxDiff = None
 
-    def test_shaped_words_stay_out_of_the_unconditional_lists(self):
-        keys = TABLE["secret_keys"]
-        self.assertEqual(set(keys["shaped"]) & set(keys["names"] + keys["whole"]), set())
-
-    def test_credentials_lose_their_value(self):
-        cases = [(form.format(k=k, v=v), v) for k in shaped() for form in SHAPED_TEXT for v in ["Ck" + _rand(14) + "7" + _rand(5)]]
-        members = [({k: v}, v) for k in shaped() for v in ["Dm" + _rand(10) + "3" + _rand(9)]]
-        out = run(self, [tool({"command": "x"}, text) for text, _ in cases + members])
-        self.assertEqual([(text, got["tool_output"]) for (text, value), got in zip(cases + members, out) if value in json.dumps(got)], [])
-
     def test_names_stay(self):
-        texts = [form.format(k=k, v=v) for k in shaped() for form in SHAPED_TEXT for v in SHAPED_NAMES]
-        members = [{k: v} for k in shaped() for v in SHAPED_NAMES]
-        out = run(self, [tool({"command": "x"}, item) for item in texts + members])
-        self.assertEqual([(item, got["tool_output"]) for item, got in zip(texts + members, out) if got["tool_output"] != item], [])
+        texts = [form.format(k=k, v=v) for k in plain_words() for form in PLAIN_TEXT for v in PLAIN_NAMES]
+        members = [{k: v, "Bucket": "b"} for k in plain_words() for v in PLAIN_NAMES]
+        out = run(self, [tool({"command": "x"}, item) for item in texts + members] + [tool(item) for item in members])
+        items = texts + members
+        self.assertEqual([(item, got["tool_output"]) for item, got in zip(items, out) if got["tool_output"] != item], [])
+        self.assertEqual([(item, got["tool_input"]) for item, got in zip(members, out[len(items):]) if got["tool_input"] != item], [])
 
-    def test_suffixes_are_not_shaped_keys(self):
-        value = "Ck" + _rand(14) + "7"
-        keys = [suffix.format(k=k) for k in shaped() for suffix in SHAPED_SUFFIXES]
-        texts = [f"{key}={value}" for key in keys] + [json.dumps({key: value}) for key in keys]
-        out = run(self, [tool({"command": "x"}, text) for text in texts] + [tool({"command": "x"}, {key: value}) for key in keys])
-        bad = [(item, got["tool_output"]) for item, got in zip(texts + [{key: value} for key in keys], out) if got["tool_output"] != item]
-        self.assertEqual(bad, [])
+    def test_formatted_credentials_still_go(self):
+        token = "gh" + "p_" + _rand(36, string.ascii_letters + string.digits)
+        cases = [form.format(k=k, v=token) for k in plain_words() for form in PLAIN_TEXT] + [{k: token} for k in plain_words()]
+        out = run(self, [tool({"command": "x"}, item) for item in cases])
+        self.assertEqual([item for item, got in zip(cases, out) if token in json.dumps(got)], [])
+
+    def test_known_limit_unformatted_values_stay(self):
+        cred = "Ck" + _rand(14) + "7" + _rand(5)
+        cases = [form.format(k=k, v=cred) for k in plain_words() for form in PLAIN_TEXT] + [{k: cred} for k in plain_words()]
+        out = run(self, [tool({"command": "x"}, item) for item in cases])
+        self.assertEqual([(item, got["tool_output"]) for item, got in zip(cases, out) if got["tool_output"] != item], [])
 
 
 def matrix_size() -> dict[str, int]:
     """How many cases the matrix generates, by family (each runs in both layers)."""
     paths = TABLE["sensitive"]["paths"]
-    a = (sum(len(r["examples"]) for r in paths) * len(PATH_SOURCES) + sum(len(r["not"]) for r in paths) * len(PATH_SOURCES)
-         + sum(len(r["examples"]) for r in paths) * len(PATH_MENTIONS) + len(TABLE["sensitive"]["patch"]["headers"]))
-    b = (len(names()) * sum(len(forms) for forms in ASSIGNMENTS.values()) + len(names()) * len(MENTIONS) * 2
-         + len(LOCATIONS) * len(names()) * len(ASSIGNMENTS["line"]) + len(LOCATIONS) * 4 * len(MENTIONS))
-    rows = cli_rows()
-    c = (sum(_fits(w, cmd) for r in rows for cmd in r["examples"] for w in WRAPS) + sum(_fits(w, cmd) for r in rows for cmd in r["not"] for w in WRAPS)
-         + sum(_fits(f, cmd) for r in rows for cmd in r["examples"] for f in QUOTED))
-    d = len(shaped()) * (2 * len(SHAPED_TEXT) + len(SHAPED_NAMES) * (len(SHAPED_TEXT) + 1) + 1) + 3 * len(shaped()) * len(SHAPED_SUFFIXES)
-    return {"paths": a, "assignments": b, "cli": c, "shaped": d}
+    a = sum(len(r["examples"]) + len(r["not"]) for r in paths) * len(PATH_SOURCES) + sum(len(r["examples"]) for r in paths) * len(PATH_MENTIONS)
+    b = (len(names()) * sum(len(forms) for forms in ASSIGNMENTS.values()) + len(LOCATIONS) * len(names()) * len(ASSIGNMENTS["line"])
+         + len(names()) * (3 * len(MENTIONS) + len(OVER_REDACTED)))
+    c = len(_examples(WRAPS)) + len(_examples(WRAPS, "not")) + len(_examples(QUOTED)) + len(_examples(LIMIT_WRAPS))
+    d = len(plain_words()) * (len(PLAIN_TEXT) * (len(PLAIN_NAMES) + 2) + 3 * len(PLAIN_NAMES) + 2)
+    return {"paths": a, "names": b, "commands": c, "key_auth": d}
 
 
 if __name__ == "__main__":

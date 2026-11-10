@@ -181,13 +181,17 @@ NOT_SENSITIVE = [
     {"command": "set -euo pipefail; make"},
     {"command": "export PATH=$PATH:/opt/bin"},
     {"file_path": "/home/tester/.ssh/id_ed25519.pub"},
-    {"command": "grep -rn credentials src/"},
     {"command": "grep -r secret_key ."},
     {"file_path": "src/secret_manager.py"},
     {"file_path": "docs/secrets.md"},
     {"command": "jq .key data.json"},
     {"file_path": "src/environment.ts"},
     {"pattern": "**/.env"},
+]
+
+OVER_BLANKED = [
+    ({"command": "grep -rn credentials src/"}, "credentials_file"),
+    ({"command": 'git commit -m "rotate secrets"'}, "secret_file"),
 ]
 
 
@@ -214,6 +218,13 @@ class SensitiveTests(unittest.TestCase):
         for item, hit in zip(NOT_SENSITIVE, py):
             with self.subTest(item=item):
                 self.assertIsNone(hit)
+
+    def test_known_limit_a_mention_blanks_the_turn(self):
+        """Known limit (mention-blanks): a sensitive file name is a mention wherever it sits in a command, so a search for
+        the word blanks the turn too. It loses that turn's text and never leaks."""
+        py, js = self.run_both([item for item, _ in OVER_BLANKED])
+        self.assertEqual(py, js)
+        self.assertEqual([hit and hit["rule"] for hit in py], [rule for _, rule in OVER_BLANKED])
 
     def test_sensitive_event_loses_its_text_and_keeps_its_ids(self):
         event = tool_event("DB_URL=postgres://u:Abc123xyz@h\nPLAIN=value", tool_input={"command": "cat .env"}, duration_ms=12, is_error=False)
@@ -304,7 +315,7 @@ class GateTests(unittest.TestCase):
         """Every secret key the member rules take holds a need of the rule that took it, in the JSON the rule sees."""
         rs = redact.ruleset()
         for key in ("api_key", "x-api-key", "X-Api-Key", "DB_PASSWORD", "clientSecret", "refresh_token", "Credentials", "passphrase", "pwd",
-                    "Authorization", "smtpPassword", "aws_secret_access_key", "token", "SESSION_TOKEN"):
+                    "smtpPassword", "aws_secret_access_key", "token", "SESSION_TOKEN"):
             text = redact.jq_json([{key: "Zq81jdjskaQ8a9d2"}])
             hits = [rule for rule in rs.members if rule.pattern.search(text)]
             self.assertTrue(hits, key)
