@@ -1,23 +1,27 @@
-"""Secret redaction in the sender, the second of two layers.
+"""Secret redaction in the sender, the second of two layers, and the rules table both layers share.
 
-The hook runs the first layer in ``core/bin/prepare.jq`` before an event reaches the inbox.
-This module runs the same rules, read from the same ``core/bin/redact-rules.json``, over each
-turn after transcript text has been pulled in. ``sanitize_event`` is the jq layer step for
-step, and tests/test_redact.py checks that the two give the same result.
+The hook runs the first layer in ``core/bin/prepare.jq`` before an event reaches the inbox. This
+module runs the same rules, read from ``core/bin/redact-rules.json``, over each turn after transcript
+text has been pulled in. ``sanitize_event`` is the jq layer step for step, and the tests check that
+the two give the same result. ``compiled`` derives what the hook's jq loads (the table with every
+regex composed); scripts/gen_redact.py writes it out.
 
-An event is a plain dict, and each step is a function of plain data:
+Everything is plain data through pure stages:
 
-    field_class    what a field is: kept when text goes, redacted, kept by metadata capture
-    env_secrets    (name, value) for each literal to replace: secret-named env values, and their lines
+    table          redact-rules.json, as written
+    compiled       every regex composed: what jq loads, and what this module compiles
+    Ruleset        compiled patterns, members, sensitive paths and commands (a user rule that fails: error)
+    env_secrets    (name, literal) for each secret-named environment value, and each line of it
     sensitive      the sensitive path or env dump a tool call names, as {rule, trigger}, or None
-    pairs          the blob of every string and key -> (found text, placeholder), in rule order
-    scrub_value    those pairs applied, as literals, to every string and key; a secret-named
-                   member's value goes whole
-    census         {rule, field, count} for each placeholder an event holds: the audit
+    pairs          the blob of every string and key -> Pair(found, replacement, rule), all found on the
+                   unchanged blob, one per distinct found text, longest first
+    scrub_fields   the pairs, and the secret-key members, applied to each field; a Counter of what was
+                   replaced, by rule
+    records        [{rule, field, count}]: the audit, carried on the event as ``redactions``
     turn_redaction the turn's audit record, and why it was blanked
 
-A rule set with an error (a user regex that does not compile) redacts every text to nothing.
-No function records a secret, or a hash, prefix, or length of one.
+A rule set with an error (a user regex that does not compile) redacts every text to nothing. No
+function records a secret, or a hash, prefix, or length of one.
 """
 
 from __future__ import annotations
@@ -26,14 +30,19 @@ import functools
 import json
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping, NamedTuple
 
-RULES_FILE = Path(__file__).resolve().parent.parent / "bin" / "redact-rules.json"
+BIN = Path(__file__).resolve().parent.parent / "bin"
+RULES_FILE = BIN / "redact-rules.json"
+COMPILED_FILE = BIN / "redact-compiled.json"
 SENSITIVE_REASON = "sensitive_path"
 _NAMED = re.compile(r"\(\?<([A-Za-z_][A-Za-z0-9_]*)>")
-_MARK = re.compile(r"\[REDACTED:([^\]\n]{1,200})\]")
+
+
+# ---------------------------------------------------------------- the table, composed
 
 
 @functools.lru_cache(maxsize=1)
@@ -41,16 +50,108 @@ def rules() -> dict:
     return json.loads(RULES_FILE.read_text(encoding="utf-8"))
 
 
-def compose(regex: Any) -> str:
-    """A rule's regex. A list joins its parts; {"def": name} is a shared fragment from ``defs``."""
-    if isinstance(regex, list):
-        return "".join(rules()["defs"][part["def"]] if isinstance(part, dict) else part for part in regex)
-    return regex
+def _cases(part: str) -> list[str]:
+    """A lowercase word as lower, UPPER, and Capitalized, without repeats."""
+    return list(dict.fromkeys([part, part.upper(), part.capitalize()]))
 
 
-def _compile(regex: Any) -> re.Pattern:
+def _word(word: str) -> str:
+    """``api_key`` -> api_key, API-KEY, apiKey, ApiKey, apikey...: each part in three cases, joined by _, -, ., or nothing."""
+    return "[_.-]?".join("(?:" + "|".join(_cases(part)) + ")" for part in word.split("_"))
+
+
+def generated(table: Mapping | None = None) -> dict[str, str]:
+    """The fragments composed from the tables: a secret key name, and a reference or placeholder value."""
+    table = table or rules()
+    keys = table["secret_keys"]
+    names = "|".join(_word(word) for word in keys["names"])
+    whole = "|".join(_word(word) for word in keys["whole"])
+    # A name is the whole key, or its end after a separator or a camelCase boundary.
+    name = "(?:(?:[A-Za-z0-9_.-]{0,64}?(?:[_.-]|(?<=[a-z0-9])(?=[A-Z])))?(?:" + names + ")|" + whole + ")"
+    lit = table["literals"]
+    refs = "(?:" + "|".join(lit["refs"]) + ")(?:[^\"\\\\]|\\\\.)*"
+    words = "|".join(case for word in lit["words"] for case in _cases(word))
+    literal = "(?:" + refs + "|" + words + "|" + "|".join(lit["forms"]) + ")"
+    last = "|".join(dict.fromkeys(case for word in keys["names"] + keys["whole"] for case in _cases(word.split("_")[-1])))
+    # The same names where a match starts: at the name, after an identifier start, a separator, or a camelCase boundary.
+    # A text rule starts here rather than at the identifier, so no prefix is tried at every position.
+    tail = ("(?:(?:(?<![A-Za-z0-9_.-])|(?<=[_.-])|(?<=[a-z0-9])(?=[A-Z]))(?:" + names + ")|(?<![A-Za-z0-9_.-])(?:" + whole + "))")
+    return {"secret_key_name": name, "secret_key_tail": tail, "literal": literal, "secret_key_last": last}
+
+
+def compose(regex: Any, table: Mapping | None = None) -> str:
+    """A rule's regex. A list joins its parts; {"def": name} is a shared fragment, {"gen": name} a generated one."""
+    if not isinstance(regex, list):
+        return regex
+    table = table or rules()
+    gen = generated(table) if any(isinstance(part, dict) and "gen" in part for part in regex) else {}
+    out = []
+    for part in regex:
+        if isinstance(part, dict):
+            out.append(table["defs"][part["def"]] if "def" in part else gen[part["gen"]])
+        else:
+            out.append(part)
+    return "".join(out)
+
+
+def _needs(item: Mapping, table: Mapping) -> list[str] | None:
+    """A rule's needed literals. "secret_key_name": the last word of each secret key name, in its three cases."""
+    if item.get("needs") == "secret_key_name":
+        keys = table["secret_keys"]
+        suffix = item.get("needs_suffix", "")
+        return list(dict.fromkeys(case + suffix for word in keys["names"] + keys["whole"] for case in _cases(word.split("_")[-1])))
+    return item.get("needs")
+
+
+def compiled(table: Mapping | None = None) -> dict:
+    """What the hook's jq loads: the table with every regex composed and the comments left out."""
+    table = table or rules()
+
+    def rule(item: Mapping, key: str = "re") -> dict:
+        out = {"id": item["id"], "re": compose(item[key], table)}
+        needs = _needs(item, table)
+        if needs:
+            out["needs"] = needs
+        if item.get("pre"):
+            out["pre"] = compose(item["pre"], table)
+        for flag in ("whole", "most"):
+            if item.get(flag) is not None:
+                out[flag] = item[flag]
+        return out
+
+    sensitive = table["sensitive"]
+    return {
+        "version": table["version"],
+        "limits": {key: value for key, value in table["limits"].items() if key != "_comment"},
+        "env": {"name_re": table["env"]["name_re"], "min_length": table["env"]["min_length"]},
+        "patterns": [rule(item) for item in table["patterns"]],
+        "members": [rule(item, "json_re") for item in table["members"]],
+        "sensitive": {
+            "paths": [rule(item) for item in sensitive["paths"]],
+            "commands": [rule(item) for item in sensitive["commands"]],
+            **{key: sensitive[key] for key in ("keys", "glob", "split", "mention")},
+        },
+        "fields": _field_sets(table["fields"]),
+    }
+
+
+def _field_sets(fields: Mapping) -> dict:
+    """The class table as the sets jq tests: strip (kept without text), plain (never redacted), bare (both: what an event
+    whose rules failed keeps). A field not listed is text: in none of them."""
+    of = {name: fields["classes"][cls] for name, cls in fields["of"].items()}
+    return {
+        "strip": {name: True for name, cls in of.items() if cls["strip"]},
+        "plain": {name: True for name, cls in of.items() if not cls["redact"]},
+        "bare": {name: True for name, cls in of.items() if cls["strip"] and not cls["redact"]},
+    }
+
+
+# ---------------------------------------------------------------- compiled rules
+
+
+def _compile(regex: str) -> re.Pattern:
     """Oniguruma names a group ``(?<p>...)``. Python spells it ``(?P<p>...)``."""
-    return re.compile(_NAMED.sub(r"(?P<\1>", compose(regex)))
+    return re.compile(_NAMED.sub(r"(?P<\1>", regex))
 
 
 class RedactionLimit(ValueError):
@@ -64,31 +165,29 @@ class Rule:
     needs: tuple = ()  # the rule can match only text holding one of these; empty means any text
     whole: bool = False  # runs over all the text, not windows of it
     most: int | None = None  # a whole rule fails on text holding more than this many of its needs
+    pre: re.Pattern | None = None  # a cheap regex every match also matches
 
     def applies(self, text: str) -> bool:
-        """Mirror of jp_holds in prepare.jq: skip the regex when no literal it needs is there."""
-        return not self.needs or any(need in text for need in self.needs)
+        """Mirror of jp_holds and pre in prepare.jq: skip the regex when no literal it needs, or no match of pre, is there."""
+        return (not self.needs or any(need in text for need in self.needs)) and (self.pre is None or self.pre.search(text) is not None)
 
 
-def _rule(item: Mapping, regex_key: str = "re") -> Rule:
-    return Rule(item["id"], _compile(item[regex_key]), tuple(item.get("needs") or ()), bool(item.get("whole")), item.get("most"))
+def _rule(item: Mapping) -> Rule:
+    pre = _compile(item["pre"]) if item.get("pre") else None
+    return Rule(item["id"], _compile(item["re"]), tuple(item.get("needs") or ()), bool(item.get("whole")), item.get("most"), pre)
 
 
 @functools.lru_cache(maxsize=1)
-def _builtin() -> tuple[tuple, tuple, tuple]:
+def _built() -> dict:
     table = rules()
-    return (
-        tuple(_rule(item) for item in table["patterns"]),
-        tuple(_rule(item) for item in table["sensitive"]["paths"]),
-        tuple(_rule(item) for item in table["sensitive"]["commands"]),
-    )
-
-
-@functools.lru_cache(maxsize=1)
-def _member() -> tuple[Rule, re.Pattern, re.Pattern]:
-    """The structured rule: {"api_key": "..."}. Its id and needs, its key regex, and its value regex."""
-    item = rules()["fields_rule"]
-    return Rule(item["id"], _compile(item["json_re"]), tuple(item["needs"])), _compile(item["key_re"]), _compile(item["value_re"])
+    done = compiled(table)
+    return {
+        "patterns": tuple(_rule(item) for item in done["patterns"]),
+        "paths": tuple(_rule(item) for item in done["sensitive"]["paths"]),
+        "commands": tuple(_rule(item) for item in done["sensitive"]["commands"]),
+        "members": tuple(_rule(item) for item in done["members"]),
+        "env": (_compile(done["env"]["name_re"]), int(done["env"]["min_length"])),
+    }
 
 
 # Field classes. A field not in the table is text.
@@ -97,12 +196,17 @@ def field_class(name: str) -> Mapping:
     return table["classes"][table["of"].get(name, "text")]
 
 
-def strip(event: Mapping, keep: Callable[[Mapping], bool] = lambda cls: cls["strip"]) -> dict:
-    """Only the fields whose class passes ``keep``. tool_calls keep their id and name."""
+def strip(event: Mapping, keep: Callable[[Mapping], bool] = lambda cls: cls["strip"], names: bool = True) -> dict:
+    """Only the fields whose class passes ``keep``. tool_calls keep their id, and their name when ``names``:
+    a name is free-form text, so an event whose rules failed keeps only the id."""
     kept = {key: value for key, value in event.items() if keep(field_class(key))}
     calls = event.get("tool_calls")
     if isinstance(calls, list):
-        kept["tool_calls"] = [{"id": _alt(call.get("id"), call.get("tool_call_id")), "name": _alt(call.get("name"), call.get("tool_name"))} for call in calls if isinstance(call, dict)]
+        kept["tool_calls"] = [
+            {"id": _alt(call.get("id"), call.get("tool_call_id")), **({"name": _alt(call.get("name"), call.get("tool_name"))} if names else {})}
+            for call in calls
+            if isinstance(call, dict)
+        ]
     return kept
 
 
@@ -117,8 +221,8 @@ def strip_text(event: Mapping) -> dict:
 
 
 def _unredactable(event: Mapping) -> dict:
-    """What an event keeps when its rules failed: only fields that are never redacted."""
-    return strip(event, lambda cls: cls["strip"] and not cls["redact"])
+    """What an event keeps when its rules failed: only fields that are never redacted. No labels, no tool names."""
+    return {**strip(event, lambda cls: cls["strip"] and not cls["redact"], names=False), "redaction_error": True}
 
 
 def unblank(event: Mapping) -> dict:
@@ -131,6 +235,7 @@ class Ruleset:
     patterns: tuple  # Rule, ... in table order, user patterns last
     paths: tuple
     commands: tuple
+    members: tuple = ()
     error: str = ""  # a user rule that did not compile: every text is dropped, never sent raw
 
 
@@ -142,7 +247,8 @@ def glob_re(glob: str) -> str:
 
 def ruleset(project: Mapping | None = None) -> Ruleset:
     """The built-in rules plus a project's ``redactPatterns`` and ``redactPaths``. User rules only add."""
-    patterns, paths, commands = _builtin()
+    built = _built()
+    patterns, paths, commands, members = built["patterns"], built["paths"], built["commands"], built["members"]
     project = project or {}
     extra_patterns = []
     extra_paths = []
@@ -154,38 +260,41 @@ def ruleset(project: Mapping | None = None) -> Ruleset:
             if isinstance(glob, str) and glob:
                 extra_paths.append(Rule("custom_path", _compile(glob_re(glob))))
     except (re.error, RecursionError, OverflowError) as exc:
-        return Ruleset(patterns, paths, commands, error=type(exc).__name__)
-    return Ruleset(patterns + tuple(extra_patterns), paths + tuple(extra_paths), commands)
-
-
-@functools.lru_cache(maxsize=1)
-def _env_res() -> tuple[re.Pattern, re.Pattern]:
-    table = rules()["env"]
-    return _compile(table["name_re"]), _compile(table["value_re"])
+        return Ruleset(patterns, paths, commands, members, error=type(exc).__name__)
+    return Ruleset(patterns + tuple(extra_patterns), paths + tuple(extra_paths), commands, members)
 
 
 def env_secrets(env: Mapping[str, str] | None = None, api_key: str = "") -> list[tuple[str, str]]:
-    """Mirror of prepare.jq: (name, literal) for each secret-named variable's value, and each line of a
-    value that spans lines, that is long enough to replace. Longest first, then by placeholder.
+    """Mirror of prepare.jq: (name, literal) for each secret-named variable's value, and each line of a value that
+    spans lines, of at least min_length characters and not only whitespace. Longest first, then by placeholder.
 
     ``api_key`` is the key from the credentials file, which the hook also hands to jq as JUDGMENT_API_KEY.
     """
     source = dict(os.environ if env is None else env)
     if api_key and not source.get("JUDGMENT_API_KEY"):
         source["JUDGMENT_API_KEY"] = api_key
-    name_re, value_re = _env_res()
+    name_re, shortest = _built()["env"]
     found = []
     for name, value in source.items():
         match = name_re.match(name) if isinstance(value, str) and "\n" not in name else None
         if match is None or match.end() != len(name):
             continue
         pieces = [value] + ([line.removesuffix("\r") for line in value.split("\n")] if "\n" in value else [])
-        found += [(name, piece) for piece in pieces if len(piece) >= 8 and value_re.search(piece)]
-    return sorted(found, key=lambda pair: (-len(pair[1]), placeholder("env:" + pair[0])))
+        found += [(name, piece) for piece in pieces if len(piece) >= shortest and piece.strip()]
+    return sorted(set(found), key=lambda pair: (-len(pair[1]), placeholder("env:" + pair[0]), pair[1]))
 
 
 def placeholder(rule: str) -> str:
     return f"[REDACTED:{rule}]"
+
+
+# ---------------------------------------------------------------- finding
+
+
+class Pair(NamedTuple):
+    found: str  # the text found
+    replacement: str  # what it becomes: the kept group, then the placeholder
+    rule: str  # the rule id the audit counts it under
 
 
 def blob_items(value: Any) -> Iterator[str]:
@@ -201,166 +310,239 @@ def blob_items(value: Any) -> Iterator[str]:
             yield from blob_items(item)
 
 
-def windows(rule: Rule, text: str) -> list[str]:
-    """Mirror of jp_windows: what a rule runs over. See ``limits`` in redact-rules.json."""
+def windows(text: str) -> list[tuple[int, str, bool]]:
+    """Mirror of jp_windows: (start, text, last) for each window a rule runs over. See ``limits`` in redact-rules.json."""
     limits = rules()["limits"]
-    if rule.whole:
-        if rule.most is not None and sum(text.count(need) for need in rule.needs) > rule.most:
-            raise RedactionLimit(rule.id)
-        return [text]
-    if len(text) <= limits["window"]:
-        return [text]
-    return [text[start : start + limits["window"]] for start in range(0, len(text), limits["step"])]
+    size, step = limits["window"], limits["step"]
+    if len(text) <= size:
+        return [(0, text, True)]
+    count = -(-(len(text) - size) // step) + 1
+    return [(k * step, text[k * step : k * step + size], k == count - 1) for k in range(count)]
 
 
-def found(rule: Rule, text: str) -> list[tuple[str, str]]:
-    """Mirror of jp_found: each distinct match, longest first, with the placeholder it becomes. Group p stays.
+def scan(pattern: re.Pattern, window: str, budget: int) -> list[re.Match]:
+    """Mirror of jp_scan: matches leftmost first, each one's copies blanked to the same length before the next search.
+    An empty first match falls back to every nonempty match."""
+    out: list[re.Match] = []
+    while True:
+        if len(out) > budget:
+            raise RedactionLimit("pairs")
+        match = pattern.search(window)
+        if match is None:
+            return out
+        if not match.group(0):
+            return out + [item for item in pattern.finditer(window) if item.group(0)]
+        out.append(match)
+        window = window.replace(match.group(0), "\x01" * len(match.group(0)))
 
-    Each window is matched after the finds before it are replaced in it, so a repeated secret is matched once.
+
+def found(rule: Rule, text: str) -> list[Pair]:
+    """Mirror of jp_found: each distinct complete match of the rule on the unchanged text, with what it becomes.
+
+    A match that reaches the end of a window that is not the last is left to the next window, which holds it from
+    its start; one that starts before the next window does is longer than window - step and fails closed.
     """
-    keep = "p" in rule.pattern.groupindex
-    hits: list[tuple[str, str]] = []
-    for window in windows(rule, text):
-        window = apply(window, hits)
-        new = {(match.group(0), ((match.group("p") or "") if keep else "") + placeholder(rule.id)) for match in rule.pattern.finditer(window) if match.group(0)}
-        hits = sorted(set(hits) | new, key=lambda pair: (-len(pair[0]), pair))
-        if len(hits) > rules()["limits"]["pairs"]:
+    limits = rules()["limits"]
+    # jq keeps the first named group's text when it is p. Oniguruma does not count unnamed groups once a group is named.
+    named = rule.pattern.groupindex
+    keep = bool(named) and min(named.values()) == named.get("p")
+    if rule.most is not None and rule.needs and text.count(rule.needs[0]) > rule.most:
+        raise RedactionLimit(rule.id)
+    if rule.whole:
+        parts = [(0, text, True)]
+    else:
+        parts = windows(text)
+    hits: list[Pair] = []
+    for _start, window, last in parts:
+        # As jq: every complete match found before is blanked to the same length first, so a repeat is matched once.
+        for pair in hits:
+            window = window.replace(pair.found, "\x01" * len(pair.found))
+        new: dict[Pair, None] = {}
+        # As jq: a short window, one global match; a long one, the scan.
+        if len(window) <= limits["dense"]:
+            matches = [item for item in rule.pattern.finditer(window) if item.group(0)]
+        else:
+            matches = scan(rule.pattern, window, limits["pairs"])
+        for match in matches:
+            if not last and match.end() == len(window):
+                if match.start() < limits["step"]:
+                    raise RedactionLimit(rule.id)
+                continue
+            new[Pair(match.group(0), ((match.group("p") or "") if keep else "") + placeholder(rule.id), rule.id)] = None
+        hits = sorted(set(hits) | set(new))
+        if len(hits) > limits["pairs"]:
             raise RedactionLimit(rule.id)
     return hits
 
 
-def apply(text: str, pairs: list[tuple[str, str]]) -> str:
-    for old, new in pairs:
-        text = new.join(text.split(old))
+def _order(pairs: Iterable[Pair]) -> list[Pair]:
+    """One pair per found text, the first in rule order, then longest first: jq's unique_by(.[0]) | sort_by(-length)."""
+    first: dict[str, Pair] = {}
+    for pair in pairs:
+        first.setdefault(pair.found, pair)
+    return sorted(first.values(), key=lambda pair: (-len(pair.found), pair.found))
+
+
+def pairs(blob: str, rs: Ruleset, secrets: list[tuple[str, str]]) -> list[Pair]:
+    """Mirror of prepare.jq: the env values the blob holds, then each rule whose needs it holds, every one run over
+    the unchanged blob. One pair per found text, longest first."""
+    out = [Pair(value, placeholder("env:" + name), "env:" + name) for name, value in secrets if value in blob]
+    for rule in rs.patterns:
+        if rule.applies(blob):
+            out += found(rule, blob)
+    ordered = _order(out)
+    if len(ordered) > rules()["limits"]["pairs"]:
+        raise RedactionLimit("pairs")
+    return ordered
+
+
+def apply(text: str, pairs: list[Pair]) -> str:
+    return apply_counted(text, pairs, Counter())
+
+
+def apply_counted(text: str, pairs: list[Pair], counts: Counter, numbered: bool = False) -> str:
+    """Mirror of jp_count: each pair replaced, in order, as a literal. ``counts`` gains how many times, by rule, and its
+    "" entry how many replacements were made in all. ``numbered``: each replacement gets the next #n."""
+    for pair in pairs:
+        parts = text.split(pair.found)
+        if len(parts) == 1:
+            continue
+        if numbered:
+            start = counts[""]
+            text = parts[0] + "".join(f"{pair.replacement}#{start + i}{part}" for i, part in enumerate(parts[1:], 1))
+        else:
+            text = pair.replacement.join(parts)
+        counts[pair.rule] += len(parts) - 1
+        counts[""] += len(parts) - 1
     return text
 
 
-def pairs(blob: str, rs: Ruleset, secrets: list[tuple[str, str]]) -> list[tuple[str, str]]:
-    """Mirror of prepare.jq: env values, then each rule whose needs the blob holds, each run over the
-    blob as the steps before left it. Every (found text, placeholder), in order."""
-    steps: list[Any] = [(value, placeholder("env:" + name)) for name, value in secrets if value in blob]
-    steps += [rule for rule in rs.patterns if rule.applies(blob)]
-    out: list[tuple[str, str]] = []
-    for step in steps:
-        hits = ([step] if step[0] in blob else []) if isinstance(step, tuple) else found(step, blob)
-        if len(out) + len(hits) > rules()["limits"]["pairs"]:
-            raise RedactionLimit("pairs")
-        blob = apply(blob, hits)
-        out += hits
-    return out
+# ---------------------------------------------------------------- scrubbing
 
 
-def _members(value: Any, key_re: re.Pattern, value_re: re.Pattern, mark: str) -> Any:
-    if isinstance(value, dict):
-        return {
-            key: mark if isinstance(item, str) and key_re.search(key) and value_re.search(item) else _members(item, key_re, value_re, mark)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_members(item, key_re, value_re, mark) for item in value]
-    return value
+def jq_json(value: Any) -> str:
+    """Compact JSON as jq's tojson writes it: raw non-ASCII, and DEL escaped."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).replace("\x7f", "\\u007f")
 
 
-def _member_count(value: Any, key_re: re.Pattern, value_re: re.Pattern) -> int:
-    """How many distinct secret members (key, value) there are: jq finds each distinct "key":"value" once."""
-    seen: set[tuple[str, str]] = set()
-
-    def visit(item: Any) -> None:
-        if isinstance(item, dict):
-            for key, inner in item.items():
-                if isinstance(inner, str) and key_re.search(key) and value_re.search(inner):
-                    seen.add((key, inner))
-                else:
-                    visit(inner)
-        elif isinstance(item, list):
-            for inner in item:
-                visit(inner)
-
-    visit(value)
-    return len(seen)
+def member_pairs(fields: Mapping[str, Any], rs: Ruleset) -> list[Pair]:
+    """Mirror of prepare.jq: each member rule over the compact JSON of the fields' values (a field's name is never a
+    key), as text: "key":"value" -> "key":"[REDACTED:secret_field]". One pair per found text, longest first."""
+    text = jq_json(list(fields.values()))
+    return _order(pair for rule in rs.members if rule.applies(text) for pair in found(rule, text))
 
 
-def _replace(value: Any, steps: list[tuple[str, str]]) -> Any:
-    if isinstance(value, str):
-        return apply(value, steps)
-    if isinstance(value, dict):
-        return {apply(key, steps): _replace(item, steps) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_replace(item, steps) for item in value]
-    return value
+def _size(value: Any) -> int:
+    """Mirror of jq's [.. | objects | length] | add: how many members the value's objects hold in all."""
+    return sum(len(obj) for obj in _objects(value))
 
 
-def scrub_value(value: Any, rs: Ruleset, secrets: list[tuple[str, str]]) -> Any:
-    """Every string and key with its secrets replaced. A secret-named member's string value goes whole."""
+def scrub_fields(fields: Mapping[str, Any], rs: Ruleset, secrets: list[tuple[str, str]]) -> tuple[dict, list[dict]]:
+    """Mirror of prepare.jq: the fields scrubbed together, and the records of what was replaced in each.
+
+    One blob of every string and key gives the pairs. Then each field: its secret-key members, its keys (rekeyed
+    without collisions, when a key holds a found text), and its strings. A field's name is never a member or a key.
+    """
     if rs.error:
-        return "" if isinstance(value, str) else None
-    blob = "\n".join(blob_items(value))
-    member, key_re, value_re = _member()
+        raise RedactionLimit("rules")
+    blob = "\n".join(blob_items(dict(fields)))
     found_pairs = pairs(blob, rs, secrets)
-    members = _member_count(value, key_re, value_re) if member.applies(blob) else 0
-    if len(found_pairs) + members > rules()["limits"]["pairs"]:
+    members = member_pairs(fields, rs)
+    if len(found_pairs) + len(members) > rules()["limits"]["pairs"]:
         raise RedactionLimit("pairs")
-    if members:
-        value = _members(value, key_re, value_re, placeholder(member.id))
-    return _replace(value, found_pairs) if found_pairs else value
+    if not found_pairs and not members:
+        return dict(fields), []
+    json_pairs = [Pair(jq_json(pair.found)[1:-1], jq_json(pair.replacement)[1:-1], pair.rule) for pair in found_pairs]
+    out: dict[str, Any] = {}
+    records: list[dict] = []
+    for field, value in fields.items():
+        counts: Counter = Counter()
+        # Member pairs were found in JSON text, so they apply to it as they are.
+        after_members = apply_counted(jq_json(value), members, counts)
+        before = Counter(counts)
+        scrubbed = json.loads(apply_counted(after_members, json_pairs, counts))
+        if _size(scrubbed) != _size(value):
+            # Two keys of one object became one placeholder: number every replacement in this field instead.
+            counts = before
+            scrubbed = json.loads(apply_counted(after_members, json_pairs, counts, numbered=True))
+            if _size(scrubbed) != _size(value):
+                raise RedactionLimit("keys")  # a key already named like a numbered placeholder: fail closed
+        out[field] = scrubbed
+        records += [{"rule": rule, "field": field, "count": n} for rule, n in counts.items() if n and rule]
+    return out, sort_records(records)
 
 
-def redact_text(text: str, rs: Ruleset, secrets: list[tuple[str, str]]) -> str:
-    """One text, such as a history summary. Nothing when the rules failed or hit a limit."""
-    try:
-        return scrub_value(text, rs, secrets)
-    except RedactionLimit:
-        return ""
-
-
-def scrub_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]]) -> dict:
-    """Mirror of prepare.jq: every field whose class is redacted, scrubbed together."""
-    fields = {key: value for key, value in event.items() if field_class(key)["redact"]}
-    return {**event, **scrub_value(fields, rs, secrets)} if fields else dict(event)
+def sort_records(records: Iterable[Mapping]) -> list[dict]:
+    """Records summed by (rule, field), sorted by field then rule, zero counts left out."""
+    totals: Counter = Counter()
+    for item in records:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            count = int(item.get("count") or 0)
+        except (TypeError, ValueError):
+            continue
+        totals[(str(item.get("field") or ""), str(item.get("rule") or ""))] += count
+    return [{"rule": rule, "field": field, "count": n} for (field, rule), n in sorted(totals.items()) if n > 0]
 
 
 def census(event: Mapping) -> list[dict]:
-    """{rule, field, count} for each placeholder in the event's redacted fields, keys included, by field then rule."""
-    audit = []
-    for field, value in event.items():
-        if not field_class(field)["redact"]:
-            continue
-        counts: dict[str, int] = {}
-        for text in blob_items(value):
-            for rule in _MARK.findall(text):
-                counts[rule] = counts.get(rule, 0) + 1
-        audit.extend({"rule": rule, "field": field, "count": counts[rule]} for rule in sorted(counts))
-    return audit
+    """The event's audit records, as the layers recorded them while they replaced text. Nothing is read back from placeholders."""
+    return sort_records(event.get("redactions") or [])
 
 
-def _with_audit(event: dict) -> dict:
-    audit = census(event)
-    if audit:
-        event["redactions"] = audit
+def _with_records(event: Mapping, records: list[dict]) -> dict:
+    out = dict(event)
+    merged = sort_records(list(event.get("redactions") or []) + records)
+    if merged:
+        out["redactions"] = merged
     else:
-        event.pop("redactions", None)
-    return event
+        out.pop("redactions", None)
+    return out
+
+
+def scrub_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]]) -> dict:
+    """Every field whose class is redacted, scrubbed together. New records join the event's ``redactions``."""
+    fields = {key: value for key, value in event.items() if field_class(key)["redact"]}
+    if not fields:
+        return dict(event)
+    scrubbed, records = scrub_fields(fields, rs, secrets)
+    return _with_records({**event, **scrubbed}, records)
+
+
+def redact_text(text: str, rs: Ruleset, secrets: list[tuple[str, str]], field: str = "text") -> tuple[str, list[dict]]:
+    """One text, such as a history summary, and the records of what was replaced in it as ``field``.
+    Nothing when the rules failed or hit a limit."""
+    try:
+        scrubbed, records = scrub_fields({field: text}, rs, secrets)
+    except RedactionLimit:
+        return "", []
+    return scrubbed[field], records
 
 
 def redact_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]]) -> dict:
-    """The sender's step: scrubbed, with ``redactions`` counted from the placeholders it then holds,
-    so text the hook already redacted is counted once."""
+    """The sender's step: scrubbed, with what it replaced added to the records the event already carries."""
     if rs.error:
-        return {**_unredactable(event), "redaction_error": True}
+        return _unredactable(event)
     try:
-        return _with_audit(scrub_event(event, rs, secrets))
+        return scrub_event(event, rs, secrets)
     except RedactionLimit:
-        return {**_unredactable(event), "redaction_error": True}
+        return _unredactable(event)
 
 
 def metadata_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]]) -> dict:
     """What metadata capture sends: the fields its class keeps, with labels redacted."""
+    kept = strip(event, lambda cls: cls["metadata"])
+    kept["redactions"] = [item for item in census(event) if field_class(str(item["field"]))["metadata"]]
     if not rs.error:
         try:
-            return _with_audit(scrub_event(strip(event, lambda cls: cls["metadata"]), rs, secrets))
+            return scrub_event(kept, rs, secrets)
         except RedactionLimit:
             pass
-    return {**strip(event, lambda cls: cls["metadata"] and not cls["redact"]), "redaction_error": True}
+    return {**strip(event, lambda cls: cls["metadata"] and not cls["redact"], names=False), "redaction_error": True}
+
+
+# ---------------------------------------------------------------- sensitive tool calls
 
 
 def _objects(value: Any) -> Iterator[dict]:
@@ -372,15 +554,6 @@ def _objects(value: Any) -> Iterator[dict]:
     elif isinstance(value, list):
         for item in value:
             yield from _objects(item)
-
-
-def _strings(value: Any) -> Iterator[str]:
-    """Mirror of ``strings, (arrays | .. | strings)``: a string, or every string in a list."""
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, list):
-        for item in value:
-            yield from _all_strings(item)
 
 
 def _all_strings(value: Any) -> Iterator[str]:
@@ -416,7 +589,7 @@ def tool_texts(event: Mapping) -> list[str]:
         for obj in _objects(item):
             for key, value in obj.items():
                 if keys.get(key):
-                    texts.extend(_strings(value))
+                    texts.extend(_all_strings(value))
     return texts
 
 
@@ -430,14 +603,14 @@ def lines(text: str, at: list[str]) -> str:
 def words(event: Mapping, texts: list[str]) -> str:
     """Mirror of prepare.jq: the words of the path and command values, then the prompt's @mentions, one per line."""
     table = rules()["sensitive"]
-    found = lines("\n".join(texts), table["split"]) + "\n"
+    found_words = lines("\n".join(texts), table["split"]) + "\n"
     prompt = event.get("prompt")
     if isinstance(prompt, str) and "@" in prompt:
         if prompt.count("@") > rules()["limits"]["mentions"]:
             raise RedactionLimit("mentions")
         mentions = [lines(word[1:], table["mention"]["end"]).split("\n")[0] for word in lines(prompt, table["mention"]["split"]).split("\n") if word.startswith("@")]
-        found += "\n".join(mention for mention in mentions if mention)
-    return found
+        found_words += "\n".join(mention for mention in mentions if mention)
+    return found_words
 
 
 @functools.lru_cache(maxsize=64)
@@ -461,10 +634,9 @@ def sensitive(event: Mapping, rs: Ruleset) -> dict | None:
 
 
 def sanitize_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]], capture: str = "sanitized") -> dict:
-    """Mirror of prepare.jq's judgment_prepare for one event: capture policy, sensitive check, scrub.
-    It records no audit; the sender counts that later from the placeholders."""
+    """Mirror of prepare.jq's judgment_prepare for one event: capture policy, sensitive check, scrub, records."""
     if rs.error:
-        return {**_unredactable(event), "redaction_error": True}
+        return _unredactable(event)
     raw = event
     try:
         if capture == "metadata":
@@ -473,9 +645,14 @@ def sanitize_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]], 
             hit = sensitive(event, rs)
             if hit is not None:
                 event = {**strip(event), "sensitive": True, "sensitive_rule": hit["rule"], "sensitive_trigger": hit["trigger"]}
-        return scrub_event(event, rs, secrets)
+        fields = {key: value for key, value in event.items() if field_class(key)["redact"]}
+        if not fields:
+            return dict(event)
+        scrubbed, records = scrub_fields(fields, rs, secrets)
+        # As jq: what this pass replaced is the event's record. A pass that replaced nothing leaves it as it was.
+        return {**event, **scrubbed, **({"redactions": records} if records else {})}
     except RedactionLimit:
-        return {**_unredactable(raw), "redaction_error": True}
+        return _unredactable(raw)
 
 
 def show_trigger(trigger: str, home: str = "") -> str:
@@ -500,24 +677,13 @@ def first_sensitive(events: list[dict], rs: Ruleset, secrets: list[tuple[str, st
             # Too much to check is treated as sensitive: the turn loses its text, never sends it unchecked.
             return {"rule": "redaction_limit", "trigger": ""}
         if hit is not None:
-            return {"rule": hit["rule"], "trigger": show_trigger(redact_text(hit["trigger"], rs, secrets), home)}
+            return {"rule": hit["rule"], "trigger": show_trigger(redact_text(hit["trigger"], rs, secrets)[0], home)}
     return None
 
 
-def turn_redaction(events: list[dict], blank: Mapping | None = None) -> dict:
-    """The turn's audit record. Counts add up across events by rule and field."""
-    totals: dict[tuple[str, str], int] = {}
-    for event in events:
-        for item in event.get("redactions") or []:
-            if not isinstance(item, dict):
-                continue
-            try:
-                count = int(item.get("count") or 0)
-            except (TypeError, ValueError):
-                continue
-            key = (str(item.get("rule") or ""), str(item.get("field") or ""))
-            totals[key] = totals.get(key, 0) + count
-    items = [{"rule": rule, "field": field, "count": count} for (rule, field), count in sorted(totals.items())]
+def turn_redaction(events: list[dict], blank: Mapping | None = None, extra: Iterable[Mapping] = ()) -> dict:
+    """The turn's audit record: every event's records, and ``extra`` (the history's), summed by rule and field."""
+    items = sort_records([item for event in events for item in (event.get("redactions") or [])] + list(extra))
     record: dict[str, Any] = {"count": sum(item["count"] for item in items), "items": items, "blanked": bool(blank)}
     if blank:
         record["reason"] = SENSITIVE_REASON

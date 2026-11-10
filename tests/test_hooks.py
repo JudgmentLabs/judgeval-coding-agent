@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 from payloads import adapter_turns, pi_turn
-from support import SECRETS, Sandbox, leaks, whole_leaks
+from support import HOOK, SECRETS, Sandbox, leaks, whole_leaks
 
 
 def run(sb: Sandbox, adapter: str, steps, env: dict | None = None):
@@ -125,6 +125,21 @@ class HookTests(unittest.TestCase):
         text = Path(__file__).resolve().parent.parent.joinpath("core", "bin", "judgment-hook").read_text()
         self.assertNotIn("--arg key", text)
         self.assertNotIn('--arg api', text)
+
+
+class NoJqFieldTests(unittest.TestCase):
+    def test_pi_without_jq_writes_only_fields_never_redacted(self):
+        """The hook's no-jq list of fields copied from a Pi payload: ids only, never a label the rules would redact."""
+        import re
+
+        from judgment_core import redact
+
+        text = HOOK.read_text()
+        fields = re.search(r"for field in ([a-z_ ]+); do\n    judgment_field \"\$payload\"", text).group(1).split()
+        self.assertIn("tool_call_id", fields)
+        for field in fields:
+            cls = redact.field_class(field)
+            self.assertTrue(cls["strip"] and not cls["redact"], field)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,12 @@ check=0
 if [ "${1:-}" = "--check" ]; then
   check=1
 fi
+# core/bin/redact-compiled.json is derived from core/bin/redact-rules.json. Write it, or check it is current.
+if [ "$check" -eq 1 ]; then
+  python3 "$root/scripts/gen_redact.py" --check || exit 1
+else
+  python3 "$root/scripts/gen_redact.py"
+fi
 found=0
 for plugin in claude-code codex cursor pi hermes; do
   [ -d "$root/$plugin" ] || continue

@@ -222,7 +222,9 @@ if [ "$RAW" -eq 1 ] && ! command -v jq >/dev/null 2>&1; then
   [ "$mode" = "on" ] || exit 0
   judgment_json_escape "$root"
   line="{\"v\":1,\"capture\":\"sanitized\",\"redaction_error\":true,\"project_root\":\"$JR\",\"environment\":\"production\""
-  for field in harness event session_id turn_id agent_id agent_type tool_name tool_call_id model provider; do
+  # Ids only. Labels such as tool_name and agent_type are free-form text that nothing here can redact.
+  # tests/test_hooks.py checks this list against the fields redact-rules.json never redacts.
+  for field in harness event session_id turn_id agent_id tool_call_id model provider; do
     judgment_field "$payload" "$field" || continue
     case $JR in
       *[!A-Za-z0-9._:@/+\ -]*) continue ;;
@@ -261,30 +263,63 @@ CORE=${HERE_HOOK%/*}
 PYTHONPATH="$CORE${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONPATH
 # The sender must outlive this hook: an agent can kill the hook's process group the moment it returns.
-#   launched -> own process group -> own session -> running
-# An ignored SIGHUP stays ignored across exec, so a hangup cannot reach the sender at any step. With job
-# control (bash and zsh, which macOS runs as /bin/sh) the shell puts the job in its own process group
-# before `&` returns: no race. dash ignores set -m. setsid(1), where there is one (Linux), puts it in its
-# own session. --detach makes the sender call setsid() itself once Python is up, wherever it was started.
+#   launch -> acknowledged: /proc shows it in another process group (or gone) -> return
+# An ignored SIGHUP stays ignored across exec, so a hangup cannot reach the sender at any step. The hook waits for a
+# positive acknowledgement, at most about 40 ms, with builtins only (no fork, no sleep):
+#   job control (bash, zsh; macOS runs /bin/sh as bash): `&` puts the job in its own process group before it returns.
+#     The acknowledgement is immediate. Without /proc (macOS), job control itself is the guarantee.
+#   dash (no job control without a terminal): setsid(1) puts the sender in a new session a moment after the fork,
+#     usually well under a millisecond. Without setsid(1), the sender calls setsid() itself as Python starts.
+#   no acknowledgement in time: a new sender is started by bash with `set -m`, whose job control isolates it before
+#     bash exits.
+#     Without bash that is a residual risk: a sender killed with the agent leaves its turns on disk for the next one.
+# --detach makes the sender call setsid() itself once Python is up, wherever it was started.
 trap '' HUP
-set -m 2>/dev/null || :
-if command -v setsid >/dev/null 2>&1; then
-  setsid python3 -m judgment_core.flush --detach >>"$STATE/flush.log" 2>&1 </dev/null &
-  sender=$!
-  # Under dash the job shares this process group until setsid runs in the child, a few microseconds
-  # after the fork. Return once /proc shows it in another session, or gone: builtin reads, no fork.
-  # The bound only matters on a machine too loaded to schedule the child; it is then a few ms.
-  if read -r own < "/proc/$$/stat" 2>/dev/null; then
-    set -- ${own##*) }
-    own=$4
-    tries=0
-    while [ "$tries" -lt 500 ] && read -r stat < "/proc/$sender/stat" 2>/dev/null; do
-      set -- ${stat##*) }
-      [ "$4" = "$own" ] && [ "$1" != Z ] || break
-      tries=$((tries + 1))
-    done
-  fi
-else
-  python3 -m judgment_core.flush --detach >>"$STATE/flush.log" 2>&1 </dev/null &
+LOG=$STATE/flush.log
+own=
+if read -r stat < "/proc/$$/stat" 2>/dev/null; then
+  set -- ${stat##*) }
+  own=$3
 fi
+# Succeeds once the sender is in another process group than this hook, or has exited.
+detached() {
+  read -r stat < "/proc/$sender/stat" 2>/dev/null || return 0
+  set -- ${stat##*) }
+  [ "$1" = Z ] || [ "$3" != "$own" ]
+}
+# Polls until detached, for 3-4 ticks of /proc/uptime (10 ms each), or fails at once without /proc.
+acknowledged() {
+  [ -n "$own" ] || return 1
+  read -r up rest < /proc/uptime || return 1
+  start=1${up%.*}${up#*.}
+  tries=0
+  while ! detached; do
+    tries=$((tries + 1))
+    if [ $((tries % 32)) -eq 0 ]; then
+      read -r up rest < /proc/uptime || return 1
+      [ $((1${up%.*}${up#*.} - start)) -lt 4 ] && [ "$tries" -lt 1000000 ] || return 1
+    fi
+  done
+}
+set -m 2>/dev/null || :
+case $- in
+  *m*)
+    python3 -m judgment_core.flush --detach >>"$LOG" 2>&1 </dev/null &
+    sender=$!
+    [ -z "$own" ] || acknowledged && exit 0
+    ;;
+  *)
+    if command -v setsid >/dev/null 2>&1; then
+      setsid python3 -m judgment_core.flush --detach >>"$LOG" 2>&1 </dev/null &
+    else
+      python3 -m judgment_core.flush --detach >>"$LOG" 2>&1 </dev/null &
+    fi
+    sender=$!
+    acknowledged && exit 0
+    ;;
+esac
+# Not acknowledged: the first sender may still be in this process group. If it gets out after all, two senders run;
+# they take turns on the flush lock.
+# `set -m` inside the script: started as `bash -m` without a terminal, bash turns job control off.
+command -v bash >/dev/null 2>&1 && bash -c 'set -m; python3 -m judgment_core.flush --detach >>"$1" 2>&1 </dev/null &' judgment-sender "$LOG" 2>/dev/null
 exit 0

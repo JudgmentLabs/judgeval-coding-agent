@@ -39,9 +39,10 @@ def adversarial() -> list[tuple[str, str]]:
         ("one long word", "a" * SIZE),
         ("@mentions", fill("@a ")),
     ]
-    rules = list(table["patterns"]) + [table["fields_rule"]] + table["sensitive"]["paths"] + table["sensitive"]["commands"]
+    rules = list(table["patterns"]) + list(table["members"]) + table["sensitive"]["paths"] + table["sensitive"]["commands"]
     for rule in rules:
-        need = (rule.get("needs") or ["x"])[0]
+        needs = rule.get("needs")
+        need = needs[0] if isinstance(needs, list) and needs else "key"
         for sep in ("=", ": ", "://", " ", "\n", "a1"):
             cases.append((f"{rule['id']}: {need!r}+{sep!r}", fill(need + sep)))
     return cases
