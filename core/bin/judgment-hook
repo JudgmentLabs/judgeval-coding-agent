@@ -260,22 +260,31 @@ fi
 CORE=${HERE_HOOK%/*}
 PYTHONPATH="$CORE${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONPATH
+# The sender must outlive this hook: an agent can kill the hook's process group the moment it returns.
+#   launched -> own process group -> own session -> running
+# An ignored SIGHUP stays ignored across exec, so a hangup cannot reach the sender at any step. With job
+# control (bash and zsh, which macOS runs as /bin/sh) the shell puts the job in its own process group
+# before `&` returns: no race. dash ignores set -m. setsid(1), where there is one (Linux), puts it in its
+# own session. --detach makes the sender call setsid() itself once Python is up, wherever it was started.
+trap '' HUP
+set -m 2>/dev/null || :
 if command -v setsid >/dev/null 2>&1; then
-  setsid python3 -m judgment_core.flush >>"$STATE/flush.log" 2>&1 </dev/null &
+  setsid python3 -m judgment_core.flush --detach >>"$STATE/flush.log" 2>&1 </dev/null &
   sender=$!
-  # An agent can kill this process group the moment the hook returns. Return only once the sender
-  # is in its own session: builtin reads of /proc, no fork, and never more than a few ms.
+  # Under dash the job shares this process group until setsid runs in the child, a few microseconds
+  # after the fork. Return once /proc shows it in another session, or gone: builtin reads, no fork.
+  # The bound only matters on a machine too loaded to schedule the child; it is then a few ms.
   if read -r own < "/proc/$$/stat" 2>/dev/null; then
     set -- ${own##*) }
     own=$4
     tries=0
-    while [ "$tries" -lt 300 ] && read -r stat < "/proc/$sender/stat" 2>/dev/null; do
+    while [ "$tries" -lt 500 ] && read -r stat < "/proc/$sender/stat" 2>/dev/null; do
       set -- ${stat##*) }
-      [ "$4" = "$own" ] || break
+      [ "$4" = "$own" ] && [ "$1" != Z ] || break
       tries=$((tries + 1))
     done
   fi
 else
-  python3 -m judgment_core.flush >>"$STATE/flush.log" 2>&1 </dev/null &
+  python3 -m judgment_core.flush --detach >>"$STATE/flush.log" 2>&1 </dev/null &
 fi
 exit 0

@@ -20,11 +20,11 @@ With `capture` set to `sanitized`, the default, the root span records what was r
 | --- | --- | --- |
 | `judgment.redacted` | bool | `true` when anything in the turn was redacted or the turn was blanked. |
 | `judgment.redaction_count` | int | How many redactions the turn's text holds. |
-| `judgment.redactions` | string | JSON list of `{"rule", "field", "count"}`, such as `{"rule":"github_token","field":"tool_output","count":2}`. `rule` is a pattern id, `env:<NAME>` for an environment variable's value, or `custom` for a `redactPatterns` rule. `field` is the event field the text was in: `prompt`, `output`, `tool_input`, `tool_output`, `tool_results`, `tool_calls`, and so on. Left out when the count is 0. |
+| `judgment.redactions` | string | JSON list of `{"rule", "field", "count"}`, such as `{"rule":"github_token","field":"tool_output","count":2}`. `rule` is a pattern id, `secret_field` for a secret-named member's value in structured input or output, `env:<NAME>` for an environment variable's value, or `custom` for a `redactPatterns` rule. `field` is the event field the text was in: `prompt`, `output`, `tool_input`, `tool_output`, `tool_results`, `tool_calls`, and so on. Left out when the count is 0. |
 | `judgment.redacted_reason` | string | `sensitive_path` when the turn was blanked. |
-| `judgment.redacted_rule` | string | The rule that blanked it, such as `dotenv`, `credentials_file`, `env_dump`, or `custom_path`. |
+| `judgment.redacted_rule` | string | The rule that blanked it, such as `dotenv`, `credentials_file`, `env_dump`, or `custom_path`. `redaction_limit` when the turn held more to check than the limits allow. |
 | `judgment.redacted_trigger` | string | The path that blanked it, such as `.env` or `~/.aws/credentials`, with the home folder as `~` and any secret in it redacted. For a command, `cmd:<rule>`, such as `cmd:env_dump`. |
-| `judgment.redaction_error` | bool | A rule failed, such as an invalid `redactPatterns` regex, so the affected events were sent without text. |
+| `judgment.redaction_error` | bool | A rule failed, such as an invalid `redactPatterns` regex, or an event needed more redaction than the limits allow, so the affected events were sent without text. A failed rule also drops the earlier turns' text that would ride along as context. |
 
 A child span whose input or output holds placeholders carries its own `judgment.redaction_count`, the number of `[REDACTED:` placeholders in that span's text.
 
@@ -85,6 +85,6 @@ A turn recorded under a different key stays queued until a sender with that key 
 
 A turn waits for its subagents to finish, for up to 10 minutes. A turn that never ends, because the agent was killed mid-turn, is sent as it stands after a day with no new events.
 
-Secrets are redacted twice: by the hook, before an event reaches the queue, and by the sender, after it reads transcript text. Both use the rules in `core/bin/redact-rules.json`. A turn that touched a sensitive file is saved blank before it is sent, so its text does not stay on disk.
+Secrets are redacted twice: by the hook, before an event reaches the queue, and by the sender, after it reads transcript text. Both use the rules in `core/bin/redact-rules.json`. The sender checks for a sensitive file before it redacts, so a placeholder in a file name cannot hide it. A turn that touched a sensitive file is saved blank before it is sent, so its text does not stay on disk.
 
 A turn being sent stays on disk until the send succeeds, so a crash or a failed send retries the whole turn on the next run. A large turn goes out in several compressed requests, with the root last. A turn the server rejects as invalid or too large is skipped and noted in `flush.log`, so it never holds back later turns.

@@ -1,14 +1,55 @@
 # Shared by adapter maps. One jq applies the map and this filter.
 # Commands pass through so a session toggle still runs when tracing is off.
 #
-# An event goes map -> capture policy -> redact -> inbox. The rules are data in redact-rules.json,
-# which judgment_core/redact.py also reads; its functions mirror the steps below, step for step.
+# An event goes map -> capture policy -> sensitive check -> redact -> inbox. The rules are data in
+# redact-rules.json, which judgment_core/redact.py also reads; its functions mirror the steps below.
+# The audit of what was redacted is counted later, by the sender, from the placeholders.
 #
-# jq compiles this on every hook run, on the agent's critical path, and each closure costs compile
-# time: so `. + {k: v}` instead of `.k = v`, `if c then . else empty end` instead of select(c),
-# and the rules live in the data. tests/bench_hook.py measures the hook.
+# Redaction is two plain steps. pairs: run the env values, then each rule, over one blob of every
+# string and key in the event's text fields, and list each (found text, placeholder) in order. Then
+# apply those pairs, as literals, to the fields' JSON. Literals need no match offsets, which jq 1.6
+# counts in bytes, and one pass over the JSON reaches every string and key at any depth.
+#
+# jq compiles this on every hook run, on the agent's critical path, at about 1.5 microseconds per
+# instruction: so no recursive walker, and the C builtin _match_impl instead of the larger test,
+# match, and join definitions. tests/bench_hook.py measures the hook.
+#
+# jq's global match counts each match's offset from the start of its string, so many matches in one
+# long string cost the square of its length: words are split at literals, and rules run over windows.
 
 import "redact-rules" as $redact_rules;
+
+# Cheap forms of gsub, sub, and test, which the maps also use. Same regex engine, same \s.
+def jp_trim: _match_impl("\\S(?:[\\s\\S]*\\S)?"; null; false)[0].string // "";
+def jp_ltrim: _match_impl("\\S[\\s\\S]*"; null; false)[0].string // "";
+# The text before a suffix matching re at the end, or null.
+def jp_before($re): _match_impl("^([\\s\\S]*?)" + $re + "$"; null; false)[0].captures[0].string;
+# join for strings, linear: jq's join, and a reduce of +, copy the whole string at every step.
+def jp_join($x): .[:1] + (.[1:] | map($x + .)) | add // "";
+# Any of the literals is in the input. No literals (null) means any text.
+def jp_holds($needs): . as $t | $needs == null or any($needs[]; . as $n | $t | contains($n));
+def jp_test($re): _match_impl($re; null; true);
+# Each (found text, placeholder) replaced, in order, as literals.
+def jp_apply($pairs): reduce $pairs[] as $x (.; split($x[0]) | jp_join($x[1]));
+# Split at each of the literals: the pieces, one per line.
+def jp_lines($at): reduce $at[] as $c (.; split($c) | jp_join("\n"));
+# The windows a rule runs over (limits in redact-rules.json). A whole rule runs over all the text, but
+# fails on text that holds more than `most` of the literals it needs.
+def jp_windows($p; $l):
+  if $p.whole then
+    if ([$p.needs[] as $n | split($n) | length - 1] | add) > ($p.most // 1e9) then error("redaction limit") else . end
+  elif length <= $l.window then .
+  else . as $t | range(0; (length - 1) / $l.step + 1 | floor) * $l.step | $t[.:. + $l.window] end;
+# Each distinct match of rule $p, longest first, with the placeholder it becomes. The text the
+# rule's group p holds stays. A window is matched after the finds before it are replaced in it, so a
+# secret that repeats is matched once, not once per copy.
+def jp_found($p; $l):
+  reduce jp_windows($p; $l) as $w ([];
+    . as $found
+    | . + [$w | jp_apply($found) | _match_impl($p.re; "g"; false)[] | select(.length > 0)
+           | [.string, (.captures[0] | if .name == "p" then .string else "" end) + "[REDACTED:" + $p.id + "]"]]
+    | unique | sort_by(-(.[0] | length))
+    | if length > $l.pairs then error("redaction limit") else . end);
 
 def judgment_prepare($cfg; $mode; $root; $model):
   if .kind == "command" then
@@ -16,8 +57,7 @@ def judgment_prepare($cfg; $mode; $root; $model):
   else
     # An empty or cut-off opt-in file is no opt-in. It must never fall back to full capture.
     (if ($cfg | type) == "object" then $cfg else {enabled: false} end) as $c
-    | (if $c.sessionDefault == "off" then "off" else "on" end) as $default
-    | (if $mode == "on" or $mode == "off" then $mode else $default end) as $active
+    | (if $mode == "on" or $mode == "off" then $mode elif $c.sessionDefault == "off" then "off" else "on" end) as $active
     | if $c.enabled == false or $active != "on" or (.session_id // "") == "" then
         empty
       else
@@ -25,83 +65,78 @@ def judgment_prepare($cfg; $mode; $root; $model):
         (if $c.capture == "metadata" or $c.capture == "full" or $c.capture == "sanitized" then $c.capture
          elif $c.redact == false then "full"
          else "sanitized" end) as $capture
-        | $redact_rules::redact_rules[0] as $r
-        | (reduce $r.keep_fields[] as $k ({}; . + {($k): true})) as $keep
-        # Only the structural fields. tool_calls keep their id and name.
-        | def strip: . as $ev
-            | reduce keys_unsorted[] as $k ({}; if $keep[$k] then . + {($k): $ev[$k]} else . end)
-            | if ($ev.tool_calls | type) == "array" then
-                . + {tool_calls: [$ev.tool_calls[] | if type == "object" then {id: (.id // .tool_call_id), name: (.name // .tool_name)} else empty end]}
-              else . end;
-        # Rules whose needs text t holds. A rule without needs always applies.
-          def gate(t): if .needs == null or (t as $t | any(.needs[]; . as $n | $t | contains($n))) then . else empty end;
-        # One string: env values, then each rule's matches, each replaced as a literal, longest first.
-        # Literals need no match offsets, which jq 1.6 counts in bytes.
-          def red(envs; rules):
-            reduce envs as $e (.; split($e.value) | join("[REDACTED:env:" + $e.name + "]"))
-            | reduce rules as $p (.;
-                reduce ([match($p.re; "g") | [.string, ([.captures[] | if .name == "p" then .string else empty end][0] // "")]] | sort_by(-(.[0] | length)))[] as $m
-                  (.; split($m[0]) | join($m[1] + "[REDACTED:" + $p.id + "]")));
-        (if (($c.environment | type) == "string") and (($c.environment | gsub("^\\s+|\\s+$"; "")) != "") then $c.environment else "production" end) as $environment
+        | (if ($c.environment | type) == "string" and ($c.environment | jp_test("\\S")) then $c.environment else "production" end) as $environment
         # The flusher enforces the same policy again after it reads transcripts. The stamp tells it to.
-        | if $capture == "metadata" then
-            strip + {prompt: "", output: ""}
-          elif $capture == "sanitized" then
+        | if $capture == "full" then . else
+            $redact_rules::redact_rules[0] as $r
+            # A field's class says what survives losing the text, and what is redacted.
+            | def class: $r.fields.classes[$r.fields.of[.] // "text"];
+              # Only the fields whose class passes f. tool_calls keep their id and name.
+              def strip(f): . as $ev
+                | reduce (keys_unsorted[] | select(class | f)) as $k ({}; . + {($k): $ev[$k]})
+                | if ($ev.tool_calls | type) == "array" then
+                    . + {tool_calls: [$ev.tool_calls[] | objects | {id: (.id // .tool_call_id), name: (.name // .tool_name)}]}
+                  else . end;
+              # A rule's regex. A list joins its parts; {"def": name} is a shared fragment.
+              def re: if type == "array" then map(if type == "object" then $r.defs[.def] else . end) | jp_join("") else . end;
             . as $raw
             | try (
-                # redactPatterns: regexes. redactPaths: globs, where * is any run of characters and ? one.
-                [($c.redactPatterns // [])[]? | if type == "string" and . != "" then {id: "custom", re: .} else empty end] as $user
-                | ($r.patterns + $user) as $rules
-                | [($c.redactPaths // [])[]? | if type == "string" and . != "" then . else empty end
-                   | {id: "custom_path", re: ("(?<![^\\n/])" + (reduce (explode[] | [.] | implode) as $ch (""; . + ({"*": "[^\\n]*", "?": "[^\\n]"}[$ch] // (if ".\\+^$()[]{}|" | contains($ch) then "\\" + $ch else $ch end)))) + "(?![^\\n])")}] as $paths
-                # Env values of secret-named variables, longest first. The rule's regex runs only on lines
-                # whose name holds one of its needs, found with C builtins on the names' JSON.
-                | ($ENV | keys_unsorted | tojson) as $names
-                | ([$r.env.needs[] | . as $w | if $names | contains($w) then . else empty end] as $words
-                   | [$ENV | keys_unsorted[] | . as $k | if any($words[]; . as $w | $k | contains($w)) then $k + "=" + $ENV[$k] + "\n" else empty end] | join("")
-                   | [match($r.env.re; "g") | {name: .captures[0].string, value: .captures[1].string}]
-                   | sort_by([-(.value | length), .name])) as $envs
-                # Sensitive: tool input that names a sensitive path, or dumps the env, blanks the event.
-                # Path rules see one word per line, from path values and commands split at shell punctuation.
-                | $r.sensitive as $s
-                | [(.tool_input, (.tool_calls[]? | if type == "object" then .arguments, .input else empty end)) | if . == null then empty else . end
-                   | if type == "string" then (try fromjson catch {command: .}) else . end
-                   | if type == "string" then {command: .} else . end
-                   | tojson | match($s.texts_re; "g").captures | (.[0].string // (.[1].string | match($s.string_re; "g").captures[0].string))
-                   | "\"" + . + "\"" | fromjson] as $texts
-                | ([$texts[] | match($s.token_re; "g").string]
-                   + (if (.prompt | type) == "string" and (.prompt | contains("@")) then [.prompt | match($s.mention_re; "g").string[1:]] else [] end)) as $tokens
-                | ($tokens | join("\n")) as $blob
-                | ($texts | join("\n")) as $cmds
-                | [(($s.paths + $paths)[] | gate($blob) | .re as $re | if $blob | test($re) then {rule: .id, trigger: [$tokens[] | if test($re) then . else empty end][0]} else empty end),
-                   ($s.commands[] | gate($cmds) | if (.re as $re | $cmds | test($re)) then {rule: .id, trigger: ("cmd:" + .id)} else empty end)][0] as $hit
-                | if $hit then
-                    strip + {sensitive: true, sensitive_rule: $hit.rule, sensitive_trigger: ($hit.trigger | (($ENV.HOME // "") + "/") as $home
-                      | if $home != "/" and startswith($home) then "~/" + .[($home | length):] else . end
-                      | red($envs[]; $rules[]))}
+                # Sensitive: tool input that names a sensitive path, or dumps the env, keeps only its structure.
+                # Path rules see one word per line, from path and command values. Command rules see the values.
+                $r.sensitive as $s
+                | (if $capture == "metadata" then null else
+                    [(.tool_input, (.tool_calls[]? | objects | .arguments, .input)) | values
+                     | if type == "string" then (. as $t | try fromjson catch {command: $t}) else . end
+                     | if type == "string" then {command: .} else . end
+                     | .. | objects | . as $o | keys_unsorted[] | select($s.keys[.]) | $o[.] | (strings, (arrays | .. | strings))] as $texts
+                    | ($texts | jp_join("\n")) as $cmds
+                    | (($cmds | jp_lines($s.split)) + "\n"
+                      + (if (.prompt | type) == "string" and (.prompt | contains("@")) then
+                           if (.prompt | split("@") | length) > $r.limits.mentions + 1 then error("redaction limit") else . end
+                           | .prompt | jp_lines($s.mention.split) | split("\n") | map(select(startswith("@")) | .[1:] | jp_lines($s.mention.end) | split("\n")[0] // "" | select(. != "")) | jp_join("\n")
+                         else "" end)) as $words
+                    | first(
+                        (($s.paths + [($c.redactPaths // [])[]? | strings | select(. != "")
+                           | {id: "custom_path", re: ("(?<![^\\n/])" + ([explode[] | [.] | implode | $s.glob[.] // .] | jp_join("")) + "(?![^\\n])")}])[]
+                         | .re as $re | .needs as $n | select(($words | jp_holds($n)) and ($words | jp_test($re)))
+                         | {rule: .id, trigger: ($words | _match_impl("(?<![^\\n])[^\\n]*?(?:" + $re + ")[^\\n]*"; null; false)[0].string)}),
+                        ($s.commands[] | .needs as $n | .re as $re | select(($cmds | jp_holds($n)) and ($cmds | jp_test($re))) | {rule: .id, trigger: ("cmd:" + .id)}),
+                        null)
+                  end) as $hit
+                | if $capture == "metadata" then strip(.strip) + {prompt: "", output: ""}
+                  elif $hit then strip(.strip) + {sensitive: true, sensitive_rule: $hit.rule, sensitive_trigger: $hit.trigger}
                   else . end
-                # Every text field. .redactions lists {rule, field, count} of the placeholders each holds.
-                | (reduce keys_unsorted[] as $k ([]; if $keep[$k] then . else . + [$k] end)) as $fields
-                | ([.[$fields[]] | .. | if type == "string" then . else empty end] | join("\n")) as $text
-                | [$envs[] | if .value as $v | $text | contains($v) then . else empty end] as $e
-                | [$rules[] | gate($text) | if (.re as $re | $text | test($re)) then . else empty end] as $p
-                | if $e == [] and $p == [] then .
+                # Redact every field whose class says so: its strings, and the keys of objects in it.
+                | . as $ev
+                | (reduce (keys_unsorted[] | select(class.redact)) as $k ({}; . + {($k): $ev[$k]})) as $sub
+                | ([$sub | .. | strings, (objects | keys_unsorted[])] | jp_join("\n")) as $text
+                # Env values of secret-named variables that occur in the text, longest first: the whole value, and each line of it.
+                | (([$ENV | keys_unsorted | jp_join("\n") | _match_impl($r.env.name_re; "g"; false)[].string as $k
+                    | $ENV[$k] | (., (select(contains("\n")) | split("\n")[] | rtrimstr("\r")))
+                    | . as $v | select(length >= 8 and ($text | contains($v)) and jp_test($r.env.value_re))
+                    | {v: ., p: ("[REDACTED:env:" + $k + "]")}]
+                   | sort_by(-(.v | length), .p))
+                  # Then the rules, built-in first, in table order.
+                  + [($r.patterns + [($c.redactPatterns // [])[]? | strings | select(. != "") | {id: "custom", re: .}])[]
+                     | .needs as $n | select($text | jp_holds($n)) | . + {re: (.re | re)}]) as $steps
+                | ([$r.fields_rule | .needs as $n | select($text | jp_holds($n)) | . + {re: (.json_re | re)}][0]) as $kv
+                | if $steps == [] and $kv == null then .
                   else
-                    def walk_text: if type == "string" then red($e[]; $p[])
-                      elif type == "array" then [.[] | walk_text]
-                      elif type == "object" then . as $o | reduce keys_unsorted[] as $k ({}; . + {($k): ($o[$k] | walk_text)})
-                      else . end;
-                    reduce $fields[] as $f (.; . + {($f): (.[$f] | walk_text)})
-                    | . as $ev
-                    | [$fields[] as $f
-                       | reduce ($ev[$f] | .. | if type == "string" then match("\\[REDACTED:([A-Za-z0-9_:.-]+)\\]"; "g").captures[0].string else empty end) as $rule ({}; . + {($rule): (.[$rule] + 1)})
-                       | keys[] as $rule | {rule: $rule, field: $f, count: .[$rule]}] as $audit
-                    | if $audit == [] then . else . + {redactions: $audit} end
+                    (reduce $steps[] as $p ([$text, []];
+                      .[0] as $blob
+                      | (if $p.v then [[$p.v, $p.p] | select($blob | contains($p.v))] else $blob | jp_found($p; $r.limits) end) as $m
+                      | if (.[1] | length) + ($m | length) > $r.limits.pairs then error("redaction limit") else . end
+                      | [($blob | jp_apply($m)), .[1] + $m]))[1] as $pairs
+                    | ($sub | tojson) as $json
+                    | (if $kv then $json | jp_found($kv; $r.limits) else [] end) as $members
+                    | if ($pairs | length) + ($members | length) > $r.limits.pairs then error("redaction limit") else . end
+                    | . + ($json | jp_apply($members) | jp_apply([$pairs[] | map(tojson | .[1:-1])]) | fromjson)
                   end)
-              # A rule that fails, such as an invalid user regex, drops the event's text. Never the raw text.
-              catch ($raw | strip + {redaction_error: true})
-          else . end
+              # A rule that fails, such as an invalid user regex, drops the event's text, and the labels it could
+              # not redact. Never the raw text.
+              catch ($raw | strip(.strip and (.redact | not)) + {redaction_error: true})
+          end
         | . + {capture: $capture, ts: (if (.ts | type) == "number" then .ts else (now * 1000 | floor) end), environment: $environment, project_root: $root}
-        | if ((.model // "") == "") and $model != "" then . + {model: $model} else . end
+        | if (.model // "") == "" and $model != "" then . + {model: $model} else . end
       end
   end;

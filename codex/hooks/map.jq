@@ -1,7 +1,7 @@
 include "prepare";
 
 def trimmed:
-  if type == "string" then gsub("^\\s+|\\s+$"; "") else "" end;
+  if type == "string" then jp_trim else "" end;
 
 def base:
   {
@@ -19,14 +19,14 @@ def tagged($id):
   if $id != "" then . + {agent_id: $id} else . end;
 
 def command_name($prompt):
-  ($prompt | gsub("^\\s+"; "")) as $p
-  | if $p | test("^\\$judgment(\\s+(on|off|status))?$") then (($p | split(" "))[1] // "status")
-    elif $p | test("^/judgment:(on|off|status)$") then ($p | split(":")[1])
-    elif $p | test("^/judgment(\\s+(on|off|status))?$") then (($p | split(" "))[1] // "status")
+  ($prompt | jp_ltrim) as $p
+  | if $p | jp_test("^\\$judgment(\\s+(on|off|status))?$") then (($p | split(" "))[1] // "status")
+    elif $p | jp_test("^/judgment:(on|off|status)$") then ($p | split(":")[1])
+    elif $p | jp_test("^/judgment(\\s+(on|off|status))?$") then (($p | split(" "))[1] // "status")
     else "" end;
 
 def spawn_response:
-  if ((.tool_name // "") | test("(^|/)spawn_agent$|collaborationspawn_agent$")) then
+  if ((.tool_name // "") | jp_test("(^|/)spawn_agent$|collaborationspawn_agent$")) then
     # v2 returns the response as a JSON string with only the task name.
     (.tool_response | (if type == "string" then (try fromjson catch {}) else . end)
       | if type == "object" then . else {} end)
@@ -46,7 +46,7 @@ def spawn_response:
   elif $event == "UserPromptSubmit" then
     base + {event: "turn_start", prompt: (.prompt // "")}
     # The Codex app runs its own background requests, such as next-message suggestions, as threads in the project.
-    + (if $prompt | test("^This is an app-generated request|^# Overview\\s+Generate \\d+ to \\d+ hyperpersonalized suggestions") then {hidden: true} else {} end)
+    + (if $prompt | jp_test("^This is an app-generated request|^# Overview\\s+Generate \\d+ to \\d+ hyperpersonalized suggestions") then {hidden: true} else {} end)
   elif $event == "PreModelRequest" then
     base + {event: "model_start"} | tagged($agent)
   elif $event == "PostModelRequest" then

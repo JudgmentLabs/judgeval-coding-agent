@@ -44,7 +44,10 @@ class HookTests(unittest.TestCase):
         for event in events:
             self.assertEqual(event["capture"], "sanitized")
             self.assertEqual(event["export_fp"] and len(event["export_fp"]), 32)
-        rules = {item["rule"] for event in events for item in event.get("redactions", [])}
+        # The hook leaves the audit to the sender, which counts the placeholders.
+        from judgment_core import redact
+
+        rules = {item["rule"] for event in events for item in redact.census(event)}
         for rule in ("openai_key", "github_token", "aws_access_key_id", "private_key", "jwt", "url_password", "secret_assignment", "env:JUDGMENT_API_KEY", "env:MY_CUSTOM_SERVICE_TOKEN"):
             self.assertIn(rule, rules)
 
@@ -84,7 +87,8 @@ class HookTests(unittest.TestCase):
         payload = {**payload, "tool_name": "Read", "tool_input": {"file_path": str(self.sb.project / ".env")}, "tool_response": {"file": {"content": "A=1"}}}
         self.assertEqual(self.sb.hook("claude", event, payload).returncode, 0)
         [stored] = self.sb.inbox()
-        self.assertEqual((stored["sensitive"], stored["sensitive_rule"], stored["sensitive_trigger"]), (True, "dotenv", "~/proj/.env"))
+        # The sender shows the home folder as ~ when it builds the audit.
+        self.assertEqual((stored["sensitive"], stored["sensitive_rule"], stored["sensitive_trigger"]), (True, "dotenv", str(self.sb.project / ".env")))
         self.assertNotIn("tool_output", stored)
 
     def test_pi_raw_full_capture_keeps_raw_text(self):

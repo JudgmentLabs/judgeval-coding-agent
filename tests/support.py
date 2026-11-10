@@ -228,7 +228,7 @@ def py_sanitize(events: list[dict], cfg: dict | None = None, env: dict | None = 
     env = env or clean_env()
     rs = redact.ruleset(cfg or {})
     secrets = redact.env_secrets(env)
-    return [redact.sanitize_event(event, rs, secrets, env.get("HOME", "")) for event in events]
+    return [redact.sanitize_event(event, rs, secrets) for event in events]
 
 
 _STAMPS = ("capture", "environment", "project_root")
