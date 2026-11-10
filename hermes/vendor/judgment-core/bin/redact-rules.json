@@ -5,9 +5,9 @@
     "Redaction is by format, plus three short data lists: secretNames (a value after one of these names), sensitivePaths and",
     "sensitiveCommands (a tool call that touches one blanks its turn). Nothing here parses code, shell, or patches.",
     "Regexes use what Oniguruma and Python re agree on: (?<name>...) for a named group (p, when it is the first group: the text",
-    "it holds is kept); \\s and \\S, which redact._compile spells out for Python (its own count U+001C to U+001F as blanks);",
+    "it holds is kept, when it starts the match);",
     "An identifier boundary also holds right after an escape a JSON string or a terminal writes before a word: \\n \\r \\t \\b \\f,",
-    "\\uXXXX, and the m that ends an ANSI color code.",
+    "\\uXXXX, and the m that ends an ANSI color code ([1m, [32m, ;31m).",
     "no ^ or $ (use (?<![\\s\\S]) and (?![\\s\\S]) for the ends of a whole value); [0-9] and [A-Za-z], not \\d and \\w;",
     "no (?i), because Oniguruma compiles it slowly and jq compiles a regex on every call. Words are spelled lower, UPPER, and Capitalized.",
     "Linear time: no repeat inside a repeat over characters both can take, and no two unbounded repeats over overlapping",
@@ -70,22 +70,22 @@
       "needs": [
         "eyJ"
       ],
-      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))eyJ[A-Za-z0-9_-]{8,}\\.eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]*"
+      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))eyJ[A-Za-z0-9_-]{8,}\\.eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]*"
     },
     {
       "id": "anthropic_key",
       "needs": [
         "sk-ant-"
       ],
-      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))sk-ant-[A-Za-z0-9_-]{20,}"
+      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))sk-ant-[A-Za-z0-9_-]{20,}"
     },
     {
       "id": "openai_key",
       "needs": [
         "sk-"
       ],
-      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))sk-(?:proj-|svcacct-|admin-)?(?=[A-Za-z0-9_-]{0,256}?[A-Za-z0-9_]{16})[A-Za-z0-9_-]{20,}",
-      "pre": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))sk-"
+      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))sk-(?:proj-|svcacct-|admin-)?(?=[A-Za-z0-9_-]{0,256}?[A-Za-z0-9_]{16})[A-Za-z0-9_-]{20,}",
+      "pre": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))sk-"
     },
     {
       "id": "aws_access_key_id",
@@ -95,7 +95,7 @@
         "ABIA",
         "ACCA"
       ],
-      "re": "(?:(?<![A-Za-z0-9])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}(?![0-9A-Za-z])"
+      "re": "(?:(?<![A-Za-z0-9])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}(?![0-9A-Za-z])"
     },
     {
       "id": "github_token",
@@ -106,14 +106,14 @@
         "ghs_",
         "ghr_"
       ],
-      "re": "(?:(?<![A-Za-z0-9_])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))gh[pousr]_[A-Za-z0-9]{36,}"
+      "re": "(?:(?<![A-Za-z0-9_])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))gh[pousr]_[A-Za-z0-9]{36,}"
     },
     {
       "id": "github_pat",
       "needs": [
         "github_pat_"
       ],
-      "re": "(?:(?<![A-Za-z0-9_])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))github_pat_[A-Za-z0-9_]{22,}"
+      "re": "(?:(?<![A-Za-z0-9_])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))github_pat_[A-Za-z0-9_]{22,}"
     },
     {
       "id": "slack_token",
@@ -125,7 +125,7 @@
         "xoxs-",
         "xoxe-"
       ],
-      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))xox[abprse]-(?=[A-Za-z0-9-]{0,255}[0-9])[A-Za-z0-9-]{10,}"
+      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))xox[abprse]-(?=[A-Za-z0-9-]{0,255}[0-9])[A-Za-z0-9-]{10,}"
     },
     {
       "id": "slack_webhook",
@@ -139,7 +139,7 @@
       "needs": [
         "AIza"
       ],
-      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"
+      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"
     },
     {
       "id": "stripe_key",
@@ -149,7 +149,7 @@
         "rk_live_",
         "rk_test_"
       ],
-      "re": "(?:(?<![A-Za-z0-9_])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}"
+      "re": "(?:(?<![A-Za-z0-9_])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}"
     },
     {
       "_comment": [
@@ -159,7 +159,7 @@
       "needs": [
         "://"
       ],
-      "re": "(?<p>(?:(?<![A-Za-z0-9+.-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))[A-Za-z][A-Za-z0-9+.-]{1,20}://[^\\s/:@'\\\"<>\\[\\]]{0,128}:)(?!(?:\\[REDACTED:[A-Za-z0-9_:.-]{1,128}\\](?:#[0-9]{1,6})?|\\$\\{[A-Za-z_][A-Za-z0-9_]{0,127}\\}|\\$[A-Za-z_][A-Za-z0-9_]{0,127}|\\{\\{\\s{0,4}[.A-Za-z_][A-Za-z0-9_.]{0,127}\\s{0,4}\\}\\}|%[A-Za-z_][A-Za-z0-9_]{0,63}%|\\*{1,64}|x{3,64}|X{3,64}|password|PASSWORD|Password|pass|PASS|Pass|passwd|PASSWD|Passwd|pwd|PWD|Pwd|secret|SECRET|Secret|changeme|CHANGEME|Changeme)@)[^\\s/@'\\\"<>]+(?=@)"
+      "re": "(?<p>(?:(?<![A-Za-z0-9+.-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))[A-Za-z][A-Za-z0-9+.-]{1,20}://[^\\s/:@'\\\"<>\\[\\]]{0,128}:)(?!(?:\\[REDACTED:[A-Za-z0-9_:.-]{1,128}\\](?:#[0-9]{1,6})?|\\$\\{[A-Za-z_][A-Za-z0-9_]{0,127}\\}|\\$[A-Za-z_][A-Za-z0-9_]{0,127}|\\{\\{\\s{0,4}[.A-Za-z_][A-Za-z0-9_.]{0,127}\\s{0,4}\\}\\}|%[A-Za-z_][A-Za-z0-9_]{0,63}%|\\*{1,64}|x{3,64}|X{3,64}|password|PASSWORD|Password|pass|PASS|Pass|passwd|PASSWD|Passwd|pwd|PWD|Pwd|secret|SECRET|Secret|changeme|CHANGEME|Changeme)@)[^\\s/@'\\\"<>]+(?=@)"
     },
     {
       "id": "authorization_header",
@@ -173,7 +173,7 @@
         "-Token",
         "-TOKEN"
       ],
-      "re": "(?<p>(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))(?:(?:proxy|PROXY|Proxy)-(?:authorization|AUTHORIZATION|Authorization)|(?:authorization|AUTHORIZATION|Authorization)|(?:x|X)-(?:api|API|Api)-(?:key|KEY|Key)|(?:api|API|Api)-(?:key|KEY|Key)|(?:x|X)-(?:auth|AUTH|Auth)-(?:token|TOKEN|Token))\\\\?[\\\"']?\\s{0,5}[:=]\\s{0,5}\\\\?[\\\"']?(?:(?:basic|BASIC|Basic|bearer|BEARER|Bearer|token|TOKEN|Token|digest|DIGEST|Digest|bot|BOT|Bot|apikey|APIKEY|Apikey)\\s+)?)(?!\\$|<|\\{\\{|%)(?=[A-Za-z._~+/=-]{0,255}[0-9+/=])[A-Za-z0-9._~+/=-]{12,}"
+      "re": "(?<p>(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))(?:(?:proxy|PROXY|Proxy)-(?:authorization|AUTHORIZATION|Authorization)|(?:authorization|AUTHORIZATION|Authorization)|(?:x|X)-(?:api|API|Api)-(?:key|KEY|Key)|(?:api|API|Api)-(?:key|KEY|Key)|(?:x|X)-(?:auth|AUTH|Auth)-(?:token|TOKEN|Token))\\\\?[\\\"']?\\s{0,5}[:=]\\s{0,5}\\\\?[\\\"']?(?:(?:basic|BASIC|Basic|bearer|BEARER|Bearer|token|TOKEN|Token|digest|DIGEST|Digest|bot|BOT|Bot|apikey|APIKEY|Apikey)\\s+)?)(?!\\$|<|\\{\\{|%)(?=[A-Za-z._~+/=-]{0,255}[0-9+/=])[A-Za-z0-9._~+/=-]{12,}"
     },
     {
       "id": "bearer_token",
@@ -182,7 +182,7 @@
         "BEARER",
         "Bearer"
       ],
-      "re": "(?<p>(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m))(?:bearer|BEARER|Bearer)\\s+)(?!\\$|<|\\{\\{|%)(?=[A-Za-z._~+/=-]{0,255}[0-9])[A-Za-z0-9._~+/=-]{16,}"
+      "re": "(?<p>(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))(?:bearer|BEARER|Bearer)\\s+)(?!\\$|<|\\{\\{|%)(?=[A-Za-z._~+/=-]{0,255}[0-9])[A-Za-z0-9._~+/=-]{16,}"
     }
   ],
   "secretNames": {
@@ -211,13 +211,13 @@
     "assignment": {
       "_comment": [
         "secret_assignment, in text: {names} at an identifier boundary, an optional closing quote, backtick, or Markdown ** (the",
-        "quote escaped any number of times, as nested JSON writes it), : or = (also := and =>), an optional closing **, then the value: quoted (up to its quote, a newline, a comma, or a",
+        "quote escaped any number of times, as nested JSON writes it), : or = (also := and =>), an optional closing ** before a blank, then the value: quoted (up to its quote, a newline, a comma, or a",
         "backslash; not starting with a blank or + ) ; ] }, which follow a string that just closed: \"password: \" + pw), or bare",
         "(up to a blank, a quote, a comma, ; ) ] } or a backslash; not starting with = [ { ( or :).",
         "Only the value is replaced. A value that is already a placeholder is left alone."
       ],
       "id": "secret_assignment",
-      "re": "(?<p>(?:(?<![A-Za-z0-9])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[0-9;]m)|(?<=[a-z0-9])(?=[A-Z])){names}\\\\{0,31}(?:[\"'`]|\\*{1,2})?[^\\S\\n]{0,32}(?::=|=>|[:=])\\*{0,2}[^\\S\\n]{0,32}\\\\{0,31}[\"'`]?)(?!\\[REDACTED:)(?:(?<=\")[^\"\\s,\\\\+);\\]}][^\"\\n,\\\\]*|(?<=')[^'\\s,\\\\+);\\]}][^'\\n,\\\\]*|(?<=`)[^`\\s,\\\\+);\\]}][^`\\n,\\\\]*|(?<![\"'`])[^\\s\"'`,;\\\\)\\]}=\\[{(:][^\\s\"'`,;\\\\)\\]}]*)"
+      "re": "(?<p>(?:(?<![A-Za-z0-9])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m)|(?<=[a-z0-9])(?=[A-Z])){names}\\\\{0,31}(?:[\"'`]|\\*{1,2})?[^\\S\\n]{0,32}(?::=|=>|[:=])(?:\\*{1,2}(?=[^\\S\\n]))?[^\\S\\n]{0,32}\\\\{0,31}[\"'`]?)(?!\\[REDACTED:)(?:(?<=\")[^\"\\s,\\\\+);\\]}][^\"\\n,\\\\]*|(?<=')[^'\\s,\\\\+);\\]}][^'\\n,\\\\]*|(?<=`)[^`\\s,\\\\+);\\]}][^`\\n,\\\\]*|(?<![\"'`])[^\\s\"'`,;\\\\)\\]}=\\[{(:][^\\s\"'`,;\\\\)\\]}]*)"
     },
     "field": {
       "_comment": [
@@ -351,7 +351,7 @@
       "|": "\\|"
     },
     "command": {
-      "prefix": "(?:(?<![\\s\\S])|(?<=[;&|\\n(`{]))[^\\S\\n]*(?:(?:then|do|else|time|exec|command|nohup|!)[^\\S\\n]+)?(?:[A-Za-z_][A-Za-z0-9_]*=[^\\s;&|`()\"']*[^\\S\\n]+)*(?:sudo(?:[^\\S\\n]+-[A-Za-z]+(?:[^\\S\\n]+[^\\s;&|`)-][^\\s;&|`)]*)?)*[^\\S\\n]+)?(?:(?:/(?:usr/)?(?:local/)?bin/)?(?:ba|z|da|k)?sh[^\\S\\n]+-[A-Za-z]*c[^\\S\\n]+[\"']?)?(?:[^\\s;&|`()\"']*/)?",
+      "prefix": "(?:(?<![\\s\\S])|(?<=[;&|\\n(`{]))[^\\S\\n]*(?:(?:then|do|else|time|exec|command|nohup|!)[^\\S\\n]+)?(?:[A-Za-z_][A-Za-z0-9_]*=[^\\s;&|`(){\"']*[^\\S\\n]+)*(?:sudo(?:[^\\S\\n]+-[A-Za-z]+(?:[^\\S\\n]+[^\\s;&|`)-][^\\s;&|`)]*)?)*[^\\S\\n]+)?(?:(?:/(?:usr/)?(?:local/)?bin/)?(?:ba|z|da|k)?sh[^\\S\\n]+-[A-Za-z]*c[^\\S\\n]+[\"']?)?(?:[^\\s;&|`(){\"']*/)?",
       "unless": "(?![^;&|\\n)`({]*[^\\S\\n](?:--help|-h|--version)(?![^\\s;&|)`\"']))"
     },
     "paths": [
@@ -563,7 +563,7 @@
           "typeset"
         ],
         "re": [
-          "(?:env|printenv|set|export(?:[^\\S\\n]+-p)?)[^\\S\\n]*(?=[0-9]?[<>]|[;&|\\n)`\"']|(?![\\s\\S]))",
+          "(?:env|printenv|set|export(?:[^\\S\\n]+-p)?)[^\\S\\n]*(?=[0-9]{0,3}[<>]|[;&|\\n)`\"']|(?![\\s\\S]))",
           "(?:declare|typeset)[^\\S\\n]+-[A-Za-z]{0,8}[px][A-Za-z]{0,8}(?![A-Za-z0-9_-])"
         ],
         "examples": [
