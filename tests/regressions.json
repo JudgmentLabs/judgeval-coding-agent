@@ -1,0 +1,861 @@
+{
+  "_comment": [
+    "Every concrete case the Codex reviews of capture: sanitized described (rounds 1-7) and commit 7458959, one row each.",
+    "tests/test_regressions.py generates the regression matrix from these rows: each row in both layers (jq and Python, which",
+    "must agree), and each row of a tool route also through the real hook of every adapter (claude, codex, cursor, pi) and",
+    "then the sender's own pass over what the hook wrote. A rule table that regresses fails here, whichever table it is.",
+    "Columns:",
+    "  id       r<round>.<finding>-<name>; source: where the case comes from",
+    "  route    how the input reaches the layers:",
+    "             output      tool output text (command x)",
+    "             structured  tool output as a JSON value",
+    "             command     the tool input's command; the tool output is <<opaque>> unless output is given",
+    "             input       the tool input as a JSON value (file_path, a Codex patch as input, ...)",
+    "             transcript  a model event's tool call arguments, as transcript enrichment writes them (no hook sees it)",
+    "             label       extra event fields (agent_name)",
+    "  expect   unchanged   byte for byte, no record, not sensitive",
+    "           redacted    every generated secret gone (and every absent string), the event neither sensitive nor dropped",
+    "           blanked     sensitive: the text is gone, every generated secret with it (rule: the rule that blanked it)",
+    "           error       the rules failed (an invalid user regex): the text is dropped, every generated secret with it",
+    "           known_gap   an open adversarial case: only layer agreement is checked; a fix moves the row to redacted",
+    "  env, cfg, output, keep (strings that must stay), absent (literal secrets that must go), numbers (members made numbers),",
+    "  layers (the input serialized into a member of each name in turn: JSON nested in a string), encode (the text",
+    "  JSON-encoded n more times), wrap (the text put into wrap at {}).",
+    "  strings_only: only string values are checked for leaks (a number equal to an env value stays a number: round 3, finding 8).",
+    "  layers_only: a reason the row runs in the layers only, not through the adapters' hooks.",
+    "Fake secrets are placeholders, generated at run time: <<name>> or <<name:n>> (its first n characters). Names: opaque (mixed",
+    "case and digits), opaque2, alpha (letters only), phrase (four words), pin (4 digits), digits8, openai, anthropic, github,",
+    "github2, long (302 characters), huge (20000). <<filler:n>> is n characters of benign text."
+  ],
+  "rows": [
+    {
+      "id": "r1.1-structured-api-key-input",
+      "route": "input",
+      "input": {
+        "command": "deploy",
+        "api_key": "<<opaque>>"
+      },
+      "expect": "redacted"
+    },
+    {
+      "id": "r1.1-structured-password-output",
+      "route": "structured",
+      "input": {
+        "rows": 3,
+        "password": "<<alpha>>"
+      },
+      "expect": "redacted",
+      "keep": [
+        "\"rows\": 3"
+      ]
+    },
+    {
+      "id": "r1.1-secret-object-key",
+      "route": "structured",
+      "input": {
+        "<<github>>": true,
+        "count": 3
+      },
+      "expect": "redacted",
+      "keep": [
+        "\"count\": 3"
+      ]
+    },
+    {
+      "id": "r1.2-multiline-env-value",
+      "route": "output",
+      "input": "first <<opaque>> then <<opaque2>>",
+      "env": {
+        "SERVICE_TOKEN": "<<opaque>>\n<<opaque2>>"
+      },
+      "expect": "redacted"
+    },
+    {
+      "id": "r1.2-short-numeric-env-value",
+      "route": "output",
+      "input": "pin is <<digits8>> ok",
+      "env": {
+        "PIN_PASSWORD": "<<digits8>>"
+      },
+      "expect": "redacted",
+      "source": "values under limits.env min_length (8) are a documented limit"
+    },
+    {
+      "id": "r1.2-lowercase-env-value",
+      "route": "output",
+      "input": "db pass <<alpha>>",
+      "env": {
+        "DB_PASSWORD": "<<alpha>>"
+      },
+      "expect": "redacted"
+    },
+    {
+      "id": "r1.3-agent-name-label",
+      "route": "label",
+      "input": {
+        "agent_name": "task <<github>>"
+      },
+      "expect": "redacted"
+    },
+    {
+      "id": "r1.4-string-tool-input-env",
+      "route": "input",
+      "input": "env",
+      "expect": "blanked",
+      "rule": "env_dump"
+    },
+    {
+      "id": "r1.5-cat-credentials",
+      "route": "command",
+      "input": "cat credentials",
+      "expect": "blanked",
+      "rule": "credentials_file"
+    },
+    {
+      "id": "r1.5-usr-bin-env",
+      "route": "command",
+      "input": "/usr/bin/env",
+      "expect": "blanked",
+      "rule": "env_dump"
+    },
+    {
+      "id": "r1.5-env-0",
+      "route": "command",
+      "input": "env -0",
+      "expect": "blanked",
+      "rule": "env_dump"
+    },
+    {
+      "id": "r1.6-dotenv-with-token-suffix",
+      "route": "command",
+      "input": "cat .env.<<github>>",
+      "expect": "blanked",
+      "rule": "dotenv"
+    },
+    {
+      "id": "r1.9-member-expression",
+      "route": "output",
+      "input": "api_key = config2.api_key\ntoken = response_v2.token",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r1.10-npm-env-name",
+      "route": "output",
+      "input": "registry auth <<opaque>>",
+      "env": {
+        "npm_config_//registry.example.com/:_authToken": "<<opaque>>"
+      },
+      "expect": "redacted",
+      "layers_only": "dash, /bin/sh on Debian and Ubuntu, drops environment names that are not shell identifiers before jq or the sender runs: an open gap of the hook route"
+    },
+    {
+      "id": "r2.1-token-across-window",
+      "route": "output",
+      "input": "<<filler:16370>> <<openai>> <<filler:200>>",
+      "expect": "redacted"
+    },
+    {
+      "id": "r2.2-eight-digit-pin",
+      "route": "output",
+      "input": "PIN <<digits8>>",
+      "env": {
+        "PIN_PASSWORD": "<<digits8>>"
+      },
+      "expect": "redacted",
+      "source": "values under limits.env min_length (8) are a documented limit"
+    },
+    {
+      "id": "r2.3-passphrase-member",
+      "route": "structured",
+      "input": {
+        "password": "<<phrase>>"
+      },
+      "expect": "redacted"
+    },
+    {
+      "id": "r2.3-short-lowercase-member",
+      "route": "structured",
+      "input": {
+        "password": "<<alpha:5>>"
+      },
+      "expect": "redacted"
+    },
+    {
+      "id": "r2.4-tool-name-under-bad-rule",
+      "route": "label",
+      "input": {
+        "tool_name": "<<github>>"
+      },
+      "cfg": {
+        "redactPatterns": [
+          "("
+        ]
+      },
+      "expect": "error"
+    },
+    {
+      "id": "r2.6-colliding-secret-keys",
+      "route": "structured",
+      "input": {
+        "<<github>>": "first-value",
+        "<<github2>>": "second-value"
+      },
+      "expect": "redacted",
+      "keep": [
+        "first-value",
+        "second-value"
+      ]
+    },
+    {
+      "id": "r2.7-constant-references",
+      "route": "output",
+      "input": "api_key = API_KEY_2024\npassword = DEFAULT_PASSWORD2",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r2.10-env-name-with-bracket",
+      "route": "output",
+      "input": "v <<opaque>>",
+      "env": {
+        "WEIRD]_TOKEN": "<<opaque>>"
+      },
+      "expect": "redacted",
+      "layers_only": "dash, /bin/sh on Debian and Ubuntu, drops environment names that are not shell identifiers before jq or the sender runs: an open gap of the hook route"
+    },
+    {
+      "id": "r3.1-short-then-full-token",
+      "route": "output",
+      "input": "<<filler:9000>> <<openai:30>>... then <<openai>> <<filler:9000>>",
+      "expect": "redacted"
+    },
+    {
+      "id": "r3.3-long-quoted-refresh-token",
+      "route": "output",
+      "input": "{\"refresh_token\": \"<<long>>\"}",
+      "expect": "redacted"
+    },
+    {
+      "id": "r3.4-dollar-prefixed-literal",
+      "route": "structured",
+      "input": {
+        "password": "$special Password <<pin>>"
+      },
+      "expect": "redacted",
+      "absent": [
+        "$special Password"
+      ]
+    },
+    {
+      "id": "r3.5-percent-encoded-url-password",
+      "route": "output",
+      "input": "postgres://app:%40<<opaque>>@db/app",
+      "expect": "redacted"
+    },
+    {
+      "id": "r3.5-one-char-url-password",
+      "route": "output",
+      "input": "postgres://app:x@db/app",
+      "expect": "redacted",
+      "absent": [
+        "app:x@"
+      ]
+    },
+    {
+      "id": "r3.5-two-char-url-password",
+      "route": "output",
+      "input": "postgres://app:ab@db/app",
+      "expect": "redacted",
+      "absent": [
+        "app:ab@"
+      ]
+    },
+    {
+      "id": "r3.6-git-show-dotenv",
+      "route": "command",
+      "input": "git show HEAD:.env",
+      "expect": "blanked",
+      "rule": "dotenv"
+    },
+    {
+      "id": "r3.6-rg-credentials",
+      "route": "command",
+      "input": "rg . credentials",
+      "expect": "blanked",
+      "rule": "credentials_file"
+    },
+    {
+      "id": "r3.7-command-v-printenv",
+      "route": "command",
+      "input": "command -v printenv",
+      "output": "/usr/bin/printenv",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r3.7-which-printenv",
+      "route": "command",
+      "input": "which printenv",
+      "output": "/usr/bin/printenv",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r3.7-grep-printenv",
+      "route": "command",
+      "input": "grep printenv README.md",
+      "output": "use printenv to debug",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r3.8-env-value-also-a-number",
+      "route": "structured",
+      "input": {
+        "text": "id <<digits8>>",
+        "count": "<<digits8>>"
+      },
+      "numbers": [
+        "count"
+      ],
+      "env": {
+        "APP_SECRET": "<<digits8>>"
+      },
+      "expect": "redacted",
+      "keep": [
+        "\"count\": "
+      ],
+      "strings_only": true
+    },
+    {
+      "id": "r3.9-escaped-password-keeps-members",
+      "route": "output",
+      "input": {
+        "rows": [
+          1
+        ],
+        "password": "pa\\ss<<alpha>>",
+        "result": "kept-result"
+      },
+      "encode": 2,
+      "expect": "redacted",
+      "keep": [
+        "rows",
+        "kept-result"
+      ]
+    },
+    {
+      "id": "r4.1-env-value-under-password-key",
+      "route": "structured",
+      "input": {
+        "password": "<<opaque>>"
+      },
+      "env": {
+        "SERVICE_TOKEN": "<<opaque>>"
+      },
+      "expect": "redacted"
+    },
+    {
+      "id": "r4.3-long-unquoted-refresh-token",
+      "route": "output",
+      "input": "refresh_token=<<long>>",
+      "expect": "redacted"
+    },
+    {
+      "id": "r4.4-huge-structured-password",
+      "route": "structured",
+      "input": {
+        "password": "<<huge>>"
+      },
+      "expect": "error",
+      "source": "round 4 finding 4: fails closed"
+    },
+    {
+      "id": "r4.5-bash-c-env",
+      "route": "command",
+      "input": "bash -c \"env\"",
+      "expect": "blanked",
+      "rule": "env_dump"
+    },
+    {
+      "id": "r4.5-command-env",
+      "route": "command",
+      "input": "command env",
+      "expect": "blanked",
+      "rule": "env_dump"
+    },
+    {
+      "id": "r4.5-assignment-printenv",
+      "route": "command",
+      "input": "FOO=1 printenv",
+      "expect": "blanked"
+    },
+    {
+      "id": "r4.6-env-help",
+      "route": "command",
+      "input": "env --help",
+      "output": "Usage: env [OPTION]",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r4.6-env-version",
+      "route": "command",
+      "input": "env --version",
+      "output": "env (GNU coreutils) 9.4",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r4.6-quoted-semicolon",
+      "route": "command",
+      "input": "echo \"foo; printenv\"",
+      "output": "foo; printenv",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r4.7-multiline-quoted-password",
+      "route": "output",
+      "input": "password = \"<<alpha>>\n<<opaque>>\"",
+      "expect": "redacted"
+    },
+    {
+      "id": "r4.8-serialized-message-body",
+      "route": "output",
+      "input": {
+        "user": "bob",
+        "password": "<<opaque>>"
+      },
+      "layers": [
+        "body",
+        "message"
+      ],
+      "expect": "redacted"
+    },
+    {
+      "id": "r4.9-dotenv-backup",
+      "route": "command",
+      "input": "cat .env.local~",
+      "expect": "blanked",
+      "rule": "dotenv"
+    },
+    {
+      "id": "r4.9-cat-secrets",
+      "route": "command",
+      "input": "cat secrets",
+      "expect": "blanked",
+      "rule": "secret_file"
+    },
+    {
+      "id": "r5.1-console-log-then-code",
+      "route": "output",
+      "input": "console.log(\"password: \"+password);\nrunTests();\nconsole.log(\"all tests passed\");",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r5.2-env-unset",
+      "route": "command",
+      "input": "env --unset DEBUG",
+      "expect": "blanked",
+      "rule": "env_dump"
+    },
+    {
+      "id": "r5.2-env-chdir",
+      "route": "command",
+      "input": "env --chdir /tmp",
+      "expect": "blanked",
+      "rule": "env_dump"
+    },
+    {
+      "id": "r5.2-env-unset-printenv",
+      "route": "command",
+      "input": "env --unset DEBUG printenv",
+      "expect": "blanked"
+    },
+    {
+      "id": "r5.3-commit-message-mention",
+      "route": "command",
+      "input": "git commit -m \"fix gh auth token documentation\"",
+      "output": "[main 1a2b3c4] fix",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r5.3-search-pattern-mention",
+      "route": "command",
+      "input": "rg 'aws configure get' .",
+      "output": "docs/aws.md:3: aws configure get",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r5.5-multiline-password-with-blank",
+      "route": "output",
+      "input": "password=\"hello world\n<<alpha>>\"",
+      "expect": "known_gap",
+      "source": "round 5 finding 5, adversarial, non-blocking"
+    },
+    {
+      "id": "r5.6-deep-json-then-log-fields",
+      "route": "output",
+      "input": {
+        "user": "bob",
+        "password": "<<opaque>>"
+      },
+      "layers": [
+        "body",
+        "msg"
+      ],
+      "wrap": "INFO payload={} elapsed_ms=12",
+      "expect": "known_gap",
+      "source": "round 5 finding 6, adversarial, non-blocking"
+    },
+    {
+      "id": "r6.1-codex-patch-dotenv-hook",
+      "route": "input",
+      "input": {
+        "input": "*** Begin Patch\n*** Update File: .env\n@@\n-SESSION_COOKIE=<<opaque>>\n+SESSION_COOKIE=\n*** End Patch"
+      },
+      "expect": "blanked",
+      "rule": "dotenv"
+    },
+    {
+      "id": "r6.1-codex-patch-dotenv-transcript",
+      "route": "transcript",
+      "input": {
+        "input": "*** Begin Patch\n*** Update File: .env\n@@\n-SESSION_COOKIE=<<opaque>>\n+SESSION_COOKIE=\n*** End Patch"
+      },
+      "expect": "blanked",
+      "rule": "dotenv"
+    },
+    {
+      "id": "r6.2-print-password-args",
+      "route": "output",
+      "input": "print(\"password:\", password, \"done\")",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r6.3-aws-configure-get-region",
+      "route": "command",
+      "input": "aws configure get region",
+      "output": "us-east-1",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r6.3-gh-auth-token-help",
+      "route": "command",
+      "input": "gh auth token --help",
+      "output": "Print the auth token gh is configured to use",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r6.3-aws-configure-get-secret",
+      "route": "command",
+      "input": "aws configure get aws_secret_access_key",
+      "expect": "blanked",
+      "rule": "secret_cli"
+    },
+    {
+      "id": "r6.3-gh-auth-token",
+      "route": "command",
+      "input": "gh auth token",
+      "expect": "blanked",
+      "rule": "secret_cli"
+    },
+    {
+      "id": "c7458959-lc-all-printenv",
+      "route": "command",
+      "input": "LC_ALL=C printenv",
+      "expect": "blanked",
+      "source": "commit 7458959"
+    },
+    {
+      "id": "c7458959-sudo-u-printenv",
+      "route": "command",
+      "input": "sudo -u root printenv",
+      "expect": "blanked",
+      "source": "commit 7458959"
+    },
+    {
+      "id": "c7458959-lc-all-env",
+      "route": "command",
+      "input": "LC_ALL=C env",
+      "expect": "blanked",
+      "rule": "env_dump",
+      "source": "commit 7458959"
+    },
+    {
+      "id": "c7458959-sudo-e-u-printenv",
+      "route": "command",
+      "input": "sudo -E -u root printenv",
+      "expect": "blanked",
+      "source": "commit 7458959"
+    },
+    {
+      "id": "r7.1-rg-n-single-file",
+      "route": "output",
+      "input": "12:  password: \"<<alpha>>\"",
+      "expect": "redacted"
+    },
+    {
+      "id": "r7.1-rg-n-passphrase",
+      "route": "output",
+      "input": "12:  passphrase: \"<<phrase>>\"",
+      "expect": "redacted"
+    },
+    {
+      "id": "r7.1-grep-n-file-line",
+      "route": "output",
+      "input": "config.yml:12:password=\"<<alpha>>\"",
+      "expect": "redacted"
+    },
+    {
+      "id": "r7.1-grep-n-file-line-yaml",
+      "route": "output",
+      "input": "config/app.yml:7:  db_password: '<<phrase>>'",
+      "expect": "redacted"
+    },
+    {
+      "id": "r7.1-rg-context-line",
+      "route": "output",
+      "input": "config.yml-13-  secret: \"<<alpha>>\"",
+      "expect": "redacted"
+    },
+    {
+      "id": "r7.1-grep-r-file-only",
+      "route": "output",
+      "input": "./deploy/env.yml:  password: \"<<phrase>>\"",
+      "expect": "redacted"
+    },
+    {
+      "id": "r7.1-nl-numbered",
+      "route": "output",
+      "input": "    12\tpassword: \"<<alpha>>\"",
+      "expect": "redacted"
+    },
+    {
+      "id": "r7.1-cat-n-numbered-export",
+      "route": "output",
+      "input": "     3\texport DB_PASSWORD=\"<<phrase>>\"",
+      "expect": "redacted"
+    },
+    {
+      "id": "r7.1-grep-n-logging-line-kept",
+      "route": "output",
+      "input": "app.py:12:    print(\"password:\", password, \"done\")",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r7.2-kubectl-output-before-operand",
+      "route": "command",
+      "input": "kubectl get -o jsonpath=\"{.data.cookie}\" secret session | base64 -d",
+      "expect": "blanked",
+      "rule": "secret_cli"
+    },
+    {
+      "id": "r7.2-kubectl-output-before-get",
+      "route": "command",
+      "input": "kubectl -n prod -o yaml get secret db",
+      "expect": "blanked",
+      "rule": "secret_cli"
+    },
+    {
+      "id": "r7.2-gh-show-token-before-status",
+      "route": "command",
+      "input": "gh auth -t status",
+      "expect": "blanked",
+      "rule": "secret_cli"
+    },
+    {
+      "id": "r7.2-security-w-before-s",
+      "route": "command",
+      "input": "security find-generic-password -w -s x",
+      "expect": "blanked",
+      "rule": "secret_cli"
+    },
+    {
+      "id": "r7.2-help-before-subcommand",
+      "route": "command",
+      "input": "gh --help auth token",
+      "output": "Work seamlessly with GitHub",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r7.2-kubectl-help-before-operand",
+      "route": "command",
+      "input": "kubectl get --help secret db -o yaml",
+      "output": "Display one or many resources",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r7.2-kubectl-pods-output-before",
+      "route": "command",
+      "input": "kubectl get -o yaml pods",
+      "output": "apiVersion: v1",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r7.3-patch-bare-credentials",
+      "route": "input",
+      "input": {
+        "input": "*** Begin Patch\n*** Update File: credentials\n@@\n-SESSION_COOKIE=<<opaque>>\n+SESSION_COOKIE=\n*** End Patch"
+      },
+      "expect": "blanked",
+      "rule": "credentials_file"
+    },
+    {
+      "id": "r7.3-patch-bare-secrets",
+      "route": "input",
+      "input": {
+        "input": "*** Begin Patch\n*** Update File: secrets\n@@\n-SESSION_COOKIE=<<opaque>>\n*** End Patch"
+      },
+      "expect": "blanked",
+      "rule": "secret_file"
+    },
+    {
+      "id": "r7.3-transcript-bare-credentials",
+      "route": "transcript",
+      "input": {
+        "input": "*** Begin Patch\n*** Delete File: credentials\n*** End Patch\n-SESSION_COOKIE=<<opaque>>"
+      },
+      "expect": "blanked",
+      "rule": "credentials_file"
+    },
+    {
+      "id": "r7.3-unified-bare-secrets",
+      "route": "input",
+      "input": {
+        "patch": "--- a/secrets\n+++ b/secrets\n@@ -1 +1 @@\n-SESSION_COOKIE=<<opaque>>\n+x\n"
+      },
+      "expect": "blanked",
+      "rule": "secret_file"
+    },
+    {
+      "id": "r7.3-read-bare-credentials",
+      "route": "input",
+      "input": {
+        "file_path": "credentials"
+      },
+      "expect": "blanked",
+      "rule": "credentials_file"
+    },
+    {
+      "id": "r7.3-patch-mentions-credentials",
+      "route": "input",
+      "input": {
+        "input": "*** Begin Patch\n*** Update File: src/app.py\n@@\n-load('credentials')\n+load(path)\n*** End Patch"
+      },
+      "output": "Success",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r7.4-print-comma-in-string",
+      "route": "output",
+      "input": "print(\"username, password:\", username, password, \"done\")",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r7.4-paren-in-string",
+      "route": "output",
+      "input": "log(\"user (password:\", pw, \"ok\")",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r7.4-semicolon-in-string",
+      "route": "output",
+      "input": "logger.info(\"a; password:\", pw, \"b\"); run()",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r7.4-bracket-brace-in-string",
+      "route": "output",
+      "input": "console.log(\"[x] {password:\", pw, \"}\")",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r7.4-single-quotes",
+      "route": "output",
+      "input": "print('user, secret:', user, secret, 'done')",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r7.4-code-after-real-value",
+      "route": "output",
+      "input": "connect(host='db', password='<<alpha>>', port=5432)",
+      "expect": "redacted",
+      "keep": [
+        "port=5432"
+      ]
+    },
+    {
+      "id": "r7.4-apostrophe-before-value",
+      "route": "output",
+      "input": "# don't commit this, password = \"<<alpha>>\"",
+      "expect": "redacted"
+    },
+    {
+      "id": "r7.4-two-values-one-line",
+      "route": "output",
+      "input": "f(a, password=\"<<alpha>>\", api_token=\"<<phrase>>\")",
+      "expect": "redacted"
+    },
+    {
+      "id": "r7.5-json-key-text",
+      "route": "output",
+      "input": "{\"key\":\"<<opaque>>\"}",
+      "expect": "redacted"
+    },
+    {
+      "id": "r7.5-json-auth-text",
+      "route": "output",
+      "input": "{\"auth\": \"<<opaque>>\"}",
+      "expect": "redacted"
+    },
+    {
+      "id": "r7.5-key-member",
+      "route": "structured",
+      "input": {
+        "key": "<<opaque>>",
+        "id": 7
+      },
+      "expect": "redacted",
+      "keep": [
+        "\"id\": 7"
+      ]
+    },
+    {
+      "id": "r7.5-auth-member",
+      "route": "structured",
+      "input": {
+        "auth": "<<opaque>>"
+      },
+      "expect": "redacted"
+    },
+    {
+      "id": "r7.5-key-assignment",
+      "route": "output",
+      "input": "key = <<opaque>>\nAUTH=<<opaque2>>",
+      "expect": "redacted"
+    },
+    {
+      "id": "r7.5-key-flag",
+      "route": "output",
+      "input": "client --key=<<opaque>> --verbose",
+      "expect": "redacted"
+    },
+    {
+      "id": "r7.5-key-name-kept",
+      "route": "output",
+      "input": "{\"key\": \"name\", \"auth\": \"oauth2\"}",
+      "expect": "unchanged"
+    },
+    {
+      "id": "r7.5-key-identifier-kept",
+      "route": "structured",
+      "input": {
+        "key": "user_id_2024_v1",
+        "auth": "oauth2_client",
+        "sort_key": "created_at2"
+      },
+      "expect": "unchanged"
+    },
+    {
+      "id": "r7.5-suffix-keys-kept",
+      "route": "output",
+      "input": "sort_key=created2024 monkey=banana42x oauth=x1y2z3w4",
+      "expect": "unchanged"
+    }
+  ]
+}

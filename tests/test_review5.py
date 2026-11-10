@@ -166,11 +166,11 @@ class SecretCliPositionTests(unittest.TestCase):
     REAL = ["gh auth token", "aws configure get aws_secret_access_key", "aws configure export-credentials --profile p",
             "git credential fill", "gcloud auth print-access-token", "gcloud auth application-default print-access-token",
             "security find-generic-password -s x -w", "op read op://v/i/f", "vault read secret/x", "vault kv get secret/x",
-            "kubectl get secret -o yaml", "kubectl get secrets", "kubectl describe secret db", "kubectl get secret/db -o json",
-            "kubectl -n prod get secret db -o yaml", "aws --profile p configure get x", "sudo gh auth token", "bash -c 'gh auth token'",
+            "kubectl get secret -o yaml", "kubectl get secrets -o json", "kubectl describe secret db", "kubectl get secret/db -o json",
+            "kubectl -n prod get secret db -o yaml", "aws --profile p configure get aws_secret_access_key", "sudo gh auth token", "bash -c 'gh auth token'",
             "FOO=1 gh auth token", "env -u X gh auth token", "x=$(gh auth token)", 'echo "$(gh auth token)"', "cd repo && gh auth token",
-            "ls; kubectl get secret", "TOKEN=`gh auth token`", "/usr/local/bin/gh auth token", "cat <<'EOF'\nx\nEOF\ngh auth token",
-            "gh auth token | pbcopy", "timeout 5 vault kv get secret/x", "sudo -u root kubectl get secret", "cat <<EOF\ngh auth token\nEOF"]
+            "ls; kubectl get secret -o json", "TOKEN=`gh auth token`", "/usr/local/bin/gh auth token", "cat <<'EOF'\nx\nEOF\ngh auth token",
+            "gh auth token | pbcopy", "timeout 5 vault kv get secret/x", "sudo -u root kubectl get secret -o yaml", "cat <<EOF\ngh auth token\nEOF"]
     MENTIONS = ['git commit -m "fix gh auth token documentation"', "rg 'aws configure get' .", "echo gh auth token",
                 "grep -e 'gh auth token' x", "cat <<'EOF'\ngh auth token\nEOF", "git log --grep='kubectl get secret'",
                 "printf '%s\\n' 'vault read x'", "rg -g '*.md' 'op read'", "git commit -m 'docs: kubectl get secrets'",
