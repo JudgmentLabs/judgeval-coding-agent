@@ -23,8 +23,8 @@ import re
 import string
 import unittest
 
-from test_review4 import assert_parity
-from test_review_fixes import tool
+
+from support import assert_parity, tool
 
 from judgment_core import redact
 

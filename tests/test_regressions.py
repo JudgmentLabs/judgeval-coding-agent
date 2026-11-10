@@ -26,10 +26,8 @@ import sys
 import unittest
 from pathlib import Path
 
-from support import Sandbox, clean_env
+from support import Sandbox, assert_parity, clean_env, tool
 from test_matrix import model_call
-from test_review4 import assert_parity
-from test_review_fixes import tool
 
 from judgment_core import redact
 
@@ -222,13 +220,13 @@ def matrix_size() -> dict:
 class TableTests(unittest.TestCase):
     def test_rows_are_well_formed(self):
         bad = [row.get("id") for row in ROWS if row.get("expect") not in EXPECTS or row.get("route") not in TOOL_ROUTES + ("transcript", "label")
-               or not re.fullmatch(r"(r[1-9]\.[0-9]+|c[0-9a-f]{7})-[a-z0-9-]+", row.get("id", ""))
+               or not re.fullmatch(r"(r[1-9][0-9]?\.[0-9]+|c[0-9a-f]{7})-[a-z0-9-]+", row.get("id", ""))
                or (row.get("limit") is not None and row["limit"] not in LIMITS) or (row["expect"] == "leaks" and not row.get("limit"))]
         self.assertEqual(bad, [])
         self.assertEqual(len({row["id"] for row in ROWS}), len(ROWS))
 
     def test_every_round_has_rows(self):
-        self.assertEqual(matrix_size()["rounds"], ["c7458959", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9"])
+        self.assertEqual(matrix_size()["rounds"], ["c7458959", "r1", "r10", "r11", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9"])
 
     def test_every_limit_is_documented(self):
         """The README's Known limits list names every limit a row may cite, so a reviewer can tell a limit from a defect."""
