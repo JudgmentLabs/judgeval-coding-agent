@@ -283,6 +283,81 @@ class UserRuleTests(unittest.TestCase):
         self.assertEqual(out["tool_output"], "[REDACTED:openai_key]")
 
 
+class ProjectRuleTests(unittest.TestCase):
+    """tracing.json's redactCommands, redactNames, redactAllow, and redactDisable, in both layers. A bad entry fails closed."""
+
+    def both(self, events: list[dict], cfg: dict) -> list[dict]:
+        py, js = py_sanitize(events, cfg), jq_sanitize(events, cfg)
+        self.assertEqual(norm(py), norm(js))
+        return py
+
+    def test_redact_commands(self):
+        cfg = {"redactCommands": ["mycli[^\\S\\n]+show-secret"]}
+        out = self.both([tool_event("x", tool_input={"command": c}) for c in ("mycli show-secret db", "cd a && mycli show-secret", "mycli show-secret --help",
+                                                                             "echo 'mycli show-secret'", "mycli list")], cfg)
+        self.assertEqual([item.get("sensitive_rule") for item in out], ["custom_command", "custom_command", None, None, None])
+
+    def test_redact_names(self):
+        value = "pw" + SECRETS["github_token"]["random"][:10]
+        texts = [f"db_pin = {value}", f'{{"vaultPin": "{value}"}}', f"PIN: {value}"]
+        events = [tool_event(text) for text in texts] + [tool_event("ok", tool_input={"pin": value})]
+        out = self.both(events, {"redactNames": ["pin", "vault_pin"]})
+        self.assertEqual([item["tool_output"] for item in out[:3]], [f"db_pin = [REDACTED:secret_assignment]", '{"vaultPin": "[REDACTED:secret_assignment]"}',
+                                                                    "PIN: [REDACTED:secret_assignment]"])
+        self.assertEqual(out[3]["tool_input"], {"pin": "[REDACTED:secret_field]"})
+        self.assertEqual([item["tool_output"] for item in self.both([tool_event(text) for text in texts], {})], texts)
+
+    def test_redact_allow(self):
+        token = SECRETS["github_token"]["core"]
+        cfg = {"redactAllow": ["changeme", token]}
+        out = self.both([tool_event("password = changeme"), tool_event("password = hunter22"), tool_event("gh " + token),
+                         tool_event("ok", tool_input={"password": "changeme"})], cfg)
+        self.assertEqual([item["tool_output"] for item in out[:3]], ["password = changeme", "password = [REDACTED:secret_assignment]", "gh " + token])
+        self.assertEqual(out[3]["tool_input"], {"password": "changeme"})
+
+    def test_redact_disable(self):
+        token = SECRETS["github_token"]["core"]
+        cfg = {"redactDisable": ["secret_assignment", "github_token", "dotenv", "env_dump"]}
+        events = [tool_event("password = hunter22 " + token), tool_event("x", tool_input={"command": "cat .env"}),
+                  tool_event("x", tool_input={"command": "env"}), tool_event("x", tool_input={"command": "printenv HOME"}),
+                  tool_event("ok", tool_input={"password": "hunter22"})]
+        out = self.both(events, cfg)
+        self.assertEqual(out[0]["tool_output"], "password = hunter22 " + token)
+        self.assertEqual([item.get("sensitive_rule") for item in out[1:4]], [None, None, "printenv"])
+        self.assertEqual(out[4]["tool_input"], {"password": "[REDACTED:secret_field]"})
+
+    def test_bad_entries_fail_closed(self):
+        secret = SECRETS["github_token"]["core"]
+        event = tool_event("plain text " + secret, prompt="hello")
+        for cfg in ({"redactDisable": ["github_tokn"]}, {"redactNames": ["db pin"]}, {"redactNames": ["pin)|("]}, {"redactCommands": ["(unclosed"]}):
+            with self.subTest(cfg=cfg):
+                self.assertTrue(redact.ruleset(cfg).error)
+                for out in (py_sanitize([event], cfg)[0], jq_sanitize([event], cfg)[0]):
+                    self.assertTrue(out["redaction_error"])
+                    self.assertNotIn("tool_output", out)
+                    self.assertNotIn("prompt", out)
+
+    def test_non_strings_and_non_lists_are_skipped(self):
+        cfg = {"redactNames": {"a": "pin"}, "redactDisable": "dotenv", "redactAllow": [3, None, ""], "redactCommands": [7]}
+        out = self.both([tool_event("pin = abc"), tool_event("x", tool_input={"command": "cat .env"})], cfg)
+        self.assertEqual(out[0]["tool_output"], "pin = abc")
+        self.assertEqual(out[1]["sensitive_rule"], "dotenv")
+
+    def test_load_project_carries_every_key(self):
+        import tempfile
+        from pathlib import Path
+
+        settings = {"redactPatterns": ["A"], "redactPaths": ["b"], "redactCommands": ["c"], "redactNames": ["d"], "redactAllow": ["e"],
+                    "redactDisable": ["dotenv"]}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "tracing.json"
+            path.write_text(json.dumps({**settings, "redactNames": ["d", 4, ""]}))
+            loaded = optin.load_project(path)
+            self.assertEqual({key: loaded[key] for key in settings}, settings)
+            path.write_text("{")
+            self.assertEqual({key: optin.load_project(path)[key] for key in settings}, {key: [] for key in settings})
+
+
 class GateTests(unittest.TestCase):
     """A rule's needs only let the layers skip its regex. They must never change a result."""
 

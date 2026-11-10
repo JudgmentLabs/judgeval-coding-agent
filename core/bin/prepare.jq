@@ -117,7 +117,8 @@ def jp_word: ascii_downcase | split("_") | map("(?:" + . + "|" + ascii_upcase + 
 # and redactNames, and the project's redactPatterns, redactPaths, and redactCommands; redactAllow as a set. A disabled id no
 # built-in rule has, or a name that is not parts joined by _, fails closed, as a regex that does not compile does.
 def jp_rules($c; $r):
-  def setting($k): $c[$k] // [] | [.[]? | strings | if . == "" then empty else . end];
+  # A list setting's nonempty strings. Anything else, in the list or instead of it, is skipped, as optin.load_project does.
+  def setting($k): $c[$k] | if type == "array" then [.[] | strings | if . == "" then empty else . end] else [] end;
   (setting("redactDisable") | map({(.): true}) | add // {}) as $off
   | if [$off | keys_unsorted[] | if $r.ids[.] then empty else 1 end] != [] then error("redaction limit") else . end
   | setting("redactNames") as $names
