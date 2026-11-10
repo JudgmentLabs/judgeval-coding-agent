@@ -254,7 +254,7 @@ class SensitiveTests(unittest.TestCase):
 
 class UserRuleTests(unittest.TestCase):
     def test_redact_patterns_and_paths(self):
-        cfg = {"redactPatterns": ["ACME-[0-9]{6}", "TCK_[A-Z]{4}", 7, ""], "redactPaths": ["vault/*.json", "prod-*.cfg", 3]}
+        cfg = {"redactPatterns": ["ACME-[0-9]{6}", "TCK_[A-Z]{4}", ""], "redactPaths": ["vault/*.json", "prod-*.cfg"]}
         events = [
             tool_event("id ACME-123456 and TCK_ABCD done"),
             tool_event("", tool_input={"file_path": "/srv/app/vault/db.json"}),
@@ -337,8 +337,9 @@ class ProjectRuleTests(unittest.TestCase):
                     self.assertNotIn("tool_output", out)
                     self.assertNotIn("prompt", out)
 
-    def test_non_strings_and_non_lists_are_skipped(self):
-        cfg = {"redactNames": {"a": "pin"}, "redactDisable": "dotenv", "redactAllow": [3, None, ""], "redactCommands": [7]}
+    def test_non_strings_and_non_lists_in_trims_are_skipped(self):
+        """A trim that is not a list of strings trims nothing. A rule setting fails closed instead (test_review8)."""
+        cfg = {"redactDisable": "dotenv", "redactAllow": [3, None, ""]}
         out = self.both([tool_event("pin = abc"), tool_event("x", tool_input={"command": "cat .env"})], cfg)
         self.assertEqual(out[0]["tool_output"], "pin = abc")
         self.assertEqual(out[1]["sensitive_rule"], "dotenv")
@@ -351,9 +352,12 @@ class ProjectRuleTests(unittest.TestCase):
                     "redactDisable": ["dotenv"]}
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "tracing.json"
-            path.write_text(json.dumps({**settings, "redactNames": ["d", 4, ""]}))
+            path.write_text(json.dumps({**settings, "redactAllow": ["e", 4, ""]}))
             loaded = optin.load_project(path)
             self.assertEqual({key: loaded[key] for key in settings}, settings)
+            # A rule setting that is not a list of strings stays as written, so the rule set fails closed on it.
+            path.write_text(json.dumps({**settings, "redactNames": ["d", 4]}))
+            self.assertEqual(optin.load_project(path)["redactNames"], ["d", 4])
             path.write_text("{")
             self.assertEqual({key: optin.load_project(path)[key] for key in settings}, {key: [] for key in settings})
 
@@ -382,7 +386,7 @@ class GateTests(unittest.TestCase):
 
         rs = redact.ruleset()
         open_rs = redact.Ruleset(tuple(replace(rule, needs=(), pre=None) for rule in rs.patterns), rs.paths, rs.commands,
-                                 tuple(replace(rule, needs=(), pre=None) for rule in rs.members))
+                                 tuple(replace(rule, needs=(), pre=None) for rule in rs.members), allow=rs.allow)
         for text in self.corpus():
             self.assertEqual(redact.redact_text(text, rs, []), redact.redact_text(text, open_rs, []))
 

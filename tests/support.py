@@ -75,10 +75,6 @@ SECRETS = build_secrets()
 ENV_SECRET_NAME = "MY_CUSTOM_SERVICE" + "_TOKEN"
 
 
-def secret_cores() -> list[str]:
-    return [item["core"] for item in SECRETS.values()]
-
-
 def secret_blob() -> str:
     """Every fake secret, as an agent would see it in text, one per line."""
     lines = [item["text"] for rule, item in SECRETS.items() if rule not in ("env_value", "judgment_key")]

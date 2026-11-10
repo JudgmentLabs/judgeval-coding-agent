@@ -4,9 +4,9 @@
     python3 scripts/gen_redact.py           write core/bin/redact-compiled.json
     python3 scripts/gen_redact.py --check   fail when it is stale
 
-redact-compiled.json is the table with every regex composed (rules, the secret_cli rows as one prefix
-tree, path triggers, the patch-header target), the key kinds, the field classes as sets, and no
-comments, so jq compiles no composing code and walks no table on the agent's critical path.
+redact-compiled.json is the table with every built-in regex composed (each rule's alternatives behind
+the command prefix, path triggers, the name rules split around {names}), the field classes as sets, and
+no comments, so jq compiles no composing code and walks no table on the agent's critical path.
 judgment_core.redact derives it, and reads the source itself.
 """
 

@@ -302,11 +302,12 @@ class SensitiveOperandTests(unittest.TestCase):
 class PrintenvPositionTests(unittest.TestCase):
     """Finding 7: any mention of printenv blanked the turn."""
 
-    RUNS = ["printenv", "printenv HOME", "sudo printenv", "ls; printenv", "x=$(printenv)", "true && printenv PATH", "printenv | sort"]
+    RUNS = ["printenv", "printenv HOME", "sudo printenv", "ls; printenv", "x=$(printenv)", "true && printenv PATH", "printenv | sort",
+            "sh -c 'printenv'", "/usr/bin/printenv | sort", "command printenv"]
     MENTIONS = ["command -v printenv", "which printenv", "grep printenv README.md", 'echo "printenv"', "man printenv", "type printenv",
                 "rg -n 'printenv' src"]
-    # Known limit (wrapped-command): behind a wrapper other than a plain sudo, printenv is not seen.
-    WRAPPED = ["env -i A=1 printenv", "sh -c 'printenv'", "/usr/bin/printenv | sort", "command printenv"]
+    # Known limit (wrapped-command): behind a wrapper command.prefix does not read, printenv is not seen.
+    WRAPPED = ["env -i A=1 printenv"]
 
     def test_both_layers(self):
         commands = self.RUNS + self.MENTIONS + self.WRAPPED

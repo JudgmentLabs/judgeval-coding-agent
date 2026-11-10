@@ -61,7 +61,7 @@ CORPUS: list[tuple[str, str]] = [
 
 # Known limit (reference-value): a reference, placeholder, constant, or expression after a secret name is redacted like a
 # value. These cases change, and only by secret_assignment.
-OVER_REDACTED = {"get_token", "api_key env ref", "process.env ref", "placeholders", "github actions", "json numbers", "member expressions",
+OVER_REDACTED = {"get_token", "api_key env ref", "process.env ref", "placeholders", "github actions", "member expressions",
                  "versioned identifiers", "structured members"}
 
 
