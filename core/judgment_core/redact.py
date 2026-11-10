@@ -146,6 +146,7 @@ def compiled(table: Mapping | None = None) -> dict:
         "version": table["version"],
         "limits": {key: value for key, value in table["limits"].items() if key != "_comment"},
         "env": {"name_re": table["env"]["name_re"], "min_length": table["env"]["min_length"]},
+        "strict": [key for key, kind in table["settings"].items() if kind == "rule"],
         "patterns": patterns,
         "names": {
             "builtin": names_re(names["names"]),
@@ -285,8 +286,10 @@ def glob_re(glob: str) -> str:
     return "(?<![^\\n/:])" + "".join(table.get(char, char) for char in glob) + "(?![^\\n])"
 
 
-# The settings that add rules. One that is not a list of strings fails the rule set closed: the project asked for a rule.
-STRICT = ("redactPatterns", "redactPaths", "redactCommands", "redactNames")
+def settings() -> dict[str, str]:
+    """The redaction settings of tracing.json, each "rule" or "trim" (``settings`` in redact-rules.json). A rule setting
+    that is not a list of strings fails the rule set closed: the project asked for a rule."""
+    return {key: kind for key, kind in rules()["settings"].items() if key != "_comment"}
 
 
 def _setting(project: Mapping, key: str) -> list[str]:
@@ -332,7 +335,7 @@ def ruleset(project: Mapping | None = None) -> Ruleset:
     def failed(error: str) -> Ruleset:
         return Ruleset(built["patterns"], built["paths"], built["commands"], built["names"][1:], error=error)
 
-    bad = [key for key in STRICT if _malformed(project.get(key))]
+    bad = [key for key, kind in settings().items() if kind == "rule" and _malformed(project.get(key))]
     if bad:
         return failed(bad[0])
     if off - built["ids"]:
@@ -926,17 +929,21 @@ def outcome(event: Mapping) -> str:
     error wins over sensitive, which wins over redacted. Impossible: text in a sensitive or error event, or a label or
     tool name in an error event. Those raise ValueError.
     """
-    # tool_calls survive stripping as ids (and names, but not in an error event): checked on their own below.
+    # tool_calls survive stripping as ids (and names, but not in an error event): checked on their own.
     text = [key for key, value in event.items() if key != "tool_calls" and not field_class(key)["strip"] and value not in ("", None)]
+    calls = event.get("tool_calls") or []
+
+    def more_than(allowed: set) -> bool:
+        return not isinstance(calls, list) or any(not isinstance(call, Mapping) or set(call) - allowed for call in calls)
+
     if event.get("redaction_error"):
-        labels = [key for key in event if field_class(key)["redact"]]
-        names = [call for call in event.get("tool_calls") or [] if isinstance(call, Mapping) and "name" in call]
-        if text or labels or names:
-            raise ValueError(f"error event keeps {sorted(set(text + labels)) or 'tool names'}")
+        labels = [key for key in event if key != "tool_calls" and field_class(key)["redact"]]
+        if text or labels or more_than({"id"}):
+            raise ValueError(f"error event keeps {sorted(set(text + labels)) or 'tool calls'}")
         return "error"
     if event.get("sensitive"):
-        if text:
-            raise ValueError(f"sensitive event keeps {sorted(text)}")
+        if text or more_than({"id", "name"}):
+            raise ValueError(f"sensitive event keeps {sorted(text) or 'tool calls'}")
         return "sensitive"
     return "redacted" if event.get("redactions") else "clean"
 

@@ -122,7 +122,7 @@ def jp_rules($c; $r):
   # A list setting's nonempty strings. Anything else in a trim (redactAllow, redactDisable) is skipped.
   def setting($k): $c[$k] | if type == "array" then [.[] | strings | if . == "" then empty else . end] else [] end;
   def glob: "(?<![^\\n/:])" + ([explode[] | [.] | implode | $r.sensitive.glob[.] // .] | jp_join("")) + "(?![^\\n])";
-  if [("redactPatterns", "redactPaths", "redactCommands", "redactNames") as $k | $c[$k]
+  if [$r.strict[] as $k | $c[$k]
       | if . == null or (type == "array" and ([.[] | strings] | length) == length) then empty else 1 end] != [] then error("redaction limit") else . end
   | (setting("redactDisable") | map({(.): true}) | add // {}) as $off
   | if [$off | keys_unsorted[] | if $r.ids[.] then empty else 1 end] != [] then error("redaction limit") else . end

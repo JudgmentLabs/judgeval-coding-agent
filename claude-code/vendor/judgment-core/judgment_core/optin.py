@@ -11,6 +11,8 @@ import os
 import re
 from pathlib import Path
 
+from judgment_core import redact
+
 OFF_VALUES = {"0", "false", "no", "off"}
 
 
@@ -52,23 +54,12 @@ def resolve_capture(data: dict) -> str:
     return "sanitized"
 
 
-def _strings(value: object) -> list[str]:
-    return [item for item in value if isinstance(item, str) and item] if isinstance(value, list) else []
+# The project's redaction settings, as written: judgment_core.redact.ruleset reads them and says what each does. It is
+# the one place that decides what a malformed value means, so nothing here reshapes one.
+REDACT_KEYS = tuple(redact.settings())
 
 
-# The project's redaction settings (judgment_core.redact.ruleset says what each does). Each is a list of strings.
-REDACT_KEYS = ("redactPatterns", "redactPaths", "redactCommands", "redactNames", "redactAllow", "redactDisable")
-# The ones that add rules: one that is not a list of strings is kept as written, so redact.ruleset fails closed on it.
-_STRICT_KEYS = ("redactPatterns", "redactPaths", "redactCommands", "redactNames")
-
-
-def _setting(key: str, value: object) -> object:
-    if key in _STRICT_KEYS and value is not None and not (isinstance(value, list) and all(isinstance(item, str) for item in value)):
-        return value
-    return _strings(value)
-
-
-_CLOSED = {"enabled": False, "capture": "sanitized", "sessionDefault": "on", "environment": "production", **{key: [] for key in REDACT_KEYS}}
+_CLOSED = {"enabled": False, "capture": "sanitized", "sessionDefault": "on", "environment": "production", **{key: None for key in REDACT_KEYS}}
 
 
 def load_project(path: Path) -> dict:
@@ -88,7 +79,7 @@ def load_project(path: Path) -> dict:
         "capture": resolve_capture(data),
         "sessionDefault": "off" if session_default == "off" else "on",
         "environment": environment.strip(),
-        **{key: _setting(key, data.get(key)) for key in REDACT_KEYS},
+        **{key: data.get(key) for key in REDACT_KEYS},
     }
 
 
