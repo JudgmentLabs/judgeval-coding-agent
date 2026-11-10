@@ -17,8 +17,16 @@ The shared code lives in `core/`. Each plugin carries a copy of it under `<agent
    sh scripts/sync-core.sh
    ```
 
-3. Try the change in the agent you touched, against a Judgment project of your own. Each agent's README has a "Try it from the CLI" section.
-4. Open a pull request against `main`. CI checks that every vendored copy matches `core/` and that every manifest has the same version.
+3. Run the tests. They need `jq`, `python3`, and `node`, and use only the standard library:
+
+   ```bash
+   python3 -m unittest discover -s tests
+   ```
+
+   A change to `core/bin/` runs on every hook. Compare the hook's latency with `main` using `python3 tests/bench_hook.py <checkout>` on both checkouts.
+
+4. Try the change in the agent you touched, against a Judgment project of your own. Each agent's README has a "Try it from the CLI" section.
+5. Open a pull request against `main`. CI runs the tests, and checks that every vendored copy matches `core/` and that every manifest has the same version.
 
 A change to `codex/hooks/hooks.json` or `claude-code/hooks/hooks.json` makes Codex users approve the hooks again. Say so in the pull request.
 

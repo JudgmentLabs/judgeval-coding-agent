@@ -197,11 +197,20 @@ record() {
   n=$((n + 1))
 }
 
-if [ "$RAW" -eq 1 ]; then
+# jq reads the payload from a here-document, one fork fewer than a pipe, and the key from its
+# environment, never from argv, so redaction can replace the key's value wherever it appears.
+prepare() {
+  JUDGMENT_API_KEY=${JUDGMENT_API_KEY:-} jq -L "$HERE_HOOK" -c --slurpfile cfg "$opt" --arg mode "$mode" --arg root "$root" --arg model "" "$@" <<JUDGMENT_PAYLOAD
+$payload
+JUDGMENT_PAYLOAD
+}
+
+if [ "$RAW" -eq 1 ] && ! command -v jq >/dev/null 2>&1; then
+  # Without jq nothing can redact. Record the event's ids and times, and none of its text.
   compact=$(tr -d '[:space:]' < "$opt")
   case $compact in
     '{'*'}') ;;
-    *) exit 0 ;;  # empty or cut off: never fall back to full capture
+    *) exit 0 ;;  # empty or cut off: no opt-in
   esac
   case $compact in
     *'"enabled":false'*) exit 0 ;;
@@ -211,30 +220,36 @@ if [ "$RAW" -eq 1 ]; then
     *) mode=on ;;
   esac
   [ "$mode" = "on" ] || exit 0
-  case $compact in
-    *'"capture":"metadata"'*)
-      command -v jq >/dev/null 2>&1 || exit 0
-      payload=$(printf '%s' "$payload" | jq -L "$HERE_HOOK" -c --slurpfile cfg "$opt" --arg mode "$mode" --arg root "$root" --arg model "" \
-        'include "prepare"; judgment_prepare($cfg[0]; $mode; $root; $model)') || exit 0
-      ;;
-    *)
-      environment=production
-      case $compact in
-        *'"environment":"'*) environment=${compact#*'"environment":"'}; environment=${environment%%\"*} ;;
-      esac
-      judgment_json_escape "$root"
-      payload="${payload%\}},\"project_root\":\"$JR\",\"environment\":\"$environment\"}"
-      ;;
-  esac
-  record "$payload"
+  judgment_json_escape "$root"
+  line="{\"v\":1,\"capture\":\"sanitized\",\"redaction_error\":true,\"project_root\":\"$JR\",\"environment\":\"production\""
+  # Ids only. Labels such as tool_name and agent_type are free-form text that nothing here can redact.
+  # tests/test_hooks.py checks this list against the fields redact-rules.json never redacts.
+  for field in harness event session_id turn_id agent_id tool_call_id model provider; do
+    judgment_field "$payload" "$field" || continue
+    case $JR in
+      *[!A-Za-z0-9._:@/+\ -]*) continue ;;
+    esac
+    line="$line,\"$field\":\"$JR\""
+  done
+  for field in ts start_ts end_ts; do
+    case $payload in
+      *"\"$field\":"[0-9]*) value=${payload#*"\"$field\":"} ;;
+      *"\"$field\": "[0-9]*) value=${payload#*"\"$field\": "} ;;
+      *) continue ;;
+    esac
+    value=${value%%[!0-9]*}
+    [ -n "$value" ] && line="$line,\"$field\":$value"
+  done
+  record "$line}"
+elif [ "$RAW" -eq 1 ]; then
+  mapped=$(prepare 'include "prepare"; judgment_prepare($cfg[0]; $mode; $root; $model)') || exit 0
+  [ -n "$mapped" ] && record "$mapped"
 else
   command -v jq >/dev/null 2>&1 || exit 0
   if [ -n "$MAP" ]; then
-    mapped=$(printf '%s' "$payload" | jq -L "$HERE_HOOK" -c --arg event "$EVENT_NAME" --slurpfile cfg "$opt" \
-      --arg mode "$mode" --arg root "$root" --arg model "" -f "$MAP") || exit 0
+    mapped=$(prepare --arg event "$EVENT_NAME" -f "$MAP") || exit 0
   else
-    mapped=$(printf '%s' "$payload" | jq -L "$HERE_HOOK" -c --slurpfile cfg "$opt" --arg mode "$mode" --arg root "$root" --arg model "" \
-      'include "prepare"; judgment_prepare($cfg[0]; $mode; $root; $model)') || exit 0
+    mapped=$(prepare 'include "prepare"; judgment_prepare($cfg[0]; $mode; $root; $model)') || exit 0
   fi
   while IFS= read -r line; do
     [ -n "$line" ] && record "$line"
@@ -247,9 +262,64 @@ fi
 CORE=${HERE_HOOK%/*}
 PYTHONPATH="$CORE${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONPATH
-if command -v setsid >/dev/null 2>&1; then
-  setsid python3 -m judgment_core.flush >>"$STATE/flush.log" 2>&1 </dev/null &
-else
-  python3 -m judgment_core.flush >>"$STATE/flush.log" 2>&1 </dev/null &
+# The sender must outlive this hook: an agent can kill the hook's process group the moment it returns.
+#   launch -> acknowledged: /proc shows it in another process group (or gone) -> return
+# An ignored SIGHUP stays ignored across exec, so a hangup cannot reach the sender at any step. The hook waits for a
+# positive acknowledgement, at most about 40 ms, with builtins only (no fork, no sleep):
+#   job control (bash, zsh; macOS runs /bin/sh as bash): `&` puts the job in its own process group before it returns.
+#     The acknowledgement is immediate. Without /proc (macOS), job control itself is the guarantee.
+#   dash (no job control without a terminal): setsid(1) puts the sender in a new session a moment after the fork,
+#     usually well under a millisecond. Without setsid(1), the sender calls setsid() itself as Python starts.
+#   no acknowledgement in time: a new sender is started by bash with `set -m`, whose job control isolates it before
+#     bash exits.
+#     Without bash that is a residual risk: a sender killed with the agent leaves its turns on disk for the next one.
+# --detach makes the sender call setsid() itself once Python is up, wherever it was started.
+trap '' HUP
+LOG=$STATE/flush.log
+own=
+if read -r stat < "/proc/$$/stat" 2>/dev/null; then
+  set -- ${stat##*) }
+  own=$3
 fi
+# Succeeds once the sender is in another process group than this hook, or has exited.
+detached() {
+  read -r stat < "/proc/$sender/stat" 2>/dev/null || return 0
+  set -- ${stat##*) }
+  [ "$1" = Z ] || [ "$3" != "$own" ]
+}
+# Polls until detached, for 3-4 ticks of /proc/uptime (10 ms each), or fails at once without /proc.
+acknowledged() {
+  [ -n "$own" ] || return 1
+  read -r up rest < /proc/uptime || return 1
+  start=1${up%.*}${up#*.}
+  tries=0
+  while ! detached; do
+    tries=$((tries + 1))
+    if [ $((tries % 32)) -eq 0 ]; then
+      read -r up rest < /proc/uptime || return 1
+      [ $((1${up%.*}${up#*.} - start)) -lt 4 ] && [ "$tries" -lt 1000000 ] || return 1
+    fi
+  done
+}
+set -m 2>/dev/null || :
+case $- in
+  *m*)
+    python3 -m judgment_core.flush --detach >>"$LOG" 2>&1 </dev/null &
+    sender=$!
+    [ -z "$own" ] || acknowledged && exit 0
+    ;;
+  *)
+    if command -v setsid >/dev/null 2>&1; then
+      setsid python3 -m judgment_core.flush --detach >>"$LOG" 2>&1 </dev/null &
+    else
+      python3 -m judgment_core.flush --detach >>"$LOG" 2>&1 </dev/null &
+    fi
+    sender=$!
+    acknowledged && exit 0
+    ;;
+esac
+# Not acknowledged: the first sender may still be in this process group. If it gets out after all, two senders run;
+# they take turns on the flush lock.
+# `set -m` inside the script: started as `bash -m` without a terminal, bash turns job control off.
+command -v bash >/dev/null 2>&1 && bash -c 'set -m; python3 -m judgment_core.flush --detach >>"$1" 2>&1 </dev/null &' judgment-sender "$LOG" 2>/dev/null
 exit 0

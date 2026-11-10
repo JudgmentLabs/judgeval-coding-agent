@@ -1,0 +1,758 @@
+{
+  "_comment": [
+    "Secret redaction rules, shared by the hook (core/bin/prepare.jq) and the sender (judgment_core/redact.py). This file is the source.",
+    "scripts/gen_redact.py derives core/bin/redact-compiled.json (what jq loads: every regex composed) from it.",
+    "Redaction is by format, plus three short data lists: secretNames (a value after one of these names), sensitivePaths and",
+    "sensitiveCommands (a tool call that touches one blanks its turn). Nothing here parses code, shell, or patches.",
+    "Regexes use what Oniguruma and Python re agree on: (?<name>...) for a named group (p, when it is the first group: the text",
+    "it holds is kept, when it starts the match);",
+    "An identifier boundary also holds right after an escape a JSON string or a terminal writes before a word: \\n \\r \\t \\b \\f,",
+    "\\uXXXX, and the m that ends an ANSI color code ([1m, [32m, ;31m).",
+    "no ^ or $ (use (?<![\\s\\S]) and (?![\\s\\S]) for the ends of a whole value); [0-9] and [A-Za-z], not \\d and \\w;",
+    "no (?i), because Oniguruma compiles it slowly and jq compiles a regex on every call. Words are spelled lower, UPPER, and Capitalized.",
+    "Linear time: no repeat inside a repeat over characters both can take, and no two unbounded repeats over overlapping",
+    "characters in a row (tests/test_latency.py feeds every rule pathological text in both layers).",
+    "needs: a rule can match only text holding one of these literals. Both layers skip the regex otherwise. tests/test_redact.py checks it.",
+    "pre: a small regex every match also matches; both layers skip the rule's regex when the text does not match it."
+  ],
+  "version": 4,
+  "limits": {
+    "_comment": [
+      "Bounds on the work redaction does, so no input makes the hook slow (tests/test_latency.py).",
+      "A rule runs over windows of the unchanged text: each `window` characters long, one every `step`. jq's global match counts each",
+      "match's offset from the start of the string it is given, so short strings keep that linear. Text no longer than `window` is one",
+      "window. A match is kept from every window that holds it whole. A match that reaches the end of a window that is not the last is",
+      "seen whole by the next window when it starts at or after that window's start; when it starts before, it is longer than",
+      "window - step characters and the event fails closed. A rule marked whole runs over all of the text, and fails when the text holds",
+      "more than `most` of the literals it needs. More than `pairs` distinct finds in one event fail too, as does a prompt with more than",
+      "`mentions` @ signs. A failure drops the event's text, as an invalid user regex does.",
+      "A window of at most `dense` characters is matched globally (one regex compile; few enough matches that jq's offset counting",
+      "costs little). A longer one is matched one distinct match at a time, each one's copies blanked first, so repeats cost one search.",
+      "The hook allows `pairs` distinct finds an event: jq matches a long window once per distinct find. The sender's matching",
+      "is linear (one finditer per rule and window, its finds kept as spans of the unchanged text), so it allows `sender_pairs`.",
+      "JSON nested in a string deeper than its rules read (a string holding \\\\\\\" ) is decoded, up to `depth` layers; what each",
+      "layer holds is replaced as encoded where it sits. Deeper nesting, or a find whose encoding is not in the text, fails."
+    ],
+    "window": 16384,
+    "step": 8192,
+    "pairs": 128,
+    "mentions": 256,
+    "dense": 8192,
+    "sender_pairs": 4096,
+    "depth": 4
+  },
+  "settings": {
+    "_comment": [
+      "The redaction settings a project's tracing.json may hold, and what a malformed one does. Each is a list of strings.",
+      "rule: it adds rules, so a value that is not a list of strings fails the rule set closed (every event loses its text).",
+      "trim: it only takes rules or finds away, so anything that is not a nonempty string in a list is skipped.",
+      "Both layers, and every adapter that forwards a project's settings, read the keys from here."
+    ],
+    "redactPatterns": "rule",
+    "redactPaths": "rule",
+    "redactCommands": "rule",
+    "redactNames": "rule",
+    "redactAllow": "trim",
+    "redactDisable": "trim"
+  },
+  "patterns": [
+    {
+      "id": "private_key",
+      "needs": [
+        "PRIVATE KEY"
+      ],
+      "re": "-----BEGIN[A-Z0-9 ]{0,30}PRIVATE KEY(?: BLOCK)?-----(?:[\\s\\S]{0,16384}?-----END[A-Z0-9 ]{0,30}PRIVATE KEY(?: BLOCK)?-----|[A-Za-z0-9+/=\\s\\\\:,-]{0,16384})",
+      "whole": true,
+      "most": 32
+    },
+    {
+      "id": "jwt",
+      "needs": [
+        "eyJ"
+      ],
+      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))eyJ[A-Za-z0-9_-]{8,}\\.eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]*"
+    },
+    {
+      "id": "anthropic_key",
+      "needs": [
+        "sk-ant-"
+      ],
+      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))sk-ant-[A-Za-z0-9_-]{20,}"
+    },
+    {
+      "id": "openai_key",
+      "needs": [
+        "sk-"
+      ],
+      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))sk-(?:proj-|svcacct-|admin-)?(?=[A-Za-z0-9_-]{0,256}?[A-Za-z0-9_]{16})[A-Za-z0-9_-]{20,}",
+      "pre": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))sk-"
+    },
+    {
+      "id": "aws_access_key_id",
+      "needs": [
+        "AKIA",
+        "ASIA",
+        "ABIA",
+        "ACCA"
+      ],
+      "re": "(?:(?<![A-Za-z0-9])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))(?:AKIA|ASIA|ABIA|ACCA)[0-9A-Z]{16}(?![0-9A-Za-z])"
+    },
+    {
+      "id": "github_token",
+      "needs": [
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_"
+      ],
+      "re": "(?:(?<![A-Za-z0-9_])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))gh[pousr]_[A-Za-z0-9]{36,}"
+    },
+    {
+      "id": "github_pat",
+      "needs": [
+        "github_pat_"
+      ],
+      "re": "(?:(?<![A-Za-z0-9_])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))github_pat_[A-Za-z0-9_]{22,}"
+    },
+    {
+      "id": "slack_token",
+      "needs": [
+        "xoxa-",
+        "xoxb-",
+        "xoxp-",
+        "xoxr-",
+        "xoxs-",
+        "xoxe-"
+      ],
+      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))xox[abprse]-(?=[A-Za-z0-9-]{0,255}[0-9])[A-Za-z0-9-]{10,}"
+    },
+    {
+      "id": "slack_webhook",
+      "needs": [
+        "hooks.slack.com/services/"
+      ],
+      "re": "(?<p>hooks\\.slack\\.com/services/)[A-Za-z0-9/_-]{20,}"
+    },
+    {
+      "id": "google_api_key",
+      "needs": [
+        "AIza"
+      ],
+      "re": "(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"
+    },
+    {
+      "id": "stripe_key",
+      "needs": [
+        "sk_live_",
+        "sk_test_",
+        "rk_live_",
+        "rk_test_"
+      ],
+      "re": "(?:(?<![A-Za-z0-9_])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}"
+    },
+    {
+      "_comment": [
+        "Any nonempty password, %-encoded included. Only a whole placeholder before the @ is exempt (${X}, $X, ****, xxx, password, ...)."
+      ],
+      "id": "url_password",
+      "needs": [
+        "://"
+      ],
+      "re": "(?<p>(?:(?<![A-Za-z0-9+.-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))[A-Za-z][A-Za-z0-9+.-]{1,20}://[^\\s/:@'\\\"<>\\[\\]]{0,128}:)(?!(?:\\[REDACTED:[A-Za-z0-9_:.-]{1,128}\\](?:#[0-9]{1,6})?|\\$\\{[A-Za-z_][A-Za-z0-9_]{0,127}\\}|\\$[A-Za-z_][A-Za-z0-9_]{0,127}|\\{\\{\\s{0,4}[.A-Za-z_][A-Za-z0-9_.]{0,127}\\s{0,4}\\}\\}|%[A-Za-z_][A-Za-z0-9_]{0,63}%|\\*{1,64}|x{3,64}|X{3,64}|password|PASSWORD|Password|pass|PASS|Pass|passwd|PASSWD|Passwd|pwd|PWD|Pwd|secret|SECRET|Secret|changeme|CHANGEME|Changeme)@)[^\\s/@'\\\"<>]+(?=@)"
+    },
+    {
+      "id": "authorization_header",
+      "needs": [
+        "uthorization",
+        "UTHORIZATION",
+        "-key",
+        "-Key",
+        "-KEY",
+        "-token",
+        "-Token",
+        "-TOKEN"
+      ],
+      "re": "(?<p>(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))(?:(?:proxy|PROXY|Proxy)-(?:authorization|AUTHORIZATION|Authorization)|(?:authorization|AUTHORIZATION|Authorization)|(?:x|X)-(?:api|API|Api)-(?:key|KEY|Key)|(?:api|API|Api)-(?:key|KEY|Key)|(?:x|X)-(?:auth|AUTH|Auth)-(?:token|TOKEN|Token))\\\\?[\\\"']?\\s{0,5}[:=]\\s{0,5}\\\\?[\\\"']?(?:(?:basic|BASIC|Basic|bearer|BEARER|Bearer|token|TOKEN|Token|digest|DIGEST|Digest|bot|BOT|Bot|apikey|APIKEY|Apikey)\\s+)?)(?!\\$|<|\\{\\{|%)(?=[A-Za-z._~+/=-]{0,255}[0-9+/=])[A-Za-z0-9._~+/=-]{12,}"
+    },
+    {
+      "id": "bearer_token",
+      "needs": [
+        "bearer",
+        "BEARER",
+        "Bearer"
+      ],
+      "re": "(?<p>(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))(?:bearer|BEARER|Bearer)\\s+)(?!\\$|<|\\{\\{|%)(?=[A-Za-z._~+/=-]{0,255}[0-9])[A-Za-z0-9._~+/=-]{16,}"
+    }
+  ],
+  "secretNames": {
+    "_comment": [
+      "A value after one of these names is redacted, whatever it looks like. A name is lowercase parts joined by _; it matches",
+      "each part lower, UPPER, or Capitalized, joined by _, -, ., or nothing (api_key: API_KEY, api-key, apiKey, ApiKey, apikey).",
+      "It counts at an identifier boundary: after no letter or digit (db_password, --token), or at a camelCase hump (smtpPassword).",
+      "Left out on purpose: key and auth (sort_key, s3 object keys, oauth), which only format rules redact, and authorization (authorization_header and bearer_token read headers).",
+      "A project adds names with redactNames in .judgment/tracing.json."
+    ],
+    "names": [
+      "password",
+      "passwd",
+      "pwd",
+      "passphrase",
+      "secret",
+      "secret_key",
+      "client_secret",
+      "token",
+      "api_key",
+      "access_key",
+      "private_key",
+      "credential",
+      "credentials"
+    ],
+    "assignment": {
+      "_comment": [
+        "secret_assignment, in text: {names} at an identifier boundary, an optional closing quote, backtick, or Markdown ** (the",
+        "quote escaped any number of times, as nested JSON writes it), : or = (also := and =>), an optional closing ** before a blank, then the value: quoted (up to its quote, a newline, a comma, or a",
+        "backslash; not starting with a blank or + ) ; ] }, which follow a string that just closed: \"password: \" + pw), or bare",
+        "(up to a blank, a quote, a comma, ; ) ] } or a backslash; not starting with = [ { ( or :).",
+        "Only the value is replaced. A value that is already a placeholder is left alone."
+      ],
+      "id": "secret_assignment",
+      "re": "(?<p>(?:(?<![A-Za-z0-9])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m)|(?<=[a-z0-9])(?=[A-Z])){names}\\\\{0,31}(?:[\"'`]|\\*{1,2})?[^\\S\\n]{0,32}(?::=|=>|[:=])(?:\\*{1,2}(?=[^\\S\\n]))?[^\\S\\n]{0,32}\\\\{0,31}[\"'`]?)(?!\\[REDACTED:)(?:(?<=\")[^\"\\s,\\\\+);\\]}][^\"\\n,\\\\]*|(?<=')[^'\\s,\\\\+);\\]}][^'\\n,\\\\]*|(?<=`)[^`\\s,\\\\+);\\]}][^`\\n,\\\\]*|(?<![\"'`])[^\\s\"'`,;\\\\)\\]}=\\[{(:][^\\s\"'`,;\\\\)\\]}]*)"
+    },
+    "field": {
+      "_comment": [
+        "secret_field, in structured values: a member whose key ends in one of the names (at the same boundaries) loses its",
+        "nonempty string value. It runs over the compact JSON of the event's text fields in both layers, as jq writes it."
+      ],
+      "id": "secret_field",
+      "re": "(?<p>(?<=[{,])\"[^\"\\\\\\n]{0,128}?(?:(?<![A-Za-z0-9])|(?<=[a-z0-9])(?=[A-Z])){names}\":\")(?!\\[REDACTED:)(?:[^\"\\\\]|\\\\.)+(?:(?=\")|(?![\\s\\S]))",
+      "needs_suffix": "\":\""
+    },
+    "allow": [
+      "str",
+      "string",
+      "String",
+      "None",
+      "null",
+      "nil",
+      "undefined",
+      "bool",
+      "boolean",
+      "int",
+      "true",
+      "false",
+      "True",
+      "False",
+      "Optional[str"
+    ]
+  },
+  "env": {
+    "_comment": [
+      "The value of each environment variable whose name looks secret is replaced literally wherever it appears: the whole value,",
+      "and each line of a value that spans lines. name_re runs over the names, one per line, and matches each secret name whole.",
+      "A name matches when it is JUDGMENT_API_KEY, or holds KEY, TOKEN, SECRET, PASSWORD, PASSWD, CREDENTIAL, PRIVATE, or AUTH",
+      "(not as part of AUTHOR, KEYBOARD, KEYMAP, KEYCHAIN, MONKEY, TURKEY), and does not end in a suffix that names a location or a",
+      "setting (_PATH, _FILE, _DIR, _SOCK, _URL, _HOST, _ID, _TOKENS, _LIMIT, ...): those values are paths, hosts, ids, or numbers.",
+      "Any value (or line) of min_length or more characters with something other than whitespace in it is replaced, whatever its",
+      "shape. A shorter one is not: replacing every 4-character run such as 2024 in all text would destroy ordinary text. Known limit.",
+      "Each event also records env_found: {name, field} for every such value its raw text held, whatever rule replaced it",
+      "and even when its rules failed. The sender reads it to know which env values the hook's text depended on."
+    ],
+    "name_re": "(?<![^\\n])(?:JUDGMENT_API_KEY(?![^\\n])|(?=[^\\n]*?(?:token|TOKEN|Token|secret|SECRET|Secret|password|PASSWORD|Password|passwd|PASSWD|Passwd|credential|CREDENTIAL|Credential|private|PRIVATE|Private|auth(?!or(?!iz))|AUTH(?!OR(?!IZ))|Auth(?!or(?!iz))|(?<![Mm][Oo][Nn])(?<![Tt][Uu][Rr])(?:key|KEY|Key)(?![Bb][Oo][Aa][Rr][Dd]|[Mm][Aa][Pp]|[Cc][Hh][Aa][Ii][Nn])))(?![^\\n]*(?:_PATH|_path|_FILE|_file|_DIR|_dir|_SOCK|_sock|_SOCKET|_socket|_HOST|_host|_PORT|_port|_URL|_url|_URI|_uri|_ID|_id|_MODE|_mode|_TYPE|_type|_NAME|_name|_USER|_user|_USERNAME|_username|_ENABLED|_enabled|_DISABLED|_disabled|_TIMEOUT|_timeout|_TOKENS|_tokens|_LIMIT|_limit|_REGION|_region)(?![^\\n]))[^\\n]+)",
+    "min_length": 8
+  },
+  "sensitive": {
+    "_comment": [
+      "A tool call that runs one of these commands, or touches one of these paths, blanks its whole turn (commands are checked first).",
+      "keys: the tool input members (at any depth) whose strings are read: paths, commands, and patches (Codex's apply_patch",
+      "arrives as {\"input\": patch}). A string tool input is a command.",
+      "Paths: every string under those keys, and each @word of the prompt, is split into tokens at the split characters.",
+      "A token is sensitive when its last component (after the last / or :) matches one of a rule's globs and none of its",
+      "! globs. A glob holding a / matches the token's last components (.kube/config). * is any run of characters but / and :,",
+      "? one such character. A token is a mention: a read, a write, a patch header, or a word in a patch's body all count. Over-blanking",
+      "is the accepted direction: it loses one turn's text and never leaks.",
+      "Commands: each command string is matched on its own. A command counts at the start of the string or after ; & | ( { `",
+      "or a newline, behind an optional sudo (command.prefix). One with --help, -h, or --version before the next ; & | ( ) { `",
+      "or newline does not count (command.unless): the help check stops where a command can start, so it is linear.",
+      "glob: how a project's redactPaths glob becomes a regex, one character at a time. There * is any run of characters, / included."
+    ],
+    "keys": {
+      "file_path": "path",
+      "filePath": "path",
+      "path": "path",
+      "paths": "path",
+      "file": "path",
+      "files": "path",
+      "filename": "path",
+      "notebook_path": "path",
+      "target_file": "path",
+      "target_notebook": "path",
+      "absolute_path": "path",
+      "relative_path": "path",
+      "source": "path",
+      "destination": "path",
+      "command": "command",
+      "cmd": "command",
+      "commands": "command",
+      "script": "command",
+      "input": "patch",
+      "patch": "patch",
+      "diff": "patch"
+    },
+    "split": [
+      " ",
+      "\t",
+      "\n",
+      "\r",
+      "\f",
+      "\u000b",
+      "\"",
+      "'",
+      "`",
+      ";",
+      "|",
+      "&",
+      "<",
+      ">",
+      "(",
+      ")",
+      "="
+    ],
+    "mention": {
+      "split": [
+        " ",
+        "\t",
+        "\n",
+        "\r",
+        "\f",
+        "\u000b",
+        "("
+      ],
+      "end": [
+        ",",
+        ";",
+        ")"
+      ]
+    },
+    "glob": {
+      "*": "[^\\n]*",
+      "?": "[^\\n]",
+      ".": "\\.",
+      "\\": "\\\\",
+      "+": "\\+",
+      "^": "\\^",
+      "$": "\\$",
+      "(": "\\(",
+      ")": "\\)",
+      "[": "\\[",
+      "]": "\\]",
+      "{": "\\{",
+      "}": "\\}",
+      "|": "\\|"
+    },
+    "command": {
+      "prefix": "(?:(?<![\\s\\S])|(?<=[;&|\\n(`{]))[^\\S\\n]*(?:(?:then|do|else|time|exec|command|nohup|!)[^\\S\\n]+)?(?:[A-Za-z_][A-Za-z0-9_]*=[^\\s;&|`(){\"']*[^\\S\\n]+)*(?:sudo(?:[^\\S\\n]+-[A-Za-z]+(?:[^\\S\\n]+[^\\s;&|`)-][^\\s;&|`)]*)?)*[^\\S\\n]+)?(?:(?:/(?:usr/)?(?:local/)?bin/)?(?:ba|z|da|k)?sh[^\\S\\n]+-[A-Za-z]*c[^\\S\\n]+[\"']?)?(?:[^\\s;&|`(){\"']*/)?",
+      "unless": "(?![^;&|\\n)`({]*[^\\S\\n](?:--help|-h|--version)(?![^\\s;&|)`\"']))"
+    },
+    "paths": [
+      {
+        "id": "dotenv",
+        "globs": [
+          ".env*",
+          "?*.env",
+          "!.env.example",
+          "!.env.sample",
+          "!.env.template",
+          "!.env.dist",
+          "!.env.default",
+          "!.env.defaults",
+          "!.env.schema",
+          "!example.env"
+        ],
+        "examples": [
+          ".env",
+          ".env.local",
+          "app/.env.production",
+          ".envrc",
+          "HEAD:.env",
+          ".env~",
+          ".env.local~",
+          "prod.env",
+          ".env-prod"
+        ],
+        "not": [
+          ".env.example",
+          "src/environment.ts",
+          "docs/env.md",
+          "example.env"
+        ]
+      },
+      {
+        "id": "ssh_private_key",
+        "globs": [
+          "id_rsa*",
+          "id_dsa*",
+          "id_ecdsa*",
+          "id_ed25519*",
+          "!*.pub"
+        ],
+        "examples": [
+          "id_rsa",
+          "~/.ssh/id_ed25519",
+          "id_ecdsa_sk"
+        ],
+        "not": [
+          "id_rsa.pub",
+          "~/.ssh/known_hosts"
+        ]
+      },
+      {
+        "id": "key_file",
+        "globs": [
+          "?*.pem",
+          "?*.key",
+          "?*.p12",
+          "?*.pfx",
+          "?*.jks",
+          "?*.keystore",
+          "?*.ppk"
+        ],
+        "examples": [
+          "server.pem",
+          "certs/tls.key",
+          "store.p12"
+        ],
+        "not": [
+          "src/key.py",
+          "docs/pem.md",
+          ".key"
+        ]
+      },
+      {
+        "id": "credentials_file",
+        "globs": [
+          "credentials",
+          "*credentials.json",
+          "*credentials.yaml",
+          "*credentials.yml",
+          "*credentials.toml",
+          "*credentials.ini",
+          "*credentials.csv",
+          "*credentials.xml",
+          "*credentials.db"
+        ],
+        "examples": [
+          "~/.aws/credentials",
+          "gcp-credentials.json",
+          "credentials"
+        ],
+        "not": [
+          "src/credentials.py",
+          "docs/credentials.md"
+        ]
+      },
+      {
+        "id": "secret_file",
+        "globs": [
+          "secret",
+          "secrets",
+          "Secret",
+          "Secrets",
+          "SECRET",
+          "SECRETS",
+          "secret.*",
+          "secrets.*",
+          "client_secret*.json",
+          "*.tfvars",
+          "!*.py",
+          "!*.pyi",
+          "!*.js",
+          "!*.ts",
+          "!*.tsx",
+          "!*.jsx",
+          "!*.go",
+          "!*.rs",
+          "!*.rb",
+          "!*.java",
+          "!*.kt",
+          "!*.php",
+          "!*.cs",
+          "!*.swift",
+          "!*.md",
+          "!*.rst",
+          "!*.c",
+          "!*.h",
+          "!*.cpp",
+          "!*.hpp",
+          "!*.html",
+          "!*.css",
+          "!*.scss",
+          "!*.vue",
+          "!*.svelte",
+          "!*.sql",
+          "!*.sh"
+        ],
+        "examples": [
+          "secrets.yaml",
+          "config/secret.json",
+          "secrets",
+          "prod.tfvars",
+          "client_secret_123.apps.json",
+          "SECRETS"
+        ],
+        "not": [
+          "src/secrets.py",
+          "lib/secret_manager.ts",
+          "docs/secrets.md",
+          "src/secrets.sh",
+          "db/secrets.sql"
+        ]
+      },
+      {
+        "id": "auth_file",
+        "globs": [
+          ".netrc",
+          "_netrc",
+          ".npmrc",
+          ".pypirc",
+          ".git-credentials",
+          ".pgpass",
+          ".htpasswd",
+          ".dockercfg",
+          "auth.json",
+          ".boto",
+          ".s3cfg",
+          ".vault-token",
+          ".docker/config.json",
+          ".kube/config",
+          "kubeconfig"
+        ],
+        "examples": [
+          ".netrc",
+          ".npmrc",
+          "~/.docker/config.json",
+          "~/.kube/config",
+          "kubeconfig"
+        ],
+        "not": [
+          "src/config.json",
+          "docs/netrc.md"
+        ]
+      },
+      {
+        "id": "proc_environ",
+        "globs": [
+          "proc/*/environ"
+        ],
+        "examples": [
+          "/proc/self/environ"
+        ],
+        "not": [
+          "/proc/self/status"
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "id": "env_dump",
+        "needs": [
+          "env",
+          "set",
+          "export",
+          "declare",
+          "typeset"
+        ],
+        "re": [
+          "(?:env|printenv|set|export(?:[^\\S\\n]+-p)?)[^\\S\\n]*(?=[0-9]{0,3}[<>]|[;&|\\n)`\"']|(?![\\s\\S]))",
+          "(?:declare|typeset)[^\\S\\n]+-[A-Za-z]{0,8}[px][A-Za-z]{0,8}(?![A-Za-z0-9_-])"
+        ],
+        "examples": [
+          "env",
+          "printenv",
+          "set",
+          "export",
+          "export -p",
+          "declare -x",
+          "declare -p FOO",
+          "env | grep KEY",
+          "env > out.txt"
+        ],
+        "not": [
+          "env FOO=1 make",
+          "set -e",
+          "export FOO=1",
+          "which env",
+          "grep set README.md"
+        ]
+      },
+      {
+        "id": "printenv",
+        "needs": [
+          "printenv"
+        ],
+        "re": [
+          "printenv(?![A-Za-z0-9_-])"
+        ],
+        "examples": [
+          "printenv GITHUB_TOKEN"
+        ],
+        "not": [
+          "printenv --help",
+          "which printenv",
+          "grep printenv README.md",
+          "man printenv"
+        ]
+      },
+      {
+        "id": "secret_cli",
+        "needs": [
+          "gh",
+          "aws",
+          "kubectl",
+          "gcloud",
+          "op",
+          "security",
+          "vault",
+          "heroku",
+          "git",
+          "az",
+          "doppler",
+          "pass",
+          "bw"
+        ],
+        "re": [
+          "gh[^\\S\\n]+auth[^\\S\\n]+token(?![A-Za-z0-9_-])",
+          "aws[^\\S\\n]+configure[^\\S\\n]+(?:get|export-credentials)(?![A-Za-z0-9_-])",
+          "aws[^\\S\\n]+sts[^\\S\\n]+(?:get-session-token|get-federation-token|assume-role(?:-with-saml|-with-web-identity)?)(?![A-Za-z0-9_-])",
+          "aws[^\\S\\n]+(?:ecr|ecr-public)[^\\S\\n]+get-login-password(?![A-Za-z0-9_-])",
+          "aws[^\\S\\n]+secretsmanager[^\\S\\n]+(?:get-secret-value|batch-get-secret-value)(?![A-Za-z0-9_-])",
+          "aws[^\\S\\n]+ssm[^\\S\\n]+(?:get-parameters?|get-parameters-by-path)(?![A-Za-z0-9_-])",
+          "aws[^\\S\\n]+codeartifact[^\\S\\n]+get-authorization-token(?![A-Za-z0-9_-])",
+          "kubectl[^\\S\\n]+(?:get|describe)[^\\S\\n]+secrets?(?![A-Za-z0-9_-])",
+          "gcloud[^\\S\\n]+auth[^\\S\\n]+(?:application-default[^\\S\\n]+)?(?:print-access-token|print-identity-token)(?![A-Za-z0-9_-])",
+          "gcloud[^\\S\\n]+secrets[^\\S\\n]+versions[^\\S\\n]+access(?![A-Za-z0-9_-])",
+          "az[^\\S\\n]+account[^\\S\\n]+get-access-token(?![A-Za-z0-9_-])",
+          "az[^\\S\\n]+keyvault[^\\S\\n]+secret[^\\S\\n]+(?:show|download)(?![A-Za-z0-9_-])",
+          "op[^\\S\\n]+(?:read|inject|item[^\\S\\n]+get)(?![A-Za-z0-9_-])",
+          "security[^\\S\\n]+find-(?:generic|internet)-password(?![A-Za-z0-9_-])",
+          "vault[^\\S\\n]+(?:read|kv[^\\S\\n]+get|print[^\\S\\n]+token)(?![A-Za-z0-9_-])",
+          "heroku[^\\S\\n]+(?:config|auth:token)(?![A-Za-z0-9_-])",
+          "git[^\\S\\n]+credential[^\\S\\n]+fill(?![A-Za-z0-9_-])",
+          "doppler[^\\S\\n]+secrets(?![A-Za-z0-9_-])",
+          "(?:pass|gopass)[^\\S\\n]+show(?![A-Za-z0-9_-])",
+          "bw[^\\S\\n]+get(?![A-Za-z0-9_-])"
+        ],
+        "examples": [
+          "gh auth token",
+          "aws configure get aws_secret_access_key",
+          "aws configure export-credentials --profile p",
+          "kubectl get secret db -o yaml",
+          "kubectl describe secrets",
+          "gcloud auth print-access-token",
+          "op read op://v/i/f",
+          "op item get x --reveal",
+          "security find-generic-password -w -s x",
+          "vault kv get secret/x",
+          "vault read secret/x",
+          "heroku config",
+          "aws secretsmanager get-secret-value --secret-id x",
+          "git credential fill"
+        ],
+        "not": [
+          "gh auth token --help",
+          "gh auth status",
+          "kubectl get pods",
+          "aws s3 ls",
+          "op --version",
+          "which gh",
+          "vault status",
+          "grep 'gh auth token' notes.md"
+        ]
+      }
+    ]
+  },
+  "fields": {
+    "_comment": [
+      "The class of each event field. A field not listed is text.",
+      "strip: kept when an event loses its text (metadata capture at the hook, a sensitive event, a rule error, a blanked turn).",
+      "redact: secrets in it are replaced. metadata: kept by metadata capture once transcripts were read.",
+      "drop_when_blanked: dropped from the events a blanked turn's spans are built from, so a free-form name cannot become a span name."
+    ],
+    "classes": {
+      "keep": {
+        "strip": true,
+        "redact": false,
+        "metadata": true
+      },
+      "transport": {
+        "strip": true,
+        "redact": false,
+        "metadata": false
+      },
+      "label": {
+        "strip": true,
+        "redact": true,
+        "metadata": true
+      },
+      "text_label": {
+        "strip": false,
+        "redact": true,
+        "metadata": false,
+        "drop_when_blanked": true
+      },
+      "text": {
+        "strip": false,
+        "redact": true,
+        "metadata": false
+      }
+    },
+    "of": {
+      "v": "keep",
+      "kind": "keep",
+      "name": "keep",
+      "harness": "keep",
+      "harness_version": "keep",
+      "event": "keep",
+      "session_id": "keep",
+      "turn_id": "keep",
+      "message_id": "keep",
+      "ts": "keep",
+      "start_ts": "keep",
+      "end_ts": "keep",
+      "duration_ms": "keep",
+      "cwd": "keep",
+      "project_root": "keep",
+      "environment": "keep",
+      "capture": "keep",
+      "model": "keep",
+      "provider": "keep",
+      "usage": "keep",
+      "interrupted": "keep",
+      "hidden": "keep",
+      "agent_id": "keep",
+      "agent_type": "label",
+      "agent_name": "text_label",
+      "bind_agent": "keep",
+      "bind_task": "keep",
+      "background": "keep",
+      "task_pending": "keep",
+      "tool_name": "label",
+      "tool_call_id": "keep",
+      "parent_call_id": "keep",
+      "is_error": "keep",
+      "export_fp": "keep",
+      "export_project": "keep",
+      "export_url": "keep",
+      "export_org": "keep",
+      "redactions": "keep",
+      "redaction_error": "keep",
+      "sensitive": "keep",
+      "sensitive_rule": "keep",
+      "sensitive_trigger": "label",
+      "_id": "transport",
+      "transcript_path": "transport",
+      "agent_transcript_path": "transport",
+      "env_found": "keep"
+    }
+  }
+}

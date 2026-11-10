@@ -1,7 +1,7 @@
 include "prepare";
 
 def trimmed:
-  if type == "string" then gsub("^\\s+|\\s+$"; "") else "" end;
+  if type == "string" then jp_trim else "" end;
 
 def base:
   {
@@ -19,7 +19,7 @@ def with_agent($id):
 
 def agent_text:
   if (.tool_response.content | type) == "array" then
-    [.tool_response.content[]? | .text // empty] | join("\n")
+    [.tool_response.content[]? | .text // empty | if type == "string" then . else tojson end] | jp_join("\n")
   elif (.tool_response.content | type) == "string" then
     .tool_response.content
   else
@@ -27,10 +27,10 @@ def agent_text:
   end;
 
 def command_name($prompt):
-  ($prompt | gsub("^\\s+"; "")) as $p
-  | if $p | test("^/judgment:(on|off|status)$") then ($p | split(":")[1])
-    elif $p | test("^/judgment-tracing:(on|off|status)$") then ($p | split(":")[1])
-    elif $p | test("^/judgment(\\s+(on|off|status))?$") then (($p | split(" "))[1] // "status")
+  ($prompt | jp_ltrim) as $p
+  | if $p | jp_test("^/judgment:(on|off|status)$") then ($p | split(":")[1])
+    elif $p | jp_test("^/judgment-tracing:(on|off|status)$") then ($p | split(":")[1])
+    elif $p | jp_test("^/judgment(\\s+(on|off|status))?$") then (($p | split(" "))[1] // "status")
     else "" end;
 
 # Cursor also runs installed Claude Code hooks. Its own plugin traces that session.
