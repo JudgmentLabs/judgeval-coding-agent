@@ -32,7 +32,8 @@ from hermes_support import (
     state_files,
     subagent_turn,
 )
-from support import ENV_SECRET_NAME, REPO, SECRETS, Sandbox, leaks, wait_for, whole_leaks
+from hermes_support import Sandbox
+from support import ENV_SECRET_NAME, REPO, SECRETS, leaks, wait_for, whole_leaks
 
 ENV_FILE = "DATABASE_URL=postgres://app:" + "Lq" + "9xT" * 4 + "@db/app\nFEATURE_FLAG=on\n"
 GIT_SHA = "4f1e2d3c9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d"
@@ -334,12 +335,14 @@ class Redaction(HermesCase):
         self.assertIn("[REDACTED:openai_key]", self.sb.state_text())
 
     def test_a_cut_long_result_drops_the_partial_token(self):
+        """The cap comes after redaction: a token across the cap is redacted whole, then the cut drops the partial word."""
         core = load_plugin().core
         token = SECRETS["github_token"]["core"]
         text = "x " * (core.TEXT_CAP // 2 - 10) + token + " tail"
-        out = core.fit(text, core._rules((), ()), [])
+        gate = core.Gate("sanitized", (), (), (), str(self.sb.state), ())
+        out = core.prepare({"event": "tool", "tool_output": text}, gate)["tool_output"]
         self.assertTrue(out.endswith(core.CUT_MARK))
-        self.assertNotIn(token[:12], out)
+        self.assertNotIn(token[4:12], out)
 
 
 class OptOut(HermesCase):
@@ -513,7 +516,8 @@ class Latency(HermesCase):
         sid = new_session_id()
         with plugin_env(self.sb, JUDGMENT_STATE_DIR=str(blocker / "state")) as (plugin, ctx):
             self.assertEqual(fire_all(ctx, simple_turn(sid, "hi", path="a", result="b", answer="c").events, plugin), [])
-            self.assertGreater(plugin.errors["count"], 0)
+            # Callbacks touch no file, so they never see the error; the writer thread and the helper do, off Hermes's threads.
+            self.assertEqual(plugin.errors["count"], 0)
 
 
 SENDER = textwrap.dedent(
@@ -529,7 +533,12 @@ SENDER = textwrap.dedent(
     start = time.perf_counter()
     fire_all(ctx, turn.events, plugin)
     took = (time.perf_counter() - start) * 1000
-    print(json.dumps({{"ms": took, "mode": plugin.spool.mode, "helper": plugin.spool.proc.pid if plugin.spool.proc else 0}}), flush=True)
+    # The hand-off to the helper is asynchronous; a real turn lasts long enough for it. Wait for it (at most 5 s),
+    # then die: what Hermes handed over must survive the kill.
+    handed = time.perf_counter()
+    while not plugin.spool.handed_over() and time.perf_counter() - handed < 5:
+        time.sleep(0.001)
+    print(json.dumps({{"ms": took, "handoff_ms": (time.perf_counter() - handed) * 1000, "helper": plugin.spool.proc.pid if plugin.spool.proc else 0}}), flush=True)
     time.sleep(60)
     """
 )
@@ -558,7 +567,6 @@ class Sender(HermesCase):
         os.killpg(proc.pid, signal.SIGKILL)  # Hermes and its whole group die the moment the turn ends
         proc.wait(timeout=10)
         info = json.loads(line)
-        self.assertEqual(info["mode"], "helper")
         self.assertGreater(info["helper"], 0)
         # The helper runs in its own session, so the kill missed it; it folds the turn and starts the sender.
         self.assertNotEqual(os.getpgid(info["helper"]) if _alive(info["helper"]) else -1, proc.pid)

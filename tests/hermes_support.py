@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 from support import REPO
+from support import Sandbox as _Sandbox
 
 PLUGIN_DIR = REPO / "hermes"
 VENDOR_CORE = PLUGIN_DIR / "vendor" / "judgment-core"
@@ -39,6 +40,16 @@ def load_plugin(name: str = "judgment_tracing_under_test"):
     sys.modules[full] = module
     spec.loader.exec_module(module)
     return module
+
+
+class Sandbox(_Sandbox):
+    """The shared sandbox, made hermetic: a closed ``.judgment/tracing.json`` at its top ends every opt-in
+    walk-up there, so a stray file above the temp dir (such as /tmp/.judgment/tracing.json) changes nothing."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        (self.dir / ".judgment").mkdir()
+        (self.dir / ".judgment" / "tracing.json").write_text('{"enabled": false}\n')
 
 
 class FakeCtx:
@@ -73,7 +84,7 @@ def plugin_env(sb, **extra):
     env = {**sb.env, "TERMINAL_CWD": str(sb.project), **extra}
     env = {key: value for key, value in env.items() if value is not None}
     with mock.patch.dict(os.environ, env, clear=True):
-        plugin.tracker = plugin.Tracker(plugin.core.resolve, version="0.19.0")
+        plugin.tracker = plugin.Tracker(plugin.core.resolve, version="0.19.0", needs_alias=plugin.core.needs_alias)
         plugin.spool = plugin.spool_for()
         plugin.core.forget_cache()  # a fresh Hermes process
         clock = plugin.now_ms
@@ -83,8 +94,7 @@ def plugin_env(sb, **extra):
         try:
             yield plugin, ctx
         finally:
-            plugin._drain_at_exit()  # what a callback handed to the drainer, as at Hermes's exit
-            plugin.spool.close()  # the helper folds every frame it was sent, then exits
+            plugin.spool.drain()  # as at Hermes's exit, then wait for the helper to publish everything and exit
             plugin.now_ms = clock
 
 

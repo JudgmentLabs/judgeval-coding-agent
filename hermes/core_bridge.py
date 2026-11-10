@@ -1,40 +1,50 @@
 """Every call from the Hermes plugin into judgment_core goes through this module.
 
 judgment_core is vendored next to this file (``vendor/judgment-core``, synced by scripts/sync-core.sh).
-When the core's opt-in or redaction API changes, this is the one file to update.
+When the core's opt-in or redaction API changes, this is the one file to update. It uses only:
 
-    resolve(key, workspace)  -> Gate | None    opt-in walk-up, kill switch, session mode, capture,
-                                               rules and secret values, export stamp. None = untraced.
-    prepare(record, gate)     -> record        the hook layer of the capture policy:
-                                               metadata strips text, sanitized redacts, full keeps it.
-                                               Then the stamps record() adds. See PREPARE below.
-    spool(record, state)                       one inbox file, as core/bin/judgment-hook record() writes it
+    optin     find_optin, load_project, tracing_forced_off, state_dir, session_override_path,
+              read_session_mode, write_session_mode, session_status, safe_id
+    redact    ruleset, env_secrets, sanitize_event, scrub_value, strip_text, RedactionLimit
+    config    load_credentials, DEFAULT_API_URL
+
+The functions, in the order a record meets them:
+
+    resolve(key, workspace)   -> Gate | None   (in Hermes, at turn start) opt-in walk-up, kill switch, session
+                                               mode, capture, rules, secret values, and the stamps, already
+                                               checked by redaction. None = untraced.
+    needs_alias(gate, id)     -> bool          (in Hermes) would redaction change this tool call id?
+    prepare(record, gate)     -> record        (in the helper) the capture policy. See PREPARE.
+    stage(record, state, name), publish(state, name)
+                                               (in the helper) the inbox file written aside, then linked in
     launch_sender(state, env)                  the core flusher, detached, never waited on
     command(action, cwd, key) -> str           /judgment on|off|status
     copy_session_mode(key, alias)              a rotated session id keeps its conversation's on/off
 
-PREPARE, for one record, as plain stages (each takes and returns a record):
+PREPARE, one record, plain stages. The record arrives with every value whole: the spooler dropped a
+value too large to redact whole and listed it in ``omitted``, and never cut one.
 
-    sanitized:  fit    every text longer than TEXT_CAP is redacted, then cut (never cut, then redacted)
-                keys   every dict key in a text field redacted; a key that then collides gets "#2", "#3"
-                text   core redact.sanitize_event: sensitive tool calls blank the text, the rest redacted
-                meta   the metadata strings Hermes or a model chose (model, provider, tool name and call id,
-                       child role, cwd) redacted too; the ids the plugin routes by are Hermes's own
-                audit  ``redactions`` counts every placeholder, in text, keys, and metadata
-    metadata:   strip, then meta and audit
-    full:       cut only
+    sanitized:  sense    an omitted input (prompt, tool input, tool calls) makes the record sensitive:
+                         its sensitivity can't be checked, so its turn is blanked, as for a .env read
+                core     redact.sanitize_event on the complete values: sensitive tool calls lose their
+                         text, every string and key is redacted, secret-named members go whole
+                meta     the metadata the core keeps as is (model, provider, cwd, ...), which in Hermes a
+                         model or provider chose, redacted with the same rules
+                cut      only now, each text longer than TEXT_CAP cut before its last partial word
+                stamp    capture, ts, and the gate's stamps (checked by redaction at resolve)
+    metadata:   core (metadata), meta, cut, stamp
+    full:       cut, stamp
+A stage that fails drops the record's text whole (the core's redaction_error), never sends it raw.
 """
 
 from __future__ import annotations
 
 import functools
 import hashlib
-import itertools
 import json
 import os
 import subprocess
 import sys
-import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -47,32 +57,33 @@ from judgment_core import __version__ as CORE_VERSION  # noqa: E402
 from judgment_core import optin, redact  # noqa: E402
 from judgment_core.config import DEFAULT_API_URL, load_credentials  # noqa: E402
 
-__all__ = ["CORE", "CORE_VERSION", "Gate", "warm", "resolve", "prepare", "spool", "launch_sender", "command", "copy_session_mode",
-           "state_dir", "forced_off", "TEXT_CAP", "CUT_MARK"]
+__all__ = ["CORE", "CORE_VERSION", "Gate", "warm", "resolve", "needs_alias", "prepare", "stage", "publish", "launch_sender", "command",
+           "copy_session_mode", "state_dir", "forced_off", "TEXT_CAP", "CUT_MARK", "OVERSIZE_RULE"]
 
-# The most text one field keeps. Spans cut at 64 KB anyway.
+# The most text one field keeps, cut only after redaction. Spans cut at 64 KB anyway.
 TEXT_CAP = 64 * 1024
-# A secret cut by the redaction window's end sits in the window's last MARGIN characters, which are dropped.
-MARGIN = 4 * 1024
 CUT_MARK = "… [truncated]"
-# Metadata strings that come from Hermes's provider, the model, or Hermes's config, not from the plugin.
-UNTRUSTED_META = ("model", "provider", "tool_name", "tool_call_id", "agent_type", "agent_name", "parent_call_id", "cwd", "harness_version")
-_NO_PATTERNS = redact.Ruleset((), (), ())
+# The fields sensitivity is read from (redact.tool_texts and the prompt's @mentions).
+INPUTS = ("prompt", "tool_input", "tool_calls")
+OVERSIZE_RULE = "too_large_to_check"
+# Fields the core keeps as is, because other harnesses set them. In Hermes a provider, a model, or
+# Hermes's config chose them. tool_call_id is replaced in Hermes when redaction would change it
+# (tracker "Tool call id"); it is checked again here.
+UNTRUSTED_META = ("model", "provider", "cwd", "harness_version", "tool_call_id", "parent_call_id")
+EXPORT = ("export_fp", "export_project", "export_url", "export_org")
 
 
 @dataclass(frozen=True)
 class Gate:
     """One turn's opt-in decision: plain data, everything prepare needs, resolved once at turn start."""
 
-    root: str
     capture: str  # full | sanitized | metadata, as optin.resolve_capture decides
-    environment: str
     patterns: tuple  # the project's redactPatterns
     paths: tuple  # the project's redactPaths
-    secrets: tuple  # ((name, value), ...) secret env values, longest first
-    home: str
-    stamp: tuple  # (("export_fp", ...), ...) or ()
+    secrets: tuple  # ((name, value), ...) secret env values, longest first. Crosses only the pipe.
     state: str
+    stamps: tuple  # ((field, value), ...) environment, project_root, export_*: each checked by redaction
+    withheld: tuple = ()  # stamps redaction changed (environment, project_root: kept redacted; export: dropped), for the helper's log
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -80,8 +91,8 @@ class Gate:
     @classmethod
     def from_json(cls, data: dict) -> "Gate":
         pairs = lambda items: tuple(tuple(item) for item in items)  # noqa: E731
-        return cls(data["root"], data["capture"], data["environment"], tuple(data["patterns"]), tuple(data["paths"]),
-                   pairs(data["secrets"]), data["home"], pairs(data["stamp"]), data["state"])
+        return cls(data["capture"], tuple(data["patterns"]), tuple(data["paths"]), pairs(data["secrets"]), data["state"],
+                   pairs(data["stamps"]), tuple(data.get("withheld") or ()))
 
 
 @functools.lru_cache(maxsize=64)
@@ -96,9 +107,9 @@ def rules(gate: Gate) -> redact.Ruleset:
 
 def warm() -> None:
     """Compile the redaction rules now, at plugin load, so the first turn does not pay for it. Writes nothing."""
-    _rules((), ())
+    rs = _rules((), ())
     redact.env_secrets({})
-    redact.sensitive({"tool_input": {"path": "x"}}, _rules((), ()))
+    redact.scrub_value("warm", rs, [])
 
 
 def forced_off(env: dict | None = None) -> bool:
@@ -113,16 +124,40 @@ def _fingerprint(key: str) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
 
 
-def _stamp(env: dict) -> tuple:
+def _export(env: dict) -> list:
     """What the hook records about the destination: the key's fingerprint, never the key."""
     creds = load_credentials(env)
     key, project = creds.get("JUDGMENT_API_KEY", ""), creds.get("JUDGMENT_PROJECT_ID", "")
     if not key or not project:
-        return ()
+        return []
     pairs = [("export_fp", _fingerprint(key)), ("export_project", project), ("export_url", creds.get("JUDGMENT_API_URL") or DEFAULT_API_URL)]
     if creds.get("JUDGMENT_ORG_ID"):
         pairs.append(("export_org", creds["JUDGMENT_ORG_ID"]))
-    return tuple(pairs)
+    return pairs
+
+
+def stamps(environment: str, root: str, export: list, rs: redact.Ruleset, secrets: list) -> tuple[tuple, tuple]:
+    """The stamps every record carries, as they may be stored: (kept, withheld names).
+
+    environment and project_root are labels once stored: redacted like text. The flusher reads
+    project_root to load the project's own rules for its second pass; a redacted root makes it use the
+    built-in rules, and the project's rules already ran here. The export stamp routes the turn, so it
+    is never redacted: a stamp redaction would change is withheld whole and the turn is not sent.
+    """
+    wanted = {"environment": environment, "project_root": root, **dict(export)}
+    try:
+        if rs.error:
+            raise redact.RedactionLimit(rs.error)
+        clean = {name: redact.scrub_value(value, rs, secrets) for name, value in wanted.items()}
+    except redact.RedactionLimit:
+        return (), tuple(wanted)
+    kept = [(name, clean[name]) for name in ("environment", "project_root")]
+    withheld = [name for name in ("environment", "project_root") if clean[name] != wanted[name]]
+    if any(clean[name] != value for name, value in export):
+        withheld.append("export")
+    else:
+        kept += export
+    return tuple(kept), tuple(withheld)
 
 
 # What a turn start reads from files, kept GATE_TTL seconds so a turn start makes no file syscall in
@@ -141,7 +176,7 @@ def forget_cache() -> None:
 
 
 def _base(workspace: str, env: dict) -> dict | None:
-    """The per-workspace part of a gate: the project, its rules, the destination stamp, the secret values."""
+    """The per-workspace part of a gate: the project, its rules, the stamps, the secret values."""
     found = optin.find_optin(workspace)
     if found is None:
         return None
@@ -150,11 +185,12 @@ def _base(workspace: str, env: dict) -> dict | None:
     project = optin.load_project(file)
     if not project["enabled"]:
         return {"file": file, "version": version, "off": True}
-    capture = project["capture"]
     api_key = load_credentials(env).get("JUDGMENT_API_KEY", "")
-    # Metadata capture keeps names a model or provider chose, so it redacts them with the same values.
-    secrets = tuple(redact.env_secrets(env, api_key)) if capture != "full" else ()
-    return {"root": root, "file": file, "version": version, "project": project, "secrets": secrets, "stamp": _stamp(env), "state": optin.state_dir(env)}
+    secrets = tuple(redact.env_secrets(env, api_key))
+    rs = _rules(tuple(project["redactPatterns"]), tuple(project["redactPaths"]))
+    kept, withheld = stamps(project["environment"], str(root), _export(env), rs, list(secrets))
+    return {"root": root, "file": file, "version": version, "project": project, "secrets": secrets, "stamps": kept, "withheld": withheld,
+            "state": optin.state_dir(env)}
 
 
 def _version(file) -> tuple:
@@ -198,148 +234,92 @@ def resolve(key: str, workspace: str, env: dict | None = None) -> Gate | None:
     if base is None or base.get("off") or _session_mode(base, key, env, now) != "on":
         return None
     project = base["project"]
-    return Gate(str(base["root"]), project["capture"], project["environment"], tuple(project["redactPatterns"]), tuple(project["redactPaths"]),
-                base["secrets"], str(env.get("HOME") or ""), base["stamp"], str(base["state"]))
+    return Gate(project["capture"], tuple(project["redactPatterns"]), tuple(project["redactPaths"]), base["secrets"], str(base["state"]),
+                base["stamps"], base["withheld"])
+
+
+def needs_alias(gate, value: str) -> bool:
+    """Would the gate's redaction change this id? Then its records carry a replacement instead (tracker "Tool call id")."""
+    if not value or not isinstance(gate, Gate) or gate.capture == "full":
+        return False
+    rs = rules(gate)
+    if rs.error:
+        return True
+    try:
+        return redact.scrub_value(value, rs, list(gate.secrets)) != value
+    except redact.RedactionLimit:
+        return True
 
 
 # ---- prepare: plain stages -----------------------------------------------------------------------
 
 
-def _cut(text: str) -> str:
-    """At most TEXT_CAP characters, ending before the last partial word. No whitespace there keeps nothing."""
+def cut(text: str) -> str:
+    """At most TEXT_CAP characters, ending before the last partial word, which goes whole. No whitespace there keeps nothing."""
+    if len(text) <= TEXT_CAP:
+        return text
     head = text[:TEXT_CAP]
     space = max(head.rfind(" "), head.rfind("\n"), head.rfind("\t"))
     return (head[:space] if space >= 0 else "") + CUT_MARK
 
 
-def fit(text: str, rs: redact.Ruleset, secrets: list) -> str:
-    """A long text redacted, then cut. Short text is left for the text stage, which redacts it whole.
-
-    Exact secret values go first, over all of it. The patterns then run over the first
-    TEXT_CAP + MARGIN characters; whatever a secret cut by that window's end left unmatched is in
-    the window's last MARGIN characters, which are dropped before the cut to a word boundary.
-    """
-    if len(text) <= TEXT_CAP:
-        return text
-    text = redact.redact_string(text, _NO_PATTERNS, secrets)[0]
-    if len(text) <= TEXT_CAP:
-        return text
-    window = redact.redact_string(text[: TEXT_CAP + MARGIN], rs, [])[0]
-    if len(text) > TEXT_CAP + MARGIN:  # the window cut the text, maybe inside a secret
-        window = window[: max(len(window) - MARGIN, 0)]
-    return _cut(window)
-
-
-def _keys(value, rs: redact.Ruleset, secrets: list, counts: dict):
-    """Every dict key redacted, and every long string fitted. Colliding keys get #2, #3, ... in order."""
+def _cut_all(value):
     if isinstance(value, str):
-        return fit(value, rs, secrets)
+        return cut(value)
     if isinstance(value, list):
-        return [_keys(item, rs, secrets, counts) for item in value]
+        return [_cut_all(item) for item in value]
     if isinstance(value, dict):
-        out = {}
-        for key, item in value.items():
-            new, found = redact.redact_string(fit(str(key), rs, secrets), rs, secrets)
-            for rule, count in found.items():
-                counts[rule] = counts.get(rule, 0) + count
-            name, n = new, 1
-            while name in out:
-                n += 1
-                name = f"{new}#{n}"
-            out[name] = _keys(item, rs, secrets, counts)
-        return out
+        return {key: _cut_all(item) for key, item in value.items()}
     return value
 
 
-def _meta(out: dict, rs: redact.Ruleset, secrets: list, counts: dict) -> None:
-    """The untrusted metadata strings redacted in place, and the id and name of each kept tool call."""
-    for name in UNTRUSTED_META:
-        if isinstance(out.get(name), str) and out[name]:
-            out[name], found = redact.redact_string(fit(out[name], rs, secrets), rs, secrets)
-            for rule, count in found.items():
-                counts[(rule, name)] = counts.get((rule, name), 0) + count
-    calls = out.get("tool_calls")
-    if out.get("capture") == "metadata" and isinstance(calls, list):
-        for call in calls:
-            for name in ("id", "name"):
-                if isinstance(call, dict) and isinstance(call.get(name), str):
-                    call[name], found = redact.redact_string(call[name], rs, secrets)
-                    for rule, count in found.items():
-                        counts[(rule, "tool_calls")] = counts.get((rule, "tool_calls"), 0) + count
+def _sense(record: dict) -> dict:
+    """An input too large to check makes the record sensitive, in the core's own terms (sanitize_event)."""
+    if not any(name in INPUTS for name in record.get("omitted") or ()):
+        return record
+    return {**redact.strip_text(record), "sensitive": True, "sensitive_rule": OVERSIZE_RULE, "sensitive_trigger": ""}
 
 
-def _audit(out: dict, extra: dict) -> None:
-    """``redactions``: census of placeholders in text fields, plus those in keys and metadata."""
-    keep = redact.keep_fields()
-    totals: dict = {}
-    for item in redact.census(out, [key for key in out if key not in keep]):
-        totals[(item["rule"], item["field"])] = item["count"]
-    for (rule, field), count in extra.items():
-        totals[(rule, field)] = totals.get((rule, field), 0) + count
-    if totals:
-        out["redactions"] = [{"rule": rule, "field": field, "count": count} for (rule, field), count in sorted(totals.items(), key=lambda x: (x[0][1], x[0][0]))]
-    else:
-        out.pop("redactions", None)
+def _unredacted(record: dict) -> dict:
+    """What a record keeps when redaction failed: only the fields the core never redacts (its redaction_error shape)."""
+    return {key: value for key, value in redact.strip_text(record).items() if not redact.field_class(key)["redact"]}
+
+
+def _meta(out: dict, rs: redact.Ruleset, secrets: list) -> dict:
+    """The untrusted metadata the core keeps as is, redacted with the same rules. Fails closed: dropped."""
+    present = {name: out[name] for name in UNTRUSTED_META if isinstance(out.get(name), str) and out[name]}
+    if not present:
+        return out
+    try:
+        if rs.error:
+            raise redact.RedactionLimit(rs.error)
+        clean = {name: redact.scrub_value(value, rs, secrets) for name, value in present.items()}
+    except redact.RedactionLimit:
+        clean = {}
+    return {**{key: value for key, value in out.items() if key not in present}, **clean}
 
 
 def prepare(record: dict, gate: Gate) -> dict:
-    """The capture policy for one record, then record()'s stamps. Never returns secret text a rule or env value names."""
-    rs = rules(gate)
-    secrets = list(gate.secrets)
-    keep = redact.keep_fields()
-    extra: dict = {}
-    if gate.capture == "metadata":
-        out = {**redact.strip_text(record), "prompt": "", "output": ""}
-        out["capture"] = "metadata"
-        _meta(out, rs, secrets, extra)
-        _audit(out, extra)
-    elif gate.capture == "sanitized":
-        try:
-            if rs.error:
-                raise ValueError(rs.error)
-            fitted = {}
-            for key, value in record.items():
-                if key in keep:
-                    fitted[key] = value
-                    continue
-                counts: dict = {}
-                fitted[key] = _keys(value, rs, secrets, counts)
-                for rule, count in counts.items():
-                    extra[(rule, key)] = count
-            out = redact.sanitize_event(fitted, rs, secrets, gate.home)
-            out["capture"] = "sanitized"
-            _meta(out, rs, secrets, extra)
-            _audit(out, extra)
-        except Exception:  # a rule that fails drops the event's text, never sends it raw
-            out = {**redact.strip_text(record), "redaction_error": True}
-            for name in UNTRUSTED_META + ("tool_calls",):
-                out.pop(name, None)
+    """The capture policy for one record, then the stamps. Never returns secret text a rule or env value names."""
+    if gate.capture == "full":
+        out = _cut_all(record)
     else:
-        out = {key: (_full(value) if key not in keep else value) for key, value in record.items()}
+        rs = rules(gate)
+        secrets = list(gate.secrets)
+        try:
+            event = _sense(record) if gate.capture == "sanitized" else record
+            out = redact.sanitize_event(event, rs, secrets, gate.capture)
+            out = _cut_all(_meta(out, rs, secrets))
+        except Exception:  # anything unexpected drops the record's text, never sends it raw
+            out = {**_meta(_unredacted(record), rs, secrets), "redaction_error": True}
     out["capture"] = gate.capture
     if not isinstance(out.get("ts"), (int, float)):
         out["ts"] = int(time.time() * 1000)
-    out["environment"] = gate.environment
-    out["project_root"] = gate.root
-    if "export_fp" not in out:
-        out.update(gate.stamp)
+    out.update(gate.stamps)
     return out
 
 
-def _full(value):
-    if isinstance(value, str):
-        return _cut(value) if len(value) > TEXT_CAP else value
-    if isinstance(value, list):
-        return [_full(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _full(item) for key, item in value.items()}
-    return value
-
-
 # ---- the inbox and the sender --------------------------------------------------------------------
-
-_seq = itertools.count()
-_spool_lock = threading.Lock()
 
 
 def _private_dir(path: Path) -> None:
@@ -348,37 +328,35 @@ def _private_dir(path: Path) -> None:
         os.chmod(path, 0o700)
 
 
-def spool(record: dict, state) -> None:
-    """One file per event in ``inbox/``, owner-only, appearing whole (written aside, then linked in).
-
-    The flusher folds files in (mtime, name) order and remembers each file it folded by name and
-    mtime, so a file that appears late is folded late, never dropped.
-    """
+def stage(record: dict, state, name: str) -> None:
+    """Write the prepared record aside, owner-only, under the name it will be published as. Overwrites a stale copy."""
     state = Path(state)
-    line = json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str) + "\n"
-    inbox = state / "inbox"
     scratch = state / "inbox.tmp"
-    pid = os.getpid()
-    with _spool_lock:
-        _private_dir(state)
-        _private_dir(inbox)
-        _private_dir(scratch)
-        for _ in range(20):
-            name = f"{pid}.{next(_seq):010d}.json"
-            tmp = scratch / name
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            try:
-                os.write(fd, line.encode("utf-8"))
-            finally:
-                os.close(fd)
-            try:
-                os.utime(tmp)  # its order is when it is published, not when it was written
-                os.link(tmp, inbox / name)  # never replaces a file a crashed process left
-                return
-            except FileExistsError:
-                continue
-            finally:
-                os.unlink(tmp)
+    _private_dir(state)
+    _private_dir(state / "inbox")
+    _private_dir(scratch)
+    line = json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str) + "\n"
+    fd = os.open(scratch / name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, line.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def publish(state, name: str) -> None:
+    """Link a staged record into ``inbox/``, whole, then drop the staged copy. Idempotent: run again after a crash
+    at any point, it finishes the job or finds it done. Its order is when it is published, not when it was written."""
+    state = Path(state)
+    tmp = state / "inbox.tmp" / name
+    try:
+        os.utime(tmp)
+    except FileNotFoundError:
+        return  # published and cleaned up already
+    try:
+        os.link(tmp, state / "inbox" / name)  # never replaces a file
+    except FileExistsError:
+        pass
+    os.unlink(tmp)
 
 
 _senders: list = []
@@ -421,6 +399,26 @@ def launch_sender(state, env: dict | None = None) -> bool:
         os.close(log)
     _senders.append(proc)
     return True
+
+
+def log_line(state, text: str) -> None:
+    """One line in flush.log. Callers pass counts and names, never text from a record."""
+    try:
+        _private_dir(Path(state))
+        fd = os.open(Path(state) / "flush.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, (time.strftime("%Y-%m-%dT%H:%M:%S ") + text + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _after_fork() -> None:
+    _senders.clear()  # the parent's children, not this process's
+
+
+os.register_at_fork(after_in_child=_after_fork)
 
 
 # ---- /judgment -----------------------------------------------------------------------------------

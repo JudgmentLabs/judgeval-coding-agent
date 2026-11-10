@@ -20,7 +20,8 @@ from unittest import mock
 
 from fake_sink import Sink, attrs, roots
 from hermes_support import VENDOR_CORE, Turn, finalize, fire_all, flush_vendor, later, load_plugin, new_session_id, plugin_env, subagent_turn
-from support import ENV_SECRET_NAME, SECRETS, Sandbox, leaks
+from hermes_support import Sandbox
+from support import ENV_SECRET_NAME, SECRETS, leaks
 
 GH = SECRETS["github_token"]["core"]
 OPENAI = SECRETS["openai_key"]["core"]
@@ -113,9 +114,10 @@ class MetadataSecrets(Case):
 
 
 class KeySecrets(Case):
-    def test_secret_keys_are_redacted_and_collisions_kept(self):
+    def test_secret_keys_are_redacted(self):
+        """Key-aware redaction is the core's (redact.scrub_value): every key, at any depth, as text."""
         sid = new_session_id()
-        args = {GH: "first", "[REDACTED:github_token]": "second", "nested": {ENV_VALUE: {OPENAI: "deep"}}, "plain": "x"}
+        args = {GH: "first", "nested": {ENV_VALUE: {OPENAI: "deep"}}, "plain": "x"}
         turn = Turn(sid, "hello")
         call = turn.api(tool=("write_file", args))
         turn.tool(call, "write_file", args, "ok")
@@ -125,10 +127,7 @@ class KeySecrets(Case):
         self.assertEqual(leaks(self.sb.state_text(), hashes=False), [], "inbox")
         tool = next(event for event in self.sb.inbox() if event["event"] == "tool")
         self.assertEqual(tool["tool_input"]["[REDACTED:github_token]"], "first")
-        self.assertEqual(tool["tool_input"]["[REDACTED:github_token]#2"], "second")
         self.assertEqual(tool["tool_input"]["nested"], {f"[REDACTED:env:{ENV_SECRET_NAME}]": {"[REDACTED:openai_key]": "deep"}})
-        self.assertIn({"rule": "github_token", "field": "tool_input", "count": 1}, tool["redactions"])
-        self.assertIn({"rule": "openai_key", "field": "tool_input", "count": 1}, tool["redactions"])
         self.flushed()
         self.assertEqual(leaks(self.sink.text(), hashes=False), [], "sink")
 
@@ -137,55 +136,10 @@ class KeySecrets(Case):
 
 
 class Truncation(unittest.TestCase):
+    """The cut-point cases are in test_hermes_round2.Truncation; this one runs the whole path."""
+
     def setUp(self):
         self.core = load_plugin().core
-        self.rs = self.core._rules((), ())
-
-    def assert_no_piece(self, out: str, secret: str) -> None:
-        pieces = {secret[i : i + 6] for i in range(len(secret) - 5)}
-        self.assertEqual([piece for piece in pieces if piece in out], [])
-
-    def test_whitespace_free_text_cut_inside_a_secret(self):
-        cap = self.core.TEXT_CAP
-        for at in (cap - 15, cap - 1, cap + 1, cap + self.core.MARGIN - 15, cap + self.core.MARGIN + 5):
-            with self.subTest(at=at):
-                text = "a" * at + GH + "b" * 9000
-                out = self.core.fit(text, self.rs, [])
-                self.assertTrue(out.endswith(self.core.CUT_MARK))
-                self.assertLessEqual(len(out), cap + len(self.core.CUT_MARK))
-                self.assert_no_piece(out, GH[4:])
-
-    def test_partial_credential_at_the_window_end_with_spaces(self):
-        cap, margin = self.core.TEXT_CAP, self.core.MARGIN
-        for at in range(cap + margin - 40, cap + margin + 2, 7):
-            with self.subTest(at=at):
-                text = ("word " * (at // 5 + 1))[:at] + "Authorization: Bearer " + "tok" + GH[4:] + " more" * 3000
-                out = self.core.fit(text, self.rs, [])
-                self.assert_no_piece(out, GH[4:])
-
-    def test_env_secret_with_spaces_cut_by_the_cap(self):
-        cap = self.core.TEXT_CAP
-        secret = "correct horse " + ENV_VALUE + " staple"
-        for at in (cap - 20, cap - 5, cap + 3):
-            with self.subTest(at=at):
-                text = "x" * at + secret + " tail" * 5000
-                out = self.core.fit(text, self.rs, [("X_TOKEN", secret)])
-                self.assert_no_piece(out, ENV_VALUE)
-
-    def test_multi_word_secret_cut_by_the_window_after_redaction_shrank_it(self):
-        """Redaction can shrink the window below TEXT_CAP; a secret the window cut must still not survive."""
-        cap, margin = self.core.TEXT_CAP, self.core.MARGIN
-        rs = self.core._rules(("passphrase is [a-z]+ [a-z]+ [a-z]+",), ())
-        dense = (OPENAI + " ") * 300  # ~17 KB that redaction shrinks by ~10 KB
-        for overhang in (4, 9, 15):
-            with self.subTest(overhang=overhang):
-                phrase = "passphrase is alpha bravo charlie"
-                filler = ("lorem " * cap)[: cap + margin - len(dense) - len(phrase) + overhang]
-                text = dense + filler + phrase + " ipsum" * 1000
-                out = self.core.fit(text, rs, [])
-                self.assertNotIn("alpha", out)
-                self.assertNotIn("bravo", out)
-                self.assert_no_piece(out, OPENAI[8:])
 
     def test_a_long_tool_result_spooled_without_any_piece(self):
         sb = Sandbox()
@@ -596,6 +550,15 @@ class Latency(Case):
         self.assertTrue(log.exists() and "post attempt" in log.read_text() or wait_log(log))
 
 
+def wait_until(predicate, timeout: float = 10.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return False
+
+
 def wait_log(log: Path) -> bool:
     deadline = time.time() + 20
     while time.time() < deadline:
@@ -666,39 +629,14 @@ class Helper(Case):
         two.end("b")
         with plugin_env(self.sb) as (plugin, ctx):
             fire_all(ctx, one.events, plugin)
+            self.assertTrue(wait_until(lambda: plugin.spool.proc is not None and not plugin.spool.inflight and plugin.spool.handed_over()))
             first = plugin.spool.proc
             first.kill()
             first.wait(timeout=10)
             fire_all(ctx, two.events, plugin)
+            self.assertTrue(wait_until(lambda: plugin.spool.proc is not None and plugin.spool.proc.pid != first.pid))
             self.assertEqual(plugin.errors["count"], 0)
-            self.assertNotEqual(plugin.spool.proc.pid, first.pid)
-        self.assertIn("after", [attrs(root)["judgment.input"] for root in roots(self.flushed())])
-
-    def test_inline_mode_does_the_same_work_in_the_callback(self):
-        sid = new_session_id()
-        turn = Turn(sid, "key " + OPENAI)
-        call = turn.api(tool=("read_file", {GH: "x"}))
-        turn.tool(call, "read_file", {GH: "x"}, "ok " + ENV_VALUE)
-        turn.api(text="done")
-        turn.end("done")
-        plugin = self.fire(turn.events, JUDGMENT_HERMES_SPOOL="inline")
-        self.assertEqual(plugin.spool.mode, "inline")
-        self.assertEqual(leaks(self.sb.state_text(), hashes=False), [])
-        self.assertEqual([attrs(root)["judgment.input"] for root in roots(self.flushed())], ["key [REDACTED:openai_key]"])
-
-    def test_batches_handed_to_the_drainer_land_in_order(self):
-        """A callback past its write budget hands the rest to the drainer thread; nothing is lost or reordered."""
-        sid = new_session_id()
-        turn = Turn(sid, "drained")
-        call = turn.api(tool=("read_file", {"path": "a"}))
-        turn.tool(call, "read_file", {"path": "a"}, "ok")
-        turn.api(text="done")
-        turn.end("done")
-        plugin = load_plugin()
-        with mock.patch.object(plugin, "WRITE_BUDGET_S", 0.0):
-            self.fire(turn.events)
-        self.assertEqual([event["event"] for event in self.sb.inbox()], ["turn_start", "model", "tool", "model", "turn_end"])
-        self.assertEqual([attrs(root)["judgment.output"] for root in roots(self.flushed())], ["done"])
+        self.assertEqual(sorted(attrs(root)["judgment.input"] for root in roots(self.flushed())), ["after", "before"])
 
     def test_helper_env_holds_no_secret(self):
         spooler = sys.modules[load_plugin().__name__ + ".spooler"]

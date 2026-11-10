@@ -16,11 +16,18 @@ State machines. Impossible states are listed so the code can refuse them.
       MAIN|CHILD --an event whose session id is new but whose turn_id the conversation owns--> same
             conversation, new id added as an alias (Hermes's legacy compression rotates
             agent.session_id mid-turn, conversation_compression.py:1246, and fires no hook)
+      MAIN|CHILD --pre_llm_call whose session id is new but whose turn_id was built from one of its ids
+            (preflight compression)--> same conversation, new id added as an alias. Hermes builds
+            turn_id = f"{session_id}:{task_id}:{8 hex}" before it compresses (agent/turn_context.py:369)
+            and fires pre_llm_call after (:697), so ``lineage`` reads the pre-rotation id back.
+      unknown --pre_llm_call whose lineage id is unknown here (a resumed session that rotates in its
+            first turn)--> MAIN keyed by the lineage id, so that id's /judgment on|off decides the gate
       MAIN --on_session_finalize|on_session_reset--> gone, with every alias, every turn, and every
             child (and grandchild) bound to it
       CHILD --subagent_stop--> gone, with every alias and turn id
       Impossible: a session id in two conversations; an alias or turn owner pointing at a gone
-      conversation; a child whose root changes after it started; a child opening a main turn.
+      conversation; a child whose root changes after it started; a child opening a main turn; a
+      rotated id resolving its gate under any key but its conversation's.
 
   Turn (main conversations only; ``turns``: turn_id -> Turn; ``owner``: turn_id -> conversation key)
       none --pre_llm_call--> OPEN --post_llm_call--> ANSWERED
@@ -47,6 +54,15 @@ State machines. Impossible states are listed so the code can refuse them.
       pending --turn or child closes--> abandoned (tool record, is_error)
       post without pre (a call blocked before pre_tool_call): recorded, timed from duration_ms.
 
+  Tool call id (per turn or child, ``Calls.ids``): raw id --first sight--> itself when redaction would
+      leave it unchanged, else ``call_redacted_<n>``, distinct within the turn. Every record of the
+      turn (the model's tool_calls, the tool event, an abandoned call) uses the same mapping.
+      Impossible: two raw ids with one replacement; a raw id redaction would change, in a record.
+
+  Text: kept whole here. Hermes already holds every value in memory, so a record holds references,
+      not copies. The spooler drops a value too large to redact whole; the helper detects
+      sensitivity and redacts on complete values, and only then cuts what it keeps.
+
   Child binding: a child's events go to the root turn that started it, under agent_id = its key,
       even after that turn ended (Hermes runs delegations in the background). A grandchild takes
       its parent's root turn. subagent_start carries ``bind_agent`` so the flusher's fold binds the
@@ -57,17 +73,16 @@ from __future__ import annotations
 
 import enum
 import json
-import threading
+import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 HARNESS = "hermes"
-# The most of one string the tracker keeps. It only bounds memory and the work redaction does:
-# the core bridge redacts first and then cuts what it keeps (core_bridge.TEXT_CAP, which is smaller).
-RAW_CAP = 128 * 1024
-# The most string text one captured value (tool arguments, a content list) keeps in total.
-VALUE_BUDGET = 256 * 1024
+# Nesting kept in a captured value; deeper structure is replaced whole, never cut.
+MAX_DEPTH = 12
+# A tool call id redaction would change is replaced by this and a number (see "Tool call id").
+ALIAS_PREFIX = "call_redacted_"
 OK_TOOL = "ok"
 DONE_CHILD = ("completed", "complete", "success", "succeeded", "ok", "done")
 # Main conversations kept without a finalize. The oldest idle one (no open turn, no child) goes first.
@@ -108,6 +123,7 @@ class Calls:
     tools: dict = field(default_factory=dict)  # tool_call_id -> (name, args, start)
     attempts: dict = field(default_factory=dict)  # api_request_id -> Attempt
     seq: dict = field(default_factory=dict)  # api_request_id -> attempts started so far
+    ids: dict = field(default_factory=dict)  # raw tool call id -> the id its records carry (see "Tool call id")
 
 
 @dataclass
@@ -163,17 +179,12 @@ class Where:
 # ---- pure readers of Hermes kwargs ---------------------------------------------------------------
 
 
-def clip(text: str) -> str:
-    """At most RAW_CAP characters, cut anywhere. The bridge redacts before it cuts what it keeps."""
-    return text if len(text) <= RAW_CAP else text[:RAW_CAP]
-
-
 def text_of(value: Any) -> str:
-    """A message content as text: a string, or the text parts of a content list."""
+    """A message content as text: a string, or the text parts of a content list. Never cut."""
     if value is None:
         return ""
     if isinstance(value, str):
-        return clip(value)
+        return value
     if isinstance(value, list):
         parts = []
         for part in value:
@@ -184,29 +195,36 @@ def text_of(value: Any) -> str:
                     parts.append("[image]")
                 elif isinstance(part.get("text"), str):
                     parts.append(part["text"])
-        return clip("\n".join(p for p in parts if p))
-    return clip(json.dumps(value, ensure_ascii=False, default=str))
+        return "\n".join(p for p in parts if p)
+    return json.dumps(value, ensure_ascii=False, default=str)
 
 
-def capped(value: Any) -> Any:
-    """A JSON-shaped copy with at most VALUE_BUDGET characters of strings, keys included. Unknown objects become their string."""
-    budget = [VALUE_BUDGET]
+def capped(value: Any, depth: int = 0) -> Any:
+    """A JSON-shaped copy: strings whole, unknown objects as their string, nesting past MAX_DEPTH replaced whole.
+    Plain recursion, no closure: a self-referencing closure per call is a cycle only the GC frees."""
+    if isinstance(value, str) or value is None or isinstance(value, (bool, int, float)):
+        return value
+    if not isinstance(value, (dict, list, tuple)):
+        return str(value)
+    if depth > MAX_DEPTH:
+        return "…"
+    if isinstance(value, dict):
+        return {str(k): capped(v, depth + 1) for k, v in value.items()}
+    return [capped(v, depth + 1) for v in value]
 
-    def walk(item: Any, depth: int) -> Any:
-        if isinstance(item, str) or not (item is None or isinstance(item, (bool, int, float, dict, list, tuple))):
-            text = item if isinstance(item, str) else str(item)
-            keep = clip(text[: max(budget[0], 0)])
-            budget[0] -= len(keep)
-            return keep
-        if item is None or isinstance(item, (bool, int, float)):
-            return item
-        if depth > 12:
-            return "…"
-        if isinstance(item, dict):
-            return {walk(str(k), depth + 1): walk(v, depth + 1) for k, v in item.items()}
-        return [walk(v, depth + 1) for v in item]
 
-    return walk(value, 0)
+_LINEAGE = re.compile(r":[0-9a-f]{8}")
+
+
+def lineage(kw: dict) -> str:
+    """The session id a turn was started under: Hermes's turn_id is f"{session_id}:{task_id}:{8 hex}",
+    built before preflight compression can rotate session_id (agent/turn_context.py:369). '' when it doesn't parse."""
+    tid, task = s(kw, "turn_id"), s(kw, "task_id")
+    tail = f":{task}:"
+    if not task or len(tid) <= len(tail) + 8 or not _LINEAGE.fullmatch(tid[-9:]) or tid[-(len(tail) + 8) : -8] != tail:
+        return ""
+    origin = tid[: -(len(tail) + 8)]
+    return "" if origin == "session" else origin  # Hermes's stand-in for an agent with no session id
 
 
 def ms(seconds: Any, default: int) -> int:
@@ -245,7 +263,7 @@ def calls_of(raw: Any) -> list[dict]:
                 args = json.loads(args)
             except ValueError:
                 pass
-        calls.append({"id": clip(str(_get(item, "id") or "")), "name": clip(str(name)), "arguments": capped(args if args is not None else {})})
+        calls.append({"id": str(_get(item, "id") or ""), "name": str(name), "arguments": capped(args if args is not None else {})})
     return calls
 
 
@@ -271,12 +289,12 @@ def error_text(kw: dict) -> str:
     text = f"{head}: {kind}: {error.get('message') or ''}".rstrip(": ")
     if kw.get("retry_count") is not None:
         text += f" [retry {kw.get('retry_count')}/{kw.get('max_retries')}]"
-    return clip(text)
+    return text
 
 
 def s(kw: dict, name: str) -> str:
     """A kwarg as a string id, '' when missing."""
-    return clip(str(kw.get(name) or ""))
+    return str(kw.get(name) or "")
 
 
 def attempt_id(request_id: str, seq: int) -> str:
@@ -288,45 +306,50 @@ def attempt_id(request_id: str, seq: int) -> str:
 
 
 class Tracker:
-    """Hermes conversations, turns, children, and calls in flight. Thread-safe: children report from worker threads."""
+    """Hermes conversations, turns, children, and calls in flight. Plain tables, no lock: the plugin
+    serializes every call (children report from worker threads)."""
 
-    def __init__(self, resolve: Callable[[str, str], Any], version: str = ""):
+    def __init__(self, resolve: Callable[[str, str], Any], version: str = "", needs_alias: Callable[[Any, str], bool] | None = None):
         self.resolve = resolve  # (conversation key, workspace) -> gate or None; called once per turn start
         self.version = version
+        self.needs_alias = needs_alias or (lambda gate, value: False)  # would redaction change this id under this gate?
         self.ids: dict[str, str] = {}  # session id or alias -> conversation key
         self.convs: OrderedDict[str, Conv] = OrderedDict()  # key -> Conv, least recently active first
         self.turns: dict[str, Turn] = {}  # open main turn id -> Turn
         self.owner: dict[str, str] = {}  # turn id (main or child) -> conversation key
-        self._lock = threading.Lock()
 
     def step(self, hook: str, kw: dict, now: int) -> Step:
         handler = HOOKS.get(hook)
         if handler is None:
             return Step()
-        with self._lock:
-            return handler(self, kw, now)
+        return handler(self, kw, now)
 
     # -- identity
 
     def key_of(self, session_id: str) -> str:
         """The conversation a session id names now ('' when none). For /judgment."""
-        with self._lock:
-            return self.ids.get(session_id, "")
+        return self.ids.get(session_id, "")
 
     def kind_of(self, key: str) -> Kind | None:
-        with self._lock:
-            conv = self.convs.get(key)
-            return conv.kind if conv else None
+        conv = self.convs.get(key)
+        return conv.kind if conv else None
+
+    def key_for(self, kw: dict) -> str:
+        """The conversation key a pre_llm_call will run under, without changing anything: the plugin
+        resolves the gate for it before the step. Same lookups, in the same order, as ``_conv``."""
+        sid = s(kw, "session_id")
+        origin = lineage(kw)
+        return self.ids.get(sid) or self.owner.get(s(kw, "turn_id")) or self.ids.get(origin) or origin or sid
 
     def _conv(self, kw: dict, step: Step, sid_name: str = "session_id") -> Conv | None:
-        """The conversation an event belongs to, adding an alias when Hermes rotated its session id."""
+        """The conversation an event belongs to, adding an alias when Hermes rotated its session id:
+        by the turn it owns (mid-turn rotation), else by the id its turn_id was built from (preflight)."""
         sid = s(kw, sid_name)
         key = self.ids.get(sid)
         if key is None:
-            owner = self.owner.get(s(kw, "turn_id"))
-            if not sid or owner is None:
+            key = self.owner.get(s(kw, "turn_id")) or self.ids.get(lineage(kw))
+            if not sid or key is None:
                 return None
-            key = owner
             self._alias(key, sid, step)
         conv = self.convs.get(key)
         if conv is not None:
@@ -389,6 +412,22 @@ class Tracker:
             return None
         return Where(turn.gate, turn.calls, turn.session_id, turn.turn_id)
 
+    def _call_id(self, where: Where, raw: str) -> str:
+        """The id a tool call's records carry: itself, or a replacement distinct within the turn when redaction would change it."""
+        if not raw:
+            return raw
+        table = where.calls.ids
+        mapped = table.get(raw)
+        if mapped is None:
+            # len(table) only grows while the turn or child lives, so each replacement is new.
+            # A raw id shaped like a replacement is replaced too, so no kept id can equal one.
+            replace = raw.startswith(ALIAS_PREFIX) or self.needs_alias(where.gate, raw)
+            mapped = table[raw] = f"{ALIAS_PREFIX}{len(table) + 1}" if replace else raw
+        return mapped
+
+    def _calls(self, where: Where, calls: list[dict]) -> list[dict]:
+        return [{**call, "id": self._call_id(where, call.get("id") or "")} for call in calls]
+
     def _model(self, where: Where, attempt: str, start: int, end: int, model: str, provider: str, **fields: Any) -> tuple:
         rec = self._record("model", where.session_id, where.turn_id, end, agent_id=where.agent_id, model=model, provider=provider or None,
                            message_id=attempt, start_ts=start, end_ts=max(end, start + 1), **fields)
@@ -400,7 +439,7 @@ class Tracker:
         calls = where.calls
         for call_id, (name, args, start) in sorted(calls.tools.items(), key=lambda item: item[1][2]):
             out.append((where.gate, self._record("tool", where.session_id, where.turn_id, now, agent_id=where.agent_id, tool_name=name,
-                                                 tool_call_id=call_id, tool_input=args, tool_output="(no result: the turn ended first)",
+                                                 tool_call_id=self._call_id(where, call_id), tool_input=args, tool_output="(no result: the turn ended first)",
                                                  is_error=True, start_ts=start, end_ts=max(now, start + 1))))
         for rid, att in sorted(calls.attempts.items(), key=lambda item: item[1].start):
             out.append(self._model(where, attempt_id(rid, att.seq), att.start, now, att.model, att.provider,
@@ -462,7 +501,10 @@ class Tracker:
         if tid in self.turns:
             return step
         if conv is None:
-            conv = self._new(sid, Kind.MAIN)
+            origin = lineage(kw) or sid  # a rotated id never seen here: the conversation is the one it was rotated from
+            conv = self._new(origin, Kind.MAIN)
+            if origin != sid:
+                self._alias(origin, sid, step)
             self._evict()
         if conv.open_turn:
             closed = self._close_turn(conv.open_turn, now, interrupted=True)
@@ -562,7 +604,7 @@ class Tracker:
         end = ms(kw.get("ended_at"), start + ms(kw.get("api_duration"), 1))
         text, calls = reply_of(kw)
         step.records.append(self._model(where, attempt or None, start, end, s(kw, "response_model") or s(kw, "model"), s(kw, "provider"),
-                                         output=text, tool_calls=calls or None, usage=usage_of(kw.get("usage"))))
+                                         output=text, tool_calls=self._calls(where, calls) or None, usage=usage_of(kw.get("usage"))))
         return step
 
     def api_request_error(self, kw: dict, now: int) -> Step:
@@ -597,7 +639,7 @@ class Tracker:
             start = pending[2] if pending else now - 1
         status = str(kw.get("status") or OK_TOOL)
         rec = self._record("tool", where.session_id, where.turn_id, now, agent_id=where.agent_id, tool_name=s(kw, "tool_name") or "tool",
-                           tool_call_id=call_id or None, tool_input=capped(kw.get("args")), tool_output=text_of(kw.get("result")),
+                           tool_call_id=self._call_id(where, call_id) or None, tool_input=capped(kw.get("args")), tool_output=text_of(kw.get("result")),
                            is_error=True if status != OK_TOOL else None, start_ts=start, end_ts=max(now, start + 1))
         step.records.append((where.gate, rec))
         return step

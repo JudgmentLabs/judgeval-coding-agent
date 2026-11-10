@@ -9,9 +9,14 @@ Cases (every fake credential is built at runtime; the env is the sandbox's, neve
   dense56k     post_api_request, post_tool_call, and turn end (post_llm_call + on_session_end) with a
                56 KB payload holding 1,000 fake credentials
   concurrent8  8 threads, each running its own sessions of 4 KB tool turns at once
+  control8     the same 8 threads calling a callback that does nothing: the GIL's share, not the plugin's
+  paced8       8 threads, 0-2 ms apart, mixing 4 KB and 56 KB secret-dense turns
+  stalled      the helper stopped (SIGSTOP): its pipe fills, then the queue; callbacks must not notice
+  saturated    56 KB turns back to back into a 4 MB queue, faster than the helper redacts: drops, never waits
   turnend      on_session_end with the real sender launch (sink down, so each sender exits quickly)
+  handoff      not a callback: ms from on_session_end returning to its records being in the helper's pipe
 
-Prints p50 / p95 / max in ms for each case and hook.
+Prints p50 / p95 / max in ms for each case and hook, and the queue's drop counts.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import signal
 import statistics
 import string
 import sys
@@ -28,8 +34,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from hermes_support import Turn, later, new_session_id, plugin_env  # noqa: E402
-from support import Sandbox  # noqa: E402
+from hermes_support import Turn, later, load_plugin, new_session_id, plugin_env  # noqa: E402
+from hermes_support import Sandbox  # noqa: E402
 
 rng = random.Random(4242)
 
@@ -190,6 +196,55 @@ def run(rounds: int) -> dict[str, dict[str, tuple]]:
             summarize("paced8", timer)
             errors = plugin.errors["count"]
 
+        spooler = sys.modules[load_plugin().__name__ + ".spooler"]
+        with plugin_env(sb, JUDGMENT_FLUSH="0") as (plugin, ctx):
+            Timer().fire(ctx, plugin, tool_turn(new_session_id(), 0, "warm", "warm").events)
+            deadline = time.time() + 10
+            while (plugin.spool.proc is None or not plugin.spool.handed_over()) and time.time() < deadline:
+                time.sleep(0.005)
+            helper = plugin.spool.proc
+            os.kill(helper.pid, signal.SIGSTOP)
+            try:
+                timer = Timer()
+                for n in range(max(rounds // 4, 100)):
+                    turn = tool_turn(new_session_id(), 0, dense, dense, api_text=dense)
+                    timer.fire(ctx, plugin, turn.events)
+                summarize("stalled", timer)
+                report["stalled"]["_queue"] = (plugin.spool.bytes / 1e6, sum(plugin.spool.dropped.values()), 0, 0)
+                start = time.perf_counter()
+                plugin.spool.close()
+                report["stalled"]["_exit_wait"] = ((time.perf_counter() - start) * 1000, 0, 0, 0)
+            finally:
+                os.kill(helper.pid, signal.SIGCONT)
+            errors += plugin.errors["count"]
+
+        old = spooler.QUEUE_BYTES
+        spooler.QUEUE_BYTES = 4 * 1024 * 1024
+        try:
+            with plugin_env(sb, JUDGMENT_FLUSH="0") as (plugin, ctx):
+                timer = Timer()
+                for n in range(max(rounds // 2, 100)):
+                    turn = tool_turn(new_session_id(), 0, dense, dense, api_text=dense)
+                    timer.fire(ctx, plugin, turn.events)
+                summarize("saturated", timer)
+                report["saturated"]["_queue"] = (plugin.spool.bytes / 1e6, sum(plugin.spool.dropped.values()), 0, 0)
+                errors += plugin.errors["count"]
+        finally:
+            spooler.QUEUE_BYTES = old
+
+        with plugin_env(sb, JUDGMENT_FLUSH="0") as (plugin, ctx):
+            Timer().fire(ctx, plugin, tool_turn(new_session_id(), 0, "warm", "warm").events)
+            handoff = []
+            for n in range(max(rounds // 4, 100)):
+                turn = tool_turn(new_session_id(), 0, plain4k if n % 2 else dense, f"answer {n}")
+                Timer().fire(ctx, plugin, turn.events)
+                start = time.perf_counter()
+                while not plugin.spool.handed_over():
+                    time.sleep(0.0001)
+                handoff.append((time.perf_counter() - start) * 1000)
+                time.sleep(0.005)
+            report["handoff"] = {"ALL": (statistics.median(handoff), pct(handoff, 0.95), max(handoff), len(handoff))}
+
         with plugin_env(sb, JUDGMENT_FLUSH=None, JUDGMENT_API_URL="http://127.0.0.1:9", JUDGMENT_FLUSH_GRACE_MS="0") as (plugin, ctx):
             timer = Timer()
             for n in range(max(rounds // 4, 40)):
@@ -199,7 +254,7 @@ def run(rounds: int) -> dict[str, dict[str, tuple]]:
                 time.sleep(0.02)  # turns are not back to back; let the sender start between them
             summarize("turnend", timer)
             errors += plugin.errors["count"]
-            plugin.spool.close(60)
+            plugin.spool.drain(60)
             for proc in list(plugin.core._senders):
                 try:
                     proc.wait(timeout=30)
@@ -221,7 +276,12 @@ def main() -> None:
     print(f"{'case':12s} {'hook':22s} {'n':>6s} {'p50':>8s} {'p95':>8s} {'max':>8s}  (ms)")
     for case, hooks in report.items():
         for hook, (p50, p95, mx, n) in hooks.items():
-            print(f"{case:12s} {hook:22s} {n:6d} {p50:8.3f} {p95:8.3f} {mx:8.3f}")
+            if hook == "_queue":
+                print(f"{case:12s} {'queue at end':22s} {p50:.1f} MB held, {p95} records dropped whole")
+            elif hook == "_exit_wait":
+                print(f"{case:12s} {'exit wait':22s} {p50:.1f} ms (bound {1000 * 0.5:.0f} ms)")
+            else:
+                print(f"{case:12s} {hook:22s} {n:6d} {p50:8.3f} {p95:8.3f} {mx:8.3f}")
 
 
 if __name__ == "__main__":

@@ -1,18 +1,25 @@
 """Judgment tracing for Hermes Agent: a native plugin of read-only observer hooks.
 
-Each hook runs in Hermes's process, on its thread, so each callback is short and does no I/O:
+Each hook runs in Hermes's process, on its thread, so each callback is short, does no I/O, and never
+waits on another thread's I/O:
 
-    kwargs -> normalize (the turn's workspace, as Hermes resolves it) -> tracker (records, pure)
-           -> spool (frames down a pipe to one helper process, which redacts and writes the inbox)
+    kwargs -> normalize (the turn's workspace and gate, as Hermes resolves them; files, cached)
+           -> tracker.step (records; pure tables)  -> outbox.put (one queue; spooler.py)
+    then, off the callback: I/O thread -> helper process (redacts, publishes the inbox, starts the sender)
+
+``_lock`` serializes every tracker access and the put that follows a step, so records reach the
+queue in the order the tracker made them. Nothing slow runs under it.
 
 Callbacks return None, so Hermes never blocks or changes anything because of this plugin, and
 any error inside one is swallowed.
+
+Fork: a forked child gets a fresh tracker, lock, and queue before any callback runs (``_after_fork``
+here, ``spooler._after_fork`` for the queue's fds and thread). The parent's turns stay the parent's.
 """
 
 from __future__ import annotations
 
 import atexit
-import collections
 import logging
 import os
 import sys
@@ -66,92 +73,68 @@ def workspace(task_id: str = "") -> str:
     return os.environ.get("TERMINAL_CWD") or os.getcwd()
 
 
-tracker = Tracker(core.resolve, version=_hermes_version())
+def new_tracker() -> Tracker:
+    return Tracker(core.resolve, version=_hermes_version(), needs_alias=core.needs_alias)
+
+
+tracker = new_tracker()
 spool = spool_for()
+_lock = threading.Lock()
+
+
+def _after_fork() -> None:
+    global tracker, _lock
+    _lock = threading.Lock()  # another thread may have held it at fork: it would stay held forever here
+    tracker = Tracker(core.resolve, version=tracker.version, needs_alias=core.needs_alias)
+
+
+os.register_at_fork(after_in_child=_after_fork)
 
 
 def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-# Hermes fires hooks from several threads (a child agent runs on its own). Frames must reach the
-# pipe in the order the tracker saw the events, but no callback should wait on another's write:
-#   _steps    the tracker step and the append to _pending, in one short critical section
-#   _writer   held by whichever thread is writing; it writes pending batches in order, and looks
-#             again after letting go, so a batch appended meanwhile is never left behind
-# A callback writes for at most WRITE_BUDGET_S; past that (other threads keep appending), the
-# drainer thread takes over, and the callback returns. At exit, whatever is pending is written.
-_steps = threading.Lock()
-_writer = threading.Lock()
-_pending: collections.deque = collections.deque()
-_wake = threading.Event()
-_drainer: dict = {"thread": None}
-WRITE_BUDGET_S = 0.001
-
-
 def normalize(hook: str, kwargs: dict) -> dict:
-    """The impure inputs a turn start needs, read before any lock: the workspace and the gate (files)."""
+    """The impure inputs a turn start needs, read before the lock: the workspace and the gate (files, cached).
+
+    The gate is resolved for the conversation the turn will run under (tracker.key_for), which for a
+    session id that preflight compression just rotated is the conversation it was rotated from.
+    """
     if hook != "pre_llm_call" or kwargs.get("platform") == "subagent":
         return kwargs
     folder = workspace(str(kwargs.get("task_id") or ""))
-    sid = str(kwargs.get("session_id") or "")
-    key = tracker.key_of(sid) or sid
+    with _lock:
+        key = tracker.key_for(kwargs)
     return {**kwargs, "_workspace": folder, "_gate_key": key, "_gate": core.resolve(key, folder)}
 
 
-def _write_pending(budget: float | None = -1.0) -> None:
-    """Write pending batches, in order. With a budget (default WRITE_BUDGET_S), hand what is left to the drainer once it runs out."""
-    budget = WRITE_BUDGET_S if budget == -1.0 else budget
-    deadline = None if budget is None else time.perf_counter() + budget
-    while _pending and _writer.acquire(blocking=deadline is None):
-        try:
-            while _pending:
-                if deadline is not None and time.perf_counter() > deadline:
-                    _hand_off()
-                    return
-                records, flush_state = _pending.popleft()
-                spool.send(records, flush_state, None)
-        finally:
-            _writer.release()
-
-
-def _hand_off() -> None:
-    thread = _drainer["thread"]
-    if thread is None or not thread.is_alive():
-        thread = _drainer["thread"] = threading.Thread(target=_drain_forever, name="judgment-drainer", daemon=True)
-        thread.start()
-    _wake.set()
-
-
-def _drain_forever() -> None:
-    while True:
-        _wake.wait()
-        _wake.clear()
-        try:
-            _write_pending(None)
-        except Exception:
-            errors["count"] += 1
+def entries(step) -> list:
+    """A step as queue items: its records, a sender start when a turn closed, and the rotated ids' /judgment copies."""
+    items = [("rec", gate, record) for gate, record in step.records]
+    if step.flush and step.records:
+        items.append(("flush", None, (step.records[-1][0].state, dict(os.environ))))
+    items += [("alias", None, (key, alias)) for key, alias in step.aliases]
+    return items
 
 
 @atexit.register
 def _drain_at_exit() -> None:
+    """Hand what is queued to the helper, waiting at most spooler.EXIT_WAIT_S. The helper finishes after Hermes exits."""
     try:
-        _write_pending(None)
+        spool.close()
     except Exception:
         pass
 
 
 def handle(hook: str, kwargs: dict) -> None:
-    """One hook: records out of the tracker, down the pipe to the helper."""
+    """One hook: records out of the tracker, into the queue."""
     kwargs = normalize(hook, kwargs)
-    with _steps:
+    with _lock:
         step = tracker.step(hook, kwargs, now_ms())
-        if step.records:
-            _pending.append((step.records, step.records[-1][0].state if step.flush else None))
-    if step.records:
-        _write_pending()
-    for key, alias in step.aliases:
-        core.copy_session_mode(key, alias)
+        items = entries(step)
+        if items:
+            spool.put(items)
 
 
 def _dump_timings() -> None:
@@ -209,8 +192,9 @@ def requester() -> str:
         return ""
     if not sid:
         return ""
-    key = tracker.key_of(sid) or sid
-    return "" if tracker.kind_of(key) is Kind.CHILD else key
+    with _lock:
+        key = tracker.key_of(sid) or sid
+        return "" if tracker.kind_of(key) is Kind.CHILD else key
 
 
 def judgment_command(raw_args: str = "") -> str:
