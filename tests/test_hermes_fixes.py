@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import statistics
 import sys
 import threading
@@ -657,7 +658,13 @@ class Helper(Case):
     def test_helper_env_holds_no_secret(self):
         spooler = sys.modules[load_plugin().__name__ + ".spooler"]
         env = spooler.helper_env({**self.sb.env, "OTHER_TOKEN": ENV_VALUE})
-        self.assertEqual(set(env) - {"PATH", "HOME", "LANG", "PYTHONDONTWRITEBYTECODE"}, set())
+        # The allowlist itself holds no secret-shaped name, and only allowlisted names get through.
+        self.assertEqual([name for name in spooler.HELPER_ENV if re.search(r"KEY|TOKEN|SECRET|PASS|AUTH|CRED", name)], [])
+        self.assertLessEqual(set(env), set(spooler.HELPER_ENV))
+        # Of the sandbox env, exactly these: TMPDIR is the suite's private temp folder (support.TMP), which the
+        # helper must keep so its temp files land where its parent's do, not in the shared /tmp.
+        self.assertEqual(set(env), {"PATH", "HOME", "LANG", "TMPDIR", "PYTHONDONTWRITEBYTECODE"})
+        self.assertNotIn(ENV_VALUE, env.values())
 
 
 if __name__ == "__main__":

@@ -100,11 +100,15 @@ def frame(message: dict) -> bytes:
     return HEAD.pack(len(body)) + body
 
 
+# The only variables the helper process starts with: enough to find python, decode text, and put temp files where its
+# parent does (TMPDIR). Secret values and the sender's full environment reach it in frames, never through its env.
+HELPER_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT", "PYTHONDONTWRITEBYTECODE")
+
+
 def helper_env(env: dict | None = None) -> dict:
-    """What the helper itself runs with. It gets secret values and the sender's environment in frames."""
+    """What the helper itself runs with: the HELPER_ENV variables that are set, nothing else."""
     source = os.environ if env is None else env
-    keep = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT", "PYTHONDONTWRITEBYTECODE")
-    return {name: source[name] for name in keep if source.get(name)}
+    return {name: source[name] for name in HELPER_ENV if source.get(name)}
 
 
 # ---- bound: the one cap before redaction -----------------------------------------------------------
