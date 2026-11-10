@@ -25,6 +25,47 @@ PLUGIN_DIR = REPO / "hermes"
 VENDOR_CORE = PLUGIN_DIR / "vendor" / "judgment-core"
 SCHEMA = "hermes.observer.v1"
 
+# Callback latency. Two numbers, on purpose:
+#   LATENCY_TARGET_P95_MS  what a callback should cost (Nick's target: p95 < 3 ms). Measured and
+#                          reported for every hook; a hook over it is flagged in the report.
+#   LATENCY_GATE_P95_MS    what fails a test. Shared CI runners (GitHub's ubuntu runners) add noise the
+#                          plugin doesn't cause: a neighbour's load, or a GIL handoff after one of the
+#                          rare syscalls a turn makes, can lift one trial's p95 by a few ms (seen:
+#                          pre_llm_call 4.1 ms on a PR run, under 3 ms on the push run of the same
+#                          commit). Nick accepted ~5 ms p95, so that is the gate.
+# A test warms up (one untimed turn), then runs up to LATENCY_TRIALS trials and stops at the first whose
+# every hook is under the gate; a regression that is real stays over it in all of them. The best whole
+# trial is judged, never the best of each hook from different trials.
+# JUDGMENT_HERMES_P95_MS overrides the gate (e.g. 3 to hold a quiet machine to the target).
+LATENCY_TARGET_P95_MS = 3.0
+LATENCY_GATE_P95_MS = float(os.environ.get("JUDGMENT_HERMES_P95_MS", "5"))
+LATENCY_TRIALS = 3
+
+
+def pct(values: list, q: float) -> float:
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(round(q * (len(ordered) - 1))))]
+
+
+def latency_trials(run_trial, trials: int = LATENCY_TRIALS, gate: float = LATENCY_GATE_P95_MS) -> tuple[dict, int]:
+    """Run ``run_trial()`` (-> {hook: [ms, ...]}) until a trial's every hook p95 is under ``gate``, at most
+    ``trials`` times. Returns (the best trial's times, how many trials ran)."""
+    best, best_worst, tried = {}, float("inf"), 0
+    while tried < trials:
+        tried += 1
+        times = run_trial()
+        worst = max((pct(series, 0.95) for series in times.values() if series), default=0.0)
+        if worst < best_worst:
+            best, best_worst = times, worst
+        if worst < gate:
+            break
+    return best, tried
+
+
+def over(times: dict, limit: float) -> dict:
+    """{hook: p95} for each hook whose p95 is at or over ``limit`` ms."""
+    return {hook: round(pct(series, 0.95), 3) for hook, series in times.items() if series and pct(series, 0.95) >= limit}
+
 
 def load_plugin(name: str = "judgment_tracing_under_test"):
     """Import hermes/ as a package under ``hermes_plugins``, as Hermes's loader does."""

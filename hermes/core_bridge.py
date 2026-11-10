@@ -223,12 +223,19 @@ def stamps(environment: str, root: str, export: list, rs: redact.Ruleset, secret
 
 
 # What a turn start reads from files, kept GATE_TTL seconds so a turn start makes no file syscall in
-# the steady state (under GIL contention each syscall can wait a whole switch interval). /judgment
-# clears it, so its own change applies at the next turn, and so does an edit to tracing.json (one
-# stat a turn checks it). A new tracing.json above the workspace, new credentials, or another
-# process's session switch applies within GATE_TTL.
+# the steady state: a syscall releases the GIL, and with 8 busy threads getting it back can take tens
+# of ms (measured: one os.stat a turn was p50 7 us, max 48 ms). /judgment clears it, so its own change
+# applies at the next turn. An edit to tracing.json applies within VERSION_CHECK_S (one stat per
+# slot per VERSION_CHECK_S, not one per turn). A new tracing.json above the workspace, new
+# credentials, or another process's session switch applies within GATE_TTL.
+#
+# One cache slot, three states, decided by two deadlines:
+#   fresh      now <= checked_until                -> use base, no syscall
+#   stale      checked_until < now <= expires      -> one stat: same version -> fresh again; else re-resolve
+#   expired    expires < now, or no slot, or edit  -> re-resolve (_base: walk-up, load, rules, stamps)
 GATE_TTL = 2.0
-_bases: dict = {}  # (workspace, env fingerprint) -> (expires, base dict or None)
+VERSION_CHECK_S = 0.25
+_bases: dict = {}  # (workspace, env fingerprint) -> (expires, checked_until, base dict or None)
 _overrides: dict = {}  # sessions folder -> (expires, file names in it)
 
 
@@ -287,12 +294,17 @@ def resolve(key: str, workspace: str, env: dict | None = None) -> Gate | None:
     now = time.monotonic()
     slot = (workspace, hash(frozenset(env.items())))
     cached = _bases.get(slot)
-    # One stat a turn: an edit to tracing.json applies at the next turn, as without the cache.
-    if cached is None or cached[0] < now or (cached[1] is not None and _version(cached[1]["file"]) != cached[1]["version"]):
+    if cached is not None and cached[1] < now <= cached[0]:  # stale: one stat says whether tracing.json changed
+        base = cached[2]
+        if base is not None and _version(base["file"]) != base["version"]:
+            cached = None
+        else:
+            cached = _bases[slot] = (cached[0], now + VERSION_CHECK_S, base)
+    if cached is None or cached[0] < now:
         if len(_bases) > 256:
             _bases.clear()
-        cached = _bases[slot] = (now + GATE_TTL, _base(workspace, env))
-    base = cached[1]
+        cached = _bases[slot] = (now + GATE_TTL, now + VERSION_CHECK_S, _base(workspace, env))
+    base = cached[2]
     if base is None or base.get("off") or _session_mode(base, key, env, now) != "on":
         return None
     project = base["project"]
