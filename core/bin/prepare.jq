@@ -109,17 +109,37 @@ def jp_pairs($rules; $l):
          if $p.most and ($t | split($p.needs[0]) | length) > $p.most + 1 then error("redaction limit") else $t | jp_found($p; $l)[] end
        else empty end]
   | unique_by(.[0]) | sort_by(-(.[0] | length));
+# The patch-header parser (sensitive.patch): the texts -> the path each header line names, in order: per text, per header
+# row, each line starting with its prefix, read up to `line`, unquoted, split at blanks for a row marked words. Split, not a
+# global match, so the work is linear; more than limits.patch_headers header lines fail closed.
+def jp_patch($p; $max):
+  [.[] | . as $t | $p.headers[] | . as $h
+   | if $t | contains($h.prefix) then ("\n" + $t | split("\n" + $h.prefix))[1:][] | [$h, .] else empty end]
+  | if length > $max then error("redaction limit") else . end
+  | [.[] | .[0] as $h | .[1] | _match_impl($p.line; null; false)[0].string
+     | if length > 1 and startswith("\"") and endswith("\"") then .[1:-1] else . end
+     | . as $w | ([$p.strip[] as $l | if $w | startswith($l) then $w[$l | length:] else empty end][0] // $w)
+     | if $h.words then split(" ")[] else . end
+     | if . == "" or $p.skip[.] then empty else . end];
 # {rule, trigger} for the first sensitive path or env dump the tool input names, or null. Path rules see one word per line,
-# from path and command values and the prompt's @mentions. Command rules see the values, one per line.
+# from path and command values, the targets of patch headers in them and in patch values, and the prompt's @mentions.
+# Command rules see the values, one per line.
 def jp_sensitive($c; $r):
   $r.sensitive as $s
+  # [kind, value]: "v" a path or command value, "p" a patch value. One walk.
   | ([(.tool_input, (.tool_calls[]? | if type == "object" then .arguments, .input else empty end))
      | if type == "string" then (. as $t | try fromjson catch $t) else . end
      | if type == "string" then {command: .} else . end
-     | .. | if type == "object" then . as $o | keys_unsorted[] | if $s.keys[.] then $o[.] | .. | if type == "string" then . else empty end else empty end else empty end]) as $vals
+     | .. | if type == "object" then . as $o | keys_unsorted[]
+              | if $s.keys[.] then $o[.] | .. | if type == "string" then ["v", .] else empty end
+                elif $s.patch.keys[.] then $o[.] | .. | if type == "string" then ["p", .] else empty end
+                else empty end
+            else empty end]) as $kv
+  | [$kv[] | if .[0] == "v" then .[1] else empty end] as $vals
   | ($vals | jp_join("\n")) as $cmds
+  | ($vals + [$kv[] | if .[0] == "p" then .[1] else empty end] | jp_patch($s.patch; $r.limits.patch_headers) | jp_join("\n")) as $targets
   # Split, not a global match: jq counts each match's offset from the start of the string, so many matches cost its square.
-  | (($cmds | jp_lines($s.split)) + "\n"
+  | (($cmds | jp_lines($s.split)) + "\n" + $targets + "\n"
      + (if (.prompt | type) == "string" and (.prompt | contains("@")) then
           if (.prompt | split("@") | length) > $r.limits.mentions + 1 then error("redaction limit") else . end
           | [.prompt | jp_lines($s.mention.split) | split("\n")[] | if startswith("@") then .[1:] | jp_lines($s.mention.end) | split("\n")[0] // "" else "" end

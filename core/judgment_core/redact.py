@@ -12,7 +12,9 @@ Everything is plain data through pure stages:
     compiled       every regex composed: what jq loads, and what this module compiles
     Ruleset        compiled patterns, members, sensitive paths and commands (a user rule that fails: error)
     env_secrets    (name, literal) for each secret-named environment value, and each line of it
-    sensitive      the sensitive path or env dump a tool call names, as {rule, trigger}, or None
+    patch_targets  PatchTarget(header, path) for each header line of a patch in the tool input (the patch-header parser)
+    sensitive      the sensitive path (from tool args, shell words, patch targets, @mentions), env dump, or
+                   credential-printing command a tool call names, as {rule, trigger}, or None
     findings       Finding(rule, start, end, kept): each rule's matches as spans of the unchanged blob, one
                    finditer per window (linear: no match is searched for twice)
     layers         the strings and keys of JSON nested deeper in a string than the rules read, one list per depth
@@ -87,12 +89,67 @@ def generated(table: Mapping | None = None) -> dict[str, str]:
     last = "|".join(dict.fromkeys(case for word in keys["names"] + keys["whole"] for case in _cases(word.split("_")[-1])))
     # The same names where a match starts: at the name, after an identifier start, a separator, or a camelCase boundary.
     # A text rule starts here rather than at the identifier, so no prefix is tried at every position.
-    tail = ("(?:(?:(?<![A-Za-z0-9_.-])|(?<=[_.-])|(?<=[a-z0-9])(?=[A-Z]))(?:" + names + ")|(?<![A-Za-z0-9_.-])(?:" + whole + "))")
+    tail = ("(?:(?:(?<![A-Za-z0-9_.-])|(?<=[_.-])|(?<=[a-z0-9])(?=[A-Z]))(?:" + names + ")|(?<![A-Za-z0-9_])(?:" + whole + "))")
     out = {"secret_key_name": name, "secret_key_tail": tail, "literal": literal, "secret_key_last": last}
+    if "assignment" in table:
+        out.update(_assignment_fragments(table["assignment"]))
+    readers = table.get("sensitive", {}).get("not_readers")
+    if readers:
+        cli = [item for item in table["sensitive"]["commands"] if "rows" in item] if readers.get("and_cli") else []
+        out["sh_not_reader"] = "|".join(dict.fromkeys([re.escape(word) for word in readers["words"]] + [cmd for item in cli for cmd in cli_needs(item)]
+                                                     + list(readers.get("patterns", []))))
     for tool, opts in table.get("shell_options", {}).items():
         if not tool.startswith("_"):
             out.update(_option_fragments(tool, opts))
     return out
+
+
+def _assignment_fragments(table: Mapping) -> dict[str, str]:
+    """The assignment recognizer's rows (the assignment table) as fragments. assign_ctx: one of the contexts, each setting its
+    group, then the key's identifier prefix. assign_close: the group of the context that was read matches again (a quoting
+    context's quote closes; the others are empty), then ok is set. assign_op: an operator, or a blank after a flag."""
+    keywords = "(?:(?:" + "|".join(map(re.escape, table["keywords"])) + ")[^\\S\\n]+(?:-[A-Za-z]{1,8}[^\\S\\n]+)?){0,3}"
+    contexts = table["contexts"]
+    ctx = "(?:" + "|".join(row["re"].replace("{keywords}", keywords) for row in contexts) + ")" + table["key_prefix"]
+    close = "(?:" + "|".join("\\k<" + row["group"] + ">" for row in contexts) + ")(?<ok>)"
+    ops = "|".join(re.escape(op) for op in sorted(table["operators"], key=len, reverse=True))
+    blank = "".join("|\\k<" + row["group"] + ">[^\\S\\n]+" for row in contexts if row.get("blank_operator"))
+    return {"assign_ctx": ctx, "assign_close": close, "assign_op": "(?:\\s{0,5}(?:" + ops + ")\\s{0,5}" + blank + ")"}
+
+
+def cli_regex(item: Mapping, table: Mapping) -> list:
+    """A secret_cli table (rows) as one rule regex, composed like any other: at a command position (sh_at), behind wrappers
+    (sh_prefix), each row's command, its subcommand words with options between them (sh_opts), its operand, and lookaheads
+    over the rest of the command's arguments (at most 16): one of `with` must follow, none of `unless` may."""
+    stop = {"def": "sh_stop"}
+    word = compose(table["defs"]["sh_word"], table)
+    groups = iter(range(1, 1 << 16))
+
+    def args() -> str:
+        name = f"cl{next(groups)}"
+        return "(?:[^\\S\\n]+(?=(?<" + name + ">" + word + "))\\k<" + name + ">){0,16}?[^\\S\\n]+"
+
+    alts: list = []
+    for row in item["rows"]:
+        part: list = ["(?:" + row["cmd"] + ")"]
+        for sub in row["words"]:
+            part += [{"def": "sh_opts"}, "(?:" + sub + ")", stop]
+        if row.get("operand"):
+            part += [{"def": "sh_opts"}, "['\"]?(?:" + row["operand"] + ")['\"]?", stop]
+        if row.get("alone"):
+            part.append("(?![^\\S\\n]+[^-\\s;&|()<>`#])")
+        if row.get("with"):
+            part += ["(?=" + args() + "(?:" + "|".join(row["with"]) + ")(?![A-Za-z0-9_-]))"]
+        unless = list(item.get("unless", [])) + list(row.get("unless", []))
+        if unless:
+            part += ["(?!" + args() + "(?:" + "|".join(map(re.escape, unless)) + ")", stop, ")"]
+        alts += (["|"] if alts else []) + part
+    return [{"def": "sh_at"}, {"def": "sh_prefix"}, {"def": "sh_path"}, "(?:"] + alts + [")"]
+
+
+def cli_needs(item: Mapping) -> list[str]:
+    """A secret_cli table's needed literals: its command words."""
+    return sorted({cmd for row in item["rows"] for cmd in row["cmd"].split("|")})
 
 
 def _option_fragments(tool: str, opts: Mapping) -> dict[str, str]:
@@ -151,8 +208,8 @@ def compiled(table: Mapping | None = None) -> dict:
     table = table or rules()
 
     def rule(item: Mapping, key: str = "re") -> dict:
-        out = {"id": item["id"], "re": compose(item[key], table)}
-        needs = _needs(item, table)
+        out = {"id": item["id"], "re": compose(cli_regex(item, table) if "rows" in item else item[key], table)}
+        needs = cli_needs(item) if "rows" in item else _needs(item, table)
         if needs:
             out["needs"] = needs
         if item.get("pre"):
@@ -173,6 +230,7 @@ def compiled(table: Mapping | None = None) -> dict:
             "paths": [rule(item) for item in sensitive["paths"]],
             "commands": [rule(item) for item in sensitive["commands"]],
             **{key: sensitive[key] for key in ("keys", "glob", "split", "mention")},
+            "patch": {key: value for key, value in sensitive["patch"].items() if key != "_comment"},
         },
         "fields": _field_sets(table["fields"]),
     }
@@ -741,13 +799,21 @@ def _all_strings(value: Any) -> Iterator[str]:
 
 def tool_texts(event: Mapping) -> list[str]:
     """Mirror of prepare.jq: the path and command values in the tool input, at any depth, by the table's keys."""
+    return tool_values(event)[0]
+
+
+def tool_values(event: Mapping) -> tuple[list[str], list[str]]:
+    """Mirror of prepare.jq: (the path and command values, the patch values) in the tool input, at any depth, by the table's
+    keys and patch keys. A string tool input is a command."""
     keys = rules()["sensitive"]["keys"]
+    patch_keys = rules()["sensitive"]["patch"]["keys"]
     raw = [event.get("tool_input")]
     calls = event.get("tool_calls")
     for call in calls if isinstance(calls, list) else calls.values() if isinstance(calls, dict) else []:
         if isinstance(call, dict):
             raw += [call.get("arguments"), call.get("input")]
     texts: list[str] = []
+    patches: list[str] = []
     for item in raw:
         if item is None:
             continue
@@ -762,7 +828,38 @@ def tool_texts(event: Mapping) -> list[str]:
             for key, value in obj.items():
                 if keys.get(key):
                     texts.extend(_all_strings(value))
-    return texts
+                elif patch_keys.get(key):
+                    patches.extend(_all_strings(value))
+    return texts, patches
+
+
+class PatchTarget(NamedTuple):
+    """One file a patch header names: which header row (its prefix) and the path, as plain data."""
+
+    header: str
+    path: str
+
+
+def patch_targets(texts: Iterable[str]) -> list[PatchTarget]:
+    """Mirror of jp_patch: the patch-header parser. For each text and header row (sensitive.patch.headers), each line that
+    starts with the row's prefix names a target: the rest of the line up to ``line``, unquoted, split at blanks for a row
+    marked words. More than ``limits.patch_headers`` header lines fail closed."""
+    table = rules()["sensitive"]["patch"]
+    line = _compile(table["line"])
+    found = [(row, piece) for text in texts for row in table["headers"] if row["prefix"] in text
+             for piece in ("\n" + text).split("\n" + row["prefix"])[1:]]
+    if len(found) > rules()["limits"]["patch_headers"]:
+        raise RedactionLimit("patch")
+    out = []
+    for row, piece in found:
+        path = line.match(piece).group(0)
+        if len(path) > 1 and path.startswith('"') and path.endswith('"'):
+            path = path[1:-1]
+        path = next((path[len(lead):] for lead in table["strip"] if path.startswith(lead)), path)
+        for word in path.split(" ") if row.get("words") else [path]:
+            if word and not table["skip"].get(word):
+                out.append(PatchTarget(row["prefix"], word))
+    return out
 
 
 def lines(text: str, at: list[str]) -> str:
@@ -772,10 +869,12 @@ def lines(text: str, at: list[str]) -> str:
     return text
 
 
-def words(event: Mapping, texts: list[str]) -> str:
-    """Mirror of prepare.jq: the words of the path and command values, then the prompt's @mentions, one per line."""
+def words(event: Mapping, texts: list[str], patches: list[str] = ()) -> str:
+    """Mirror of prepare.jq: the words of the path and command values, then the target of each patch header in them and in
+    the patch values (whole: a path may hold a blank), then the prompt's @mentions, one per line."""
     table = rules()["sensitive"]
-    found_words = lines("\n".join(texts), table["split"]) + "\n"
+    targets = patch_targets(list(texts) + list(patches))
+    found_words = lines("\n".join(texts), table["split"]) + "\n" + "\n".join(target.path for target in targets) + "\n"
     prompt = event.get("prompt")
     if isinstance(prompt, str) and "@" in prompt:
         if prompt.count("@") > rules()["limits"]["mentions"]:
@@ -793,8 +892,8 @@ def _whole_word(regex: str) -> re.Pattern:
 
 def sensitive(event: Mapping, rs: Ruleset) -> dict | None:
     """The first sensitive path or env dump the event's tool input names, as {rule, trigger}."""
-    texts = tool_texts(event)
-    blob = words(event, texts)
+    texts, patches = tool_values(event)
+    blob = words(event, texts, patches)
     for rule in rs.paths:
         if rule.applies(blob) and rule.pattern.search(blob):
             return {"rule": rule.id, "trigger": _whole_word(rule.pattern.pattern).search(blob).group(0)}

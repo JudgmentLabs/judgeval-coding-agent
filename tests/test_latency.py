@@ -52,10 +52,19 @@ def adversarial() -> list[tuple[str, str]]:
     ]
     rules = list(table["patterns"]) + list(table["members"]) + table["sensitive"]["paths"] + table["sensitive"]["commands"]
     for rule in rules:
-        needs = rule.get("needs")
+        needs = redact.cli_needs(rule) if "rows" in rule else rule.get("needs")
         need = needs[0] if isinstance(needs, list) and needs else "key"
         for sep in ("=", ": ", "://", " ", "\n", "a1"):
             cases.append((f"{rule['id']}: {need!r}+{sep!r}", fill(need + sep)))
+    # The patch-header parser: every header row, flooded (fails closed past limits.patch_headers) and as one long line.
+    for header in table["sensitive"]["patch"]["headers"]:
+        cases.append((f"patch {header['prefix']!r} lines", fill(header["prefix"] + "a\n")))
+        cases.append((f"patch {header['prefix']!r} one line", "\n" + header["prefix"] + fill("a/")))
+    # Each CLI row's words, repeated: options and lookaheads over arguments stay bounded.
+    for item in table["sensitive"]["commands"]:
+        for row in item.get("rows", []):
+            words = " ".join([row["cmd"].split("|")[0]] + [w.split("|")[0] for w in row["words"]])
+            cases.append((f"cli {row['row']}", fill(words + " -o ")))
     return cases
 
 
