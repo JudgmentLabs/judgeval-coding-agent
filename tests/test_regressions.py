@@ -1,12 +1,13 @@
 """The cross-round regression matrix, generated from tests/regressions.json: every concrete case the Codex reviews of
-capture: sanitized described (rounds 1-7, and commit 7458959), one row each, run
+capture: sanitized described (rounds 1-8, and commit 7458959), one row each, run
 
     (a) in both layers: the hook's jq and its Python mirror, which must agree, on the event the row's route builds;
     (b) for each row of a tool route (output, structured, command, input), through the real hook of every adapter
         (claude, codex, cursor, pi) into the inbox, and then through the sender's own pass (redact_event) over what the
         hook wrote.
 
-Each run is held to the row's expected outcome (unchanged, redacted, blanked, error; known_gap rows only to layer agreement).
+Each run is held to the row's expected outcome (unchanged, redacted, blanked, error, or leaks for a row a documented known
+limit lets through; known_gap rows only to layer agreement). A row whose limit is set names one of TABLE["limits"].
 Rule tables are data: a change to one that breaks any earlier round's case fails here, by row id.
 
 Every fake secret is generated at run time from the row's placeholders (<<name>>); the table holds none.
@@ -34,7 +35,8 @@ from judgment_core import redact
 
 TABLE = json.loads((Path(__file__).resolve().parent / "regressions.json").read_text(encoding="utf-8"))
 ROWS = TABLE["rows"]
-EXPECTS = ("unchanged", "redacted", "blanked", "error", "known_gap")
+LIMITS = TABLE["limits"]
+EXPECTS = ("unchanged", "redacted", "blanked", "error", "leaks", "known_gap")
 TOOL_ROUTES = ("output", "structured", "command", "input")
 ADAPTERS = ("claude", "codex", "cursor", "pi")
 PLACEHOLDER = re.compile(r"<<([a-z0-9]+)(?::([0-9]+))?>>")
@@ -87,7 +89,7 @@ class Case:
         if row.get("wrap"):
             self.input = row["wrap"].replace("{}", self.input)
         self.env = {key: self._fill(value) for key, value in row.get("env", {}).items()}
-        default = "<<opaque>>" if row["route"] in ("command", "input") and row["expect"] == "blanked" else "ok"
+        default = "<<opaque>>" if row["route"] in ("command", "input") and row["expect"] in ("blanked", "leaks") else "ok"
         self.output = self._fill(row.get("output", default))
 
     def _fill(self, value):
@@ -170,6 +172,11 @@ class Case:
                 found.append(f"{where}: not blanked")
             elif row.get("rule") and out.get("sensitive_rule") != row["rule"]:
                 found.append(f"{where}: blanked by {out.get('sensitive_rule')}, not {row['rule']}")
+        if expect == "leaks":
+            if not any(_leaks(core, out, row.get("strings_only", False)) for core in self.cores):
+                found.append(f"{where}: no longer leaks: the known limit {row.get('limit')} is fixed, so the row moves to redacted")
+            if out.get("sensitive") or out.get("redaction_error"):
+                found.append(f"{where}: lost its text: sensitive={out.get('sensitive_rule')} error={out.get('redaction_error')}")
         if expect == "error" and not out.get("redaction_error"):
             found.append(f"{where}: no redaction_error")
         for keep in row.get("keep", []):
@@ -215,12 +222,22 @@ def matrix_size() -> dict:
 class TableTests(unittest.TestCase):
     def test_rows_are_well_formed(self):
         bad = [row.get("id") for row in ROWS if row.get("expect") not in EXPECTS or row.get("route") not in TOOL_ROUTES + ("transcript", "label")
-               or not re.fullmatch(r"(r[1-7]\.[0-9]+|c[0-9a-f]{7})-[a-z0-9-]+", row.get("id", ""))]
+               or not re.fullmatch(r"(r[1-8]\.[0-9]+|c[0-9a-f]{7})-[a-z0-9-]+", row.get("id", ""))
+               or (row.get("limit") is not None and row["limit"] not in LIMITS) or (row["expect"] == "leaks" and not row.get("limit"))]
         self.assertEqual(bad, [])
         self.assertEqual(len({row["id"] for row in ROWS}), len(ROWS))
 
     def test_every_round_has_rows(self):
-        self.assertEqual(matrix_size()["rounds"], ["c7458959", "r1", "r2", "r3", "r4", "r5", "r6", "r7"])
+        self.assertEqual(matrix_size()["rounds"], ["c7458959", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8"])
+
+    def test_every_limit_is_documented(self):
+        """The README's Known limits list names every limit a row may cite, so a reviewer can tell a limit from a defect."""
+        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+        known = readme[readme.index("### Known limits") :]
+        self.assertEqual([name for name in LIMITS if f"(`{name}`)" not in known], [])
+
+    def test_every_limit_is_used(self):
+        self.assertEqual(sorted(set(LIMITS) - {row.get("limit") for row in ROWS}), ["space-separated"])
 
     def test_the_table_holds_no_secret(self):
         """Values are placeholders: a realistic token in the file would be a test bug."""

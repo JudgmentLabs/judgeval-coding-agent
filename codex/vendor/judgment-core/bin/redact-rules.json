@@ -2,383 +2,17 @@
   "_comment": [
     "Secret redaction rules, shared by the hook (core/bin/prepare.jq) and the sender (judgment_core/redact.py). This file is the source.",
     "scripts/gen_redact.py derives core/bin/redact-compiled.json (what jq loads: every regex composed) from it.",
-    "Regexes use what Oniguruma and Python re agree on: (?<name>...) for a named group (p: the text it holds is kept), \\\\k<name> to match it again;",
+    "Redaction is by format, plus three short data lists: secretNames (a value after one of these names), sensitivePaths and",
+    "sensitiveCommands (a tool call that touches one blanks its turn). Nothing here parses code, shell, or patches.",
+    "Regexes use what Oniguruma and Python re agree on: (?<name>...) for a named group (p: the text it holds is kept);",
     "no ^ or $ (use (?<![\\s\\S]) and (?![\\s\\S]) for the ends of a whole value); [0-9] and [A-Za-z], not \\d and \\w;",
     "no (?i), because Oniguruma compiles it slowly and jq compiles a regex on every call. Words are spelled lower, UPPER, and Capitalized.",
-    "Every repeat a lookahead scans is bounded, so no input makes a rule rescan the text after it (tests/test_latency.py).",
+    "Linear time: no repeat inside a repeat over characters both can take, and no two unbounded repeats over overlapping",
+    "characters in a row (tests/test_latency.py feeds every rule pathological text in both layers).",
     "needs: a rule can match only text holding one of these literals. Both layers skip the regex otherwise. tests/test_redact.py checks it.",
-    "pre: a small regex every match also matches; both layers skip the rule's regex when the text does not match it (a cheap",
-    "filter before an expensive regex). tests/test_redact.py checks it the way it checks needs."
+    "pre: a small regex every match also matches; both layers skip the rule's regex when the text does not match it."
   ],
-  "version": 3,
-  "defs": {
-    "_comment": [
-      "Regex fragments rules share. A rule's re may be a list: strings, and {\"def\": name} for one of these, or {\"gen\": name} for a",
-      "fragment scripts/gen_redact.py and redact.py compose from the tables below (secret_keys, literals).",
-      "secret_value: an unquoted value that looks like a credential. Not a reference (${X}, os.environ, process.env, a.b.c member),",
-      "a placeholder, a versioned name (api_key_v2), or a constant (API_KEY_2024, DEFAULT_PASSWORD2: CAPITAL words joined by _, or one",
-      "CAPITAL word with up to 4 digits), which in code name a value rather than hold one.",
-      "A def may itself be a list, composed the same way.",
-      "sh_*: a shell command tokenizer, one regex grammar both layers run (no atomic groups: Python 3.9 has none). Its states:",
-      "  code      outside quotes. Tokens: 'single' (inert), \"double\" (inert unless it holds $(...) or `...`), \\x, a quoted",
-      "            heredoc <<'EOF' with its body (inert), separators ; & | ( newline ` $(, runs of other characters, blanks.",
-      "            Each token is decided by its first character, and a quote that closes nothing is one character, so the",
-      "            engine never reads text two ways (a run that took a backslash made it exponential).",
-      "  command   a command position: the start, after a separator, inside sh -c '...' or \"...\" (or eval's), or inside",
-      "            \"...$(...)\". There the words before the command (assignments, sudo and the like with their options, env",
-      "            with its, keywords) are skipped, and the command word and its arguments are read whole (sh_word).",
-      "  Impossible: a command position inside an inert token. A text the grammar cannot read (a quote in an irregular",
-      "  place) is read as code, so its words can only count, never hide.",
-      "sh_args reads each argument whole: a lookahead captures it and \\\\k<aw> matches it, so the engine never gives part back.",
-      "sh_envarg: one argument of env before its command (shell_options.env): a short cluster, ending in an option that takes",
-      "the rest of the cluster or the next word; a lone - or --; a long option with its argument (--unset NAME, --chdir=DIR);",
-      "another long option (--null, --block-signal=INT); or an assignment. -S/--split-string's argument is the command line",
-      "env runs: it counts as no command only when it runs env or printenv itself, or nothing (sh_splitdump).",
-      "sh_opts: up to 4 options (with an argument each, as --opt=arg or -o arg) between a command's words, then the blank before",
-      "the next word: kubectl -n prod get secret, aws --profile p configure get."
-    ],
-    "secret_name": "(?:api|API|Api)[_-]?(?:key|KEY|Key)|(?:secret|SECRET|Secret)[_-]?(?:key|KEY|Key)|(?:client|CLIENT|Client)[_-]?(?:secret|SECRET|Secret)|(?:secret|SECRET|Secret)|(?:access|ACCESS|Access)[_-]?(?:key|KEY|Key)|(?:private|PRIVATE|Private)[_-]?(?:key|KEY|Key)|(?:auth|AUTH|Auth)[_-]?(?:token|TOKEN|Token)|(?:access|ACCESS|Access)[_-]?(?:token|TOKEN|Token)|(?:refresh|REFRESH|Refresh)[_-]?(?:token|TOKEN|Token)|(?:session|SESSION|Session)[_-]?(?:token|TOKEN|Token)|(?:token|TOKEN|Token)|(?:password|PASSWORD|Password)|(?:passwd|PASSWD|Passwd)|(?:passphrase|PASSPHRASE|Passphrase)|(?:credentials|CREDENTIALS|Credentials)|(?:credential|CREDENTIAL|Credential)",
-    "secret_value": "(?!\\\\?[\\\"']?(?:xxx|XXX|Xxx|\\*\\*\\*|\\.\\.\\.|changeme|CHANGEME|Changeme|change_me|CHANGE_ME|Change_me|change-me|CHANGE-ME|Change-me|your_|YOUR_|Your_|your-|YOUR-|Your-|example|EXAMPLE|Example|placeholder|PLACEHOLDER|Placeholder|dummy|DUMMY|Dummy|redacted|REDACTED|Redacted|sample|SAMPLE|Sample|null\\b|NULL\\B|Null\\b|none\\b|NONE\\B|None\\b|undefined\\b|UNDEFINED\\B|Undefined\\b|true\\b|TRUE\\B|True\\b|false\\b|FALSE\\B|False\\b|process\\.env|PROCESS\\.ENV|Process\\.env|os\\.environ|OS\\.ENVIRON|Os\\.environ|os\\.getenv|OS\\.GETENV|Os\\.getenv|env\\.|ENV\\.|Env\\.|env\\[|ENV\\[|Env\\[|getenv|GETENV|Getenv|secrets\\.|SECRETS\\.|Secrets\\.|vault:|VAULT:|Vault:|arn:|ARN:|Arn:))(?![A-Za-z_][A-Za-z0-9_]{0,63}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,63}){1,16}(?![A-Za-z0-9_\\-+/.~!@#%^*]))(?![A-Za-z_]{1,64}_?[vV][0-9]{1,3}(?![A-Za-z0-9_\\-+/.~!@#%^*]))(?![A-Z][A-Z0-9]{0,63}(?:_[A-Z0-9]{1,63}){1,8}(?![A-Za-z0-9_\\-+/.~!@#%^*]))(?![A-Z]{2,64}[0-9]{1,4}(?![A-Za-z0-9_\\-+/.~!@#%^*]))(?![$<{%\\[(/~.])(?=[A-Za-z0-9_\\-+/.~!@#%^*]{0,255}[0-9])(?=[A-Za-z0-9_\\-+/.~!@#%^*]{0,255}[A-Za-z])[A-Za-z0-9_\\-+/.~!@#%^*]{8,}={0,3}(?=[\\\"'`\\s,;)}\\]&<>|\\\\]|$)",
-    "secret_key": "[A-Za-z0-9_.-]{0,64}?(?:(?:api|API|Api)[_-]?(?:key|KEY|Key)|(?:secret|SECRET|Secret)[_-]?(?:key|KEY|Key)|(?:client|CLIENT|Client)[_-]?(?:secret|SECRET|Secret)|(?:secret|SECRET|Secret)|(?:access|ACCESS|Access)[_-]?(?:key|KEY|Key)|(?:private|PRIVATE|Private)[_-]?(?:key|KEY|Key)|(?:auth|AUTH|Auth)[_-]?(?:token|TOKEN|Token)|(?:access|ACCESS|Access)[_-]?(?:token|TOKEN|Token)|(?:refresh|REFRESH|Refresh)[_-]?(?:token|TOKEN|Token)|(?:session|SESSION|Session)[_-]?(?:token|TOKEN|Token)|(?:token|TOKEN|Token)|(?:password|PASSWORD|Password)|(?:passwd|PASSWD|Passwd)|(?:passphrase|PASSPHRASE|Passphrase)|(?:credentials|CREDENTIALS|Credentials)|(?:credential|CREDENTIAL|Credential))",
-    "sh_run": "(?<![^\\s'\"\\\\;&|()<>`$])[^\\s'\"\\\\;&|()<>`$]+",
-    "sh_hws": "(?<![^\\S\\n])[^\\S\\n]+",
-    "sh_subst": "\\$\\((?:[^()'\"\\\\`]|\\\\[\\s\\S]|'[^']*'|\"(?:[^\"\\\\$`]|\\\\[\\s\\S]|\\$(?!\\())*\"|\\([^()'\"\\\\`]*\\))*\\)|`[^`]*`",
-    "sh_dqchar": "[^\"\\\\$`]|\\\\[\\s\\S]|\\$(?!\\()",
-    "sh_dqbody": [
-      "(?:",
-      {
-        "def": "sh_dqchar"
-      },
-      "|",
-      {
-        "def": "sh_subst"
-      },
-      ")*"
-    ],
-    "sh_sep": "(?:\\$\\(|[;&|(\\n`])",
-    "sh_heredoc": "<<-?[^\\S\\n]*['\"](?<hd>[A-Za-z0-9_.-]{1,64})['\"][^\\n]*(?:\\n[^\\n]*)*?(?:\\n[^\\S\\n]*\\k<hd>(?![^\\n])|(?![\\s\\S]))",
-    "sh_ops": [
-      "\\$\\(|\\$(?!\\()|[;&|()\\n`>]|<(?!<-?[^\\S\\n]*['\"][A-Za-z0-9_.-]{1,64}['\"])|",
-      {
-        "def": "sh_run"
-      },
-      "|",
-      {
-        "def": "sh_hws"
-      }
-    ],
-    "sh_tok": [
-      "(?:'[^']*'|'(?![^']*')|\"",
-      {
-        "def": "sh_dqbody"
-      },
-      "\"|\"(?!",
-      {
-        "def": "sh_dqbody"
-      },
-      "\")|\\\\[\\s\\S]|\\\\(?![\\s\\S])|",
-      {
-        "def": "sh_heredoc"
-      },
-      "|",
-      {
-        "def": "sh_ops"
-      },
-      ")"
-    ],
-    "sh_in_sq": [
-      "(?:\"[^\"']*\"|\"(?![^\"']*\")|\\\\[^']|",
-      {
-        "def": "sh_ops"
-      },
-      ")"
-    ],
-    "sh_in_dq": [
-      "(?:'[^'\"]*'|'(?![^'\"]*')|\\\\[\\s\\S]|",
-      {
-        "def": "sh_ops"
-      },
-      ")"
-    ],
-    "sh_in_sub": [
-      "(?:'[^']*'|'(?![^']*')|\"(?:",
-      {
-        "def": "sh_dqchar"
-      },
-      ")*\"|\\\\[\\s\\S]|",
-      {
-        "def": "sh_ops"
-      },
-      ")"
-    ],
-    "sh_word": "(?:'[^']*'|\"(?:[^\"\\\\]|\\\\[\\s\\S])*\"|\\\\[\\s\\S]|[^\\s;&|()<>`'\"\\\\])+",
-    "sh_path": "(?:(?:/[^\\s/;&|()<>`'\"\\\\]{1,64}){0,8}/)?",
-    "sh_stop": "(?![^\\s;&|)<>`'\"])",
-    "sh_shell": [
-      {
-        "def": "sh_path"
-      },
-      "(?:(?:ba|z|da|k|fi|tc|mk|a)?sh(?:[^\\S\\n]+-[A-Za-z]+){0,4}[^\\S\\n]+-[A-Za-z]*c[A-Za-z]*|eval)"
-    ],
-    "sh_at": [
-      "(?<![\\s\\S])",
-      {
-        "def": "sh_tok"
-      },
-      "*?(?:(?<![\\s\\S])|",
-      {
-        "def": "sh_sep"
-      },
-      "|(?<![^\\s;&|(`])",
-      {
-        "def": "sh_shell"
-      },
-      "[^\\S\\n]+'(?:",
-      {
-        "def": "sh_in_sq"
-      },
-      "*?",
-      {
-        "def": "sh_sep"
-      },
-      ")?|(?<![^\\s;&|(`])",
-      {
-        "def": "sh_shell"
-      },
-      "[^\\S\\n]+\"(?:",
-      {
-        "def": "sh_in_dq"
-      },
-      "*?",
-      {
-        "def": "sh_sep"
-      },
-      ")?|\"(?:",
-      {
-        "def": "sh_dqchar"
-      },
-      "|",
-      {
-        "def": "sh_subst"
-      },
-      ")*?(?:\\$\\(|`)(?:",
-      {
-        "def": "sh_in_sub"
-      },
-      "*?",
-      {
-        "def": "sh_sep"
-      },
-      ")?)[^\\S\\n]*(?![;&|)\\n]|(?![\\s\\S]))"
-    ],
-    "sh_assign": [
-      "[A-Za-z_][A-Za-z0-9_]{0,63}=(?:",
-      {
-        "def": "sh_word"
-      },
-      ")?"
-    ],
-    "sh_long": [
-      "--[A-Za-z][A-Za-z-]{0,31}(?:=",
-      {
-        "def": "sh_word"
-      },
-      ")?"
-    ],
-    "sh_envarg": [
-      "(?:-",
-      {
-        "gen": "env_short_flag"
-      },
-      "{0,8}(?:",
-      {
-        "gen": "env_short_arg"
-      },
-      "(?:[^\\S\\n]+)?",
-      {
-        "def": "sh_word"
-      },
-      "|",
-      {
-        "gen": "env_short_split"
-      },
-      "(?:[^\\S\\n]+)?",
-      {
-        "def": "sh_splitdump"
-      },
-      {
-        "def": "sh_word"
-      },
-      ")|-",
-      {
-        "gen": "env_short_flag"
-      },
-      "{1,8}",
-      {
-        "def": "sh_stop"
-      },
-      "|--?",
-      {
-        "def": "sh_stop"
-      },
-      "|--(?:",
-      {
-        "gen": "env_long_arg"
-      },
-      "(?:=|[^\\S\\n]+)",
-      {
-        "def": "sh_word"
-      },
-      "|",
-      {
-        "gen": "env_long_split"
-      },
-      "(?:=|[^\\S\\n]+)",
-      {
-        "def": "sh_splitdump"
-      },
-      {
-        "def": "sh_word"
-      },
-      ")|--(?!(?:help|version)",
-      {
-        "def": "sh_stop"
-      },
-      ")(?!(?:",
-      {
-        "gen": "env_long_arg"
-      },
-      "|",
-      {
-        "gen": "env_long_split"
-      },
-      ")(?![A-Za-z0-9-]))[A-Za-z][A-Za-z0-9-]{0,31}(?:=",
-      {
-        "def": "sh_word"
-      },
-      ")?|",
-      {
-        "def": "sh_assign"
-      },
-      ")"
-    ],
-    "sh_prefix": [
-      "(?:(?:",
-      {
-        "def": "sh_assign"
-      },
-      "|",
-      {
-        "def": "sh_path"
-      },
-      "(?:sudo|doas)(?:[^\\S\\n]+(?:-[ugpCDhrtTRU][^\\S\\n]+(?!-)",
-      {
-        "def": "sh_word"
-      },
-      "|-(?![ugpCDhrtTRU](?![A-Za-z]))[A-Za-z]{1,16}|",
-      {
-        "def": "sh_long"
-      },
-      ")){0,8}|",
-      {
-        "def": "sh_path"
-      },
-      "(?:exec|nohup|builtin|setsid|time|nice|ionice|stdbuf|chrt|taskset|caffeinate|unbuffer|xargs|timeout)(?:[^\\S\\n]+(?:-[A-Za-z0-9]{1,16}(?:[^\\S\\n]+[0-9][0-9A-Za-z.]{0,15})?|",
-      {
-        "def": "sh_long"
-      },
-      ")){0,8}(?:[^\\S\\n]+[0-9][0-9.]{0,15}[smhd]?)?|command(?:[^\\S\\n]+-p)?|",
-      {
-        "def": "sh_path"
-      },
-      "env(?:[^\\S\\n]+",
-      {
-        "def": "sh_envarg"
-      },
-      "){0,16}|!|then|do|else|elif|if|while|until|\\{|",
-      {
-        "def": "sh_shell"
-      },
-      ")[^\\S\\n]+){0,8}"
-    ],
-    "sh_end": "[^\\S\\n]*(?=[;&|)\\n`'\"<>#]|[0-9]{1,4}[<>]|(?![\\s\\S]))",
-    "sh_args": [
-      "(?:",
-      "[^\\S\\n]+(?=(?<aw>",
-      {
-        "def": "sh_word"
-      },
-      "))\\k<aw>){0,16}?",
-      "[^\\S\\n]+"
-    ],
-    "sh_notpat": "(?<!--grep[^\\S\\n])(?<!--regexp[^\\S\\n])(?<!-e[^\\S\\n])(?<!-S[^\\S\\n])(?<!-G[^\\S\\n])(?<!-g[^\\S\\n])(?<!--glob[^\\S\\n])",
-    "sh_search": [
-      {
-        "def": "sh_path"
-      },
-      "(?:grep|egrep|fgrep|rg|ag|ack|git[^\\S\\n]+grep)(?:[^\\S\\n]+-(?!e",
-      {
-        "def": "sh_stop"
-      },
-      "|-regexp)[^\\s;&|()<>`'\"\\\\]{1,64})*(?:[^\\S\\n]+(?:-e|--regexp)(?:[^\\S\\n]+|=)",
-      {
-        "def": "sh_word"
-      },
-      "|[^\\S\\n]+(?!-)",
-      {
-        "def": "sh_word"
-      },
-      ")"
-    ],
-    "sh_reader": [
-      "(?:(?:",
-      {
-        "def": "sh_search"
-      },
-      "|git[^\\S\\n]+(?!grep",
-      {
-        "def": "sh_stop"
-      },
-      ")",
-      {
-        "def": "sh_word"
-      },
-      "|(?!(?:",
-      {
-        "gen": "sh_not_reader"
-      },
-      ")",
-      {
-        "def": "sh_stop"
-      },
-      ")",
-      {
-        "def": "sh_word"
-      },
-      ")",
-      {
-        "def": "sh_args"
-      },
-      {
-        "def": "sh_notpat"
-      },
-      ")?"
-    ],
-    "sh_splitdump": [
-      "(?=['\"]?",
-      {
-        "def": "sh_path"
-      },
-      "(?:env|printenv)(?![^\\s;&|)<>`'\"])|''|\"\")"
-    ],
-    "sh_opts": [
-      "(?:[^\\S\\n]+-{1,2}[A-Za-z][A-Za-z0-9-]{0,31}(?:(?:=|[^\\S\\n]+(?!-))",
-      {
-        "def": "sh_word"
-      },
-      ")?){0,4}[^\\S\\n]+"
-    ]
-  },
+  "version": 4,
   "limits": {
     "_comment": [
       "Bounds on the work redaction does, so no input makes the hook slow (tests/test_latency.py).",
@@ -394,9 +28,7 @@
       "The hook allows `pairs` distinct finds an event: jq matches a long window once per distinct find. The sender's matching",
       "is linear (one finditer per rule and window, its finds kept as spans of the unchanged text), so it allows `sender_pairs`.",
       "JSON nested in a string deeper than its rules read (a string holding \\\\\\\" ) is decoded, up to `depth` layers; what each",
-      "layer holds is replaced as encoded where it sits. Deeper nesting, or a find whose encoding is not in the text, fails.",
-      "A tool input whose patch texts hold more than `patch_headers` header lines fails too.",
-      "A secret_cli row's flags are looked for among the first `cli_args` arguments of its command (redact.cli_regex)."
+      "layer holds is replaced as encoded where it sits. Deeper nesting, or a find whose encoding is not in the text, fails."
     ],
     "window": 16384,
     "step": 8192,
@@ -404,9 +36,7 @@
     "mentions": 256,
     "dense": 8192,
     "sender_pairs": 4096,
-    "depth": 4,
-    "patch_headers": 4096,
-    "cli_args": 32
+    "depth": 4
   },
   "patterns": [
     {
@@ -536,104 +166,52 @@
         "Bearer"
       ],
       "re": "(?<p>(?<![A-Za-z0-9_-])(?:bearer|BEARER|Bearer)\\s+)(?!\\$|<|\\{\\{|%)(?=[A-Za-z._~+/=-]{0,255}[0-9])[A-Za-z0-9._~+/=-]{16,}"
-    },
-    {
-      "id": "secret_assignment",
-      "needs": [
-        "key",
-        "KEY",
-        "Key",
-        "secret",
-        "SECRET",
-        "Secret",
-        "token",
-        "TOKEN",
-        "Token",
-        "password",
-        "PASSWORD",
-        "Password",
-        "passwd",
-        "PASSWD",
-        "Passwd",
-        "passphrase",
-        "PASSPHRASE",
-        "Passphrase",
-        "credential",
-        "CREDENTIAL",
-        "Credential",
-        "auth",
-        "AUTH",
-        "Auth"
-      ],
-      "re": [
-        "(?<p>(?:",
-        {
-          "def": "secret_name"
-        },
-        ")\\\\?[\\\"']?\\s{0,5}(?::=|=>|[:=])\\s{0,5}\\\\?[\\\"']?",
-        "|(?:",
-        {
-          "gen": "shaped_text"
-        },
-        ")\\\\?[\\\"']?\\s{0,5}(?::=|=>|[:=])\\s{0,5}\\\\?[\\\"']?",
-        "(?!",
-        {
-          "gen": "shaped_not"
-        },
-        "))",
-        {
-          "def": "secret_value"
-        }
-      ],
-      "pre": "(?:key|KEY|Key|auth|AUTH|Auth|secret|SECRET|Secret|token|TOKEN|Token|password|PASSWORD|Password|passwd|PASSWD|Passwd|passphrase|PASSPHRASE|Passphrase|credentials|CREDENTIALS|Credentials|credential|CREDENTIAL|Credential)\\\\?[\"']?\\s{0,5}(?::=|=>|[:=])"
-    },
-    {
-      "_comment": [
-        "A quoted value under a secret name, of any length, read by the assignment recognizer (the assignment table above):",
-        "only after a context that makes the quote after the operator an opening quote. Each quote style stands alone: an",
-        "escaped opening quote (\\\") opens only an escaped value, which ends at the next \\\" (doubly encoded JSON), so no",
-        "alternative reads past its own value. A value that runs to the end of a window is a match there: one too long for any",
-        "window fails closed (limits). A value whose first line has no blank and ends the line (a \\\\ before the newline too)",
-        "runs across lines to its closing quote; otherwise it ends at the line's end."
-      ],
-      "id": "quoted_secret",
-      "needs": "secret_key_name",
-      "re": [
-        "(?<p>",
-        {
-          "gen": "assign_ctx"
-        },
-        "(?:",
-        {
-          "gen": "secret_key_tail"
-        },
-        ")",
-        {
-          "gen": "assign_close"
-        },
-        {
-          "gen": "assign_op"
-        },
-        "(?:\\\\\"|\"|'))",
-        "(?!(?:",
-        {
-          "gen": "literal"
-        },
-        ")(?:\\\\\"|\"|'))",
-        "(?:(?<=\\\\\\\")(?:[^\\\"\\\\\\n]|\\\\\\\\(?:\\\\\\\\|\\\\\\\"|[^\\\"\\\\\\n]))+(?:(?=\\\\\\\")|(?![\\s\\S]))|(?<=\\\")(?<!\\\\\\\")(?:(?:[^\\\"\\\\\\s]|\\\\[^\\s])+\\\\?[^\\S\\n]*\\n(?:[^\\\"\\\\]|\\\\[\\s\\S])*|(?:[^\\\"\\\\\\n]|\\\\[^\\n])+)(?:(?=\\\")|(?![\\s\\S]))|(?<=')(?:(?:[^'\\\\\\s]|\\\\[^\\s])+\\\\?[^\\S\\n]*\\n(?:[^'\\\\]|\\\\[\\s\\S])*|(?:[^'\\\\\\n]|\\\\[^\\n])+)(?:(?=')|(?![\\s\\S])))",
-        {
-          "gen": "assign_after"
-        }
-      ],
-      "pre": [
-        "(?:",
-        {
-          "gen": "secret_key_last"
-        },
-        ")\\\\?[\"']?\\s{0,5}(?:(?::=|=>|[:=])\\s{0,5}|[^\\S\\n]+)\\\\?[\"']"
-      ]
     }
   ],
+  "secretNames": {
+    "_comment": [
+      "A value after one of these names is redacted, whatever it looks like. A name is lowercase parts joined by _; it matches",
+      "each part lower, UPPER, or Capitalized, joined by _, -, ., or nothing (api_key: API_KEY, api-key, apiKey, ApiKey, apikey).",
+      "It counts at an identifier boundary: after no letter or digit (db_password, --token), or at a camelCase hump (smtpPassword).",
+      "Left out on purpose: key and auth (sort_key, s3 object keys, oauth), which only format rules redact, and authorization (authorization_header and bearer_token read headers).",
+      "A project adds names with redactNames in .judgment/tracing.json."
+    ],
+    "names": [
+      "password",
+      "passwd",
+      "pwd",
+      "passphrase",
+      "secret",
+      "secret_key",
+      "client_secret",
+      "token",
+      "api_key",
+      "access_key",
+      "private_key",
+      "credential",
+      "credentials"
+    ],
+    "assignment": {
+      "_comment": [
+        "secret_assignment, in text: {names} at an identifier boundary, an optional closing quote (escaped any number of times, as",
+        "nested JSON writes it), : or = (also := and =>), then the value: quoted (up to its quote, a newline, a comma, or a",
+        "backslash; not starting with a blank or + ) ; ] }, which follow a string that just closed: \"password: \" + pw), or bare",
+        "(up to a blank, a quote, a comma, ; ) ] } or a backslash; not starting with = [ { ( or :).",
+        "Only the value is replaced. A value that is already a placeholder is left alone."
+      ],
+      "id": "secret_assignment",
+      "re": "(?<p>(?:(?<![A-Za-z0-9])|(?<=[a-z0-9])(?=[A-Z])){names}\\\\{0,31}[\"']?[^\\S\\n]{0,8}(?::=|=>|[:=])[^\\S\\n]{0,8}\\\\{0,31}[\"']?)(?!\\[REDACTED:)(?:(?<=\")[^\"\\s,\\\\+);\\]}][^\"\\n,\\\\]*|(?<=')[^'\\s,\\\\+);\\]}][^'\\n,\\\\]*|(?<![\"'])[^\\s\"'`,;\\\\)\\]}=\\[{(:][^\\s\"'`,;\\\\)\\]}]*)"
+    },
+    "field": {
+      "_comment": [
+        "secret_field, in structured values: a member whose key ends in one of the names (at the same boundaries) loses its",
+        "nonempty string value. It runs over the compact JSON of the event's text fields in both layers, as jq writes it."
+      ],
+      "id": "secret_field",
+      "re": "(?<p>(?<=[{,])\"[A-Za-z0-9_.-]{0,64}?(?:(?<![A-Za-z0-9])|(?<=[a-z0-9])(?=[A-Z])){names}\":\")(?!\\[REDACTED:)(?:[^\"\\\\]|\\\\.)+(?:(?=\")|(?![\\s\\S]))",
+      "needs_suffix": "\":\""
+    }
+  },
   "env": {
     "_comment": [
       "The value of each environment variable whose name looks secret is replaced literally wherever it appears: the whole value,",
@@ -651,740 +229,18 @@
   },
   "sensitive": {
     "_comment": [
-      "A tool call that reads one of these paths, or dumps the environment, blanks its whole turn.",
-      "keys: the tool input members whose string (or list of strings) values are paths or commands, at any depth, by kind.",
-      "split: the characters that end a word of those values. Path rules see one word per line. Command rules see the values, one per line.",
-      "mention: an @word in the prompt is a path too. A word starts after one of mention.split and ends at one of mention.end.",
-      "glob: how a redactPaths glob becomes a regex, one character at a time. * is any run of characters, / included, and ? is one.",
-      "A path word starts after a newline, a /, or a : (a Git revision path: HEAD:.env). A rule scans one component, never",
-      "past a / or a :, so a word of many colons costs linear work. A secrets or credentials name without an extension counts",
-      "after a / or a :, as a definite path, or as a command's operand.",
-      "definite: a word that can only be a path (a patch target, or a whole value under a key of kind path) is also seen as",
-      "definite.prefix + itself when relative (not starting with one of definite.absolute): ./credentials, a bare name in the",
-      "working folder. A command's words are not definite: git commit -m credentials names no file.",
-      "Command rules read each value on its own with the shell tokenizer (defs sh_*): a command counts only at a command",
-      "position, behind wrappers and assignments, and not in quoted text, a quoted heredoc's body, or a lookup (which,",
-      "command -v, --help, --version). A bare credentials or secrets operand is a read for any command but a search tool's",
-      "pattern (or the argument of --grep, -e, -S, -G, -g), and the arguments of echo, printf, which, man, help, type, command."
-    ],
-    "paths": [
-      {
-        "id": "dotenv",
-        "needs": [
-          ".env"
-        ],
-        "re": "(?<![^\\n/:])\\.env(?:rc)?(?:[.*~](?!(?:example|sample|template|dist|defaults?|schema)~?(?![^\\n]))(?:[A-Za-z0-9_.*~-]|\\[REDACTED:[^\\]\\n]{1,128}\\])*)?(?![^\\n])",
-        "examples": [
-          ".env",
-          ".env.local",
-          "app/.env.production",
-          ".envrc"
-        ],
-        "not": [
-          ".env.example",
-          "src/environment.ts",
-          "docs/env.md"
-        ]
-      },
-      {
-        "id": "ssh_private_key",
-        "needs": [
-          "id_rsa",
-          "id_dsa",
-          "id_ecdsa",
-          "id_ed25519"
-        ],
-        "re": "(?<![^\\n/:])id_(?:rsa|dsa|ecdsa|ed25519)(?:_sk)?(?![^\\n])",
-        "examples": [
-          "id_rsa",
-          "~/.ssh/id_ed25519"
-        ],
-        "not": [
-          "id_rsa.pub",
-          "src/id_rsa_parser.py"
-        ]
-      },
-      {
-        "id": "key_file",
-        "needs": [
-          ".pem",
-          ".key",
-          ".p12",
-          ".pfx",
-          ".jks",
-          ".keystore",
-          ".ppk"
-        ],
-        "re": "(?<![^\\n/:])[^\\n/:]*[A-Za-z0-9_-]\\.(?:pem|key|p12|pfx|jks|keystore|ppk)(?![^\\n])",
-        "examples": [
-          "server.pem",
-          "certs/tls.key",
-          "store.p12"
-        ],
-        "not": [
-          "src/key.py",
-          "docs/pem.md"
-        ]
-      },
-      {
-        "id": "credentials_file",
-        "needs": [
-          "credentials"
-        ],
-        "re": "(?:(?<=[/:])credentials|(?<![^\\n/:])[A-Za-z0-9_.-]*credentials\\.(?:json|ya?ml|toml|ini|csv|xml|db))(?![^\\n])",
-        "examples": [
-          "~/.aws/credentials",
-          "gcp-credentials.json",
-          "credentials"
-        ],
-        "not": [
-          "src/credentials.py",
-          "docs/credentials.md",
-          "credentials.md"
-        ]
-      },
-      {
-        "id": "secret_file",
-        "needs": [
-          "secret",
-          "SECRET",
-          "Secret"
-        ],
-        "re": "(?:(?<![^\\n/:])(?=[^\\n/:]*(?![^\\n]))(?=[^\\n/:]*\\.)(?![^\\n/:]*\\.(?:py|pyi|js|mjs|cjs|ts|tsx|jsx|go|rs|java|kt|rb|php|cs|c|h|cc|cpp|hpp|swift|scala|sh|bash|zsh|ps1|md|mdx|rst|html|css|scss|sql|proto|lock|map|snap|svg|png|jpg|ipynb)(?![^\\n]))[^\\n/:]*(?:secret|SECRET|Secret)[^\\n/:]*|(?<=[/:])(?:secrets?|SECRETS?|Secrets?))(?![^\\n])",
-        "examples": [
-          "secrets.yaml",
-          "config/secret.json",
-          "secrets",
-          "secret",
-          "Secrets"
-        ],
-        "not": [
-          "src/secrets.py",
-          "lib/secret_manager.ts",
-          "secrets.py"
-        ]
-      },
-      {
-        "id": "auth_file",
-        "needs": [
-          "netrc",
-          "npmrc",
-          "pypirc",
-          "git-credentials",
-          "pgpass",
-          "htpasswd",
-          "dockercfg",
-          "auth.json",
-          ".boto",
-          "s3cfg",
-          "vault-token",
-          "config"
-        ],
-        "re": "(?:(?<![^\\n/:])(?:\\.netrc|_netrc|\\.npmrc|\\.pypirc|\\.git-credentials|\\.pgpass|\\.htpasswd|\\.dockercfg|auth\\.json|\\.boto|\\.s3cfg|\\.vault-token)|(?<=\\.docker/)config\\.json|(?<=\\.kube/)config)(?![^\\n])",
-        "examples": [
-          ".netrc",
-          ".npmrc",
-          "~/.docker/config.json",
-          "~/.kube/config"
-        ],
-        "not": [
-          "src/config.json",
-          "docs/netrc.md"
-        ]
-      },
-      {
-        "id": "proc_environ",
-        "needs": [
-          "/environ"
-        ],
-        "re": "(?<![^\\n])/proc/[^\\n/]+/environ(?![^\\n])",
-        "examples": [
-          "/proc/self/environ"
-        ],
-        "not": [
-          "/proc/self/status"
-        ]
-      }
-    ],
-    "commands": [
-      {
-        "id": "env_dump",
-        "needs": [
-          "env",
-          "set",
-          "export",
-          "declare",
-          "typeset"
-        ],
-        "re": [
-          {
-            "def": "sh_at"
-          },
-          {
-            "def": "sh_prefix"
-          },
-          {
-            "def": "sh_path"
-          },
-          "(?:env(?:[^\\S\\n]+",
-          {
-            "def": "sh_envarg"
-          },
-          "){0,16}|printenv|set|export(?:[^\\S\\n]+-p)?|declare[^\\S\\n]+-[a-z]*[px][a-z]*|typeset[^\\S\\n]+-[a-z]*x[a-z]*)",
-          {
-            "def": "sh_end"
-          }
-        ]
-      },
-      {
-        "id": "printenv",
-        "needs": [
-          "printenv"
-        ],
-        "re": [
-          {
-            "def": "sh_at"
-          },
-          {
-            "def": "sh_prefix"
-          },
-          {
-            "def": "sh_path"
-          },
-          "printenv",
-          {
-            "def": "sh_stop"
-          },
-          "(?![^\\S\\n]+--(?:help|version)",
-          {
-            "def": "sh_stop"
-          },
-          ")"
-        ]
-      },
-      {
-        "id": "credentials_file",
-        "needs": [
-          "credentials"
-        ],
-        "re": [
-          {
-            "def": "sh_at"
-          },
-          {
-            "def": "sh_prefix"
-          },
-          {
-            "def": "sh_reader"
-          },
-          "(?:'(?:\\./)?credentials'|\"(?:\\./)?credentials\"|(?:\\./)?credentials)",
-          {
-            "def": "sh_stop"
-          }
-        ]
-      },
-      {
-        "_comment": [
-          "A CLI that prints a stored credential: a table of rows, one per invocation that prints one, composed by redact.cli_regex",
-          "into one rule. Each row: cmd (the command word), words (its subcommands, each a regex for one word, options allowed",
-          "between them), operand (the next word must be one of these: aws configure get region prints no credential), with (one",
-          "of these arguments must be given), alone (no further subcommand word). Every row also requires that none of `unless`",
-          "is given (help and version requests print no credential). Flags belong to the whole invocation: `with` and `unless` are",
-          "looked for among all of the command's arguments, before and after its subcommands and operand (kubectl get -o json",
-          "secret db, gh --help auth token), up to limits.cli_args of them. The rule reads the command with the shell tokenizer, like the",
-          "env rules: only at a command position (behind wrappers, assignments, sudo, env, sh -c), never in a quoted argument, a",
-          "search pattern, a commit message, echo's arguments, or a quoted heredoc's body. examples and not: invocations the",
-          "generated test matrix (tests/test_matrix.py) checks in both layers, each also behind wrappers and as a mention.",
-          "Left out on purpose: npm token list (prints truncated tokens), kubectl get secrets without -o (names only)."
-        ],
-        "id": "secret_cli",
-        "unless": [
-          "--help",
-          "-help",
-          "-h",
-          "help",
-          "--version",
-          "-version"
-        ],
-        "rows": [
-          {
-            "row": "gh_auth_token",
-            "cmd": "gh",
-            "words": [
-              "auth",
-              "token"
-            ],
-            "examples": [
-              "gh auth token",
-              "gh auth token --hostname github.com"
-            ],
-            "not": [
-              "gh auth token --help",
-              "gh auth token -h",
-              "gh auth status",
-              "gh auth login",
-              "gh --help auth token"
-            ]
-          },
-          {
-            "row": "gh_auth_status_token",
-            "cmd": "gh",
-            "words": [
-              "auth",
-              "status"
-            ],
-            "with": [
-              "--show-token",
-              "-t"
-            ],
-            "examples": [
-              "gh auth status --show-token",
-              "gh auth status -t",
-              "gh auth -t status"
-            ],
-            "not": [
-              "gh auth status",
-              "gh auth status --hostname github.com"
-            ]
-          },
-          {
-            "row": "aws_configure_get",
-            "cmd": "aws",
-            "words": [
-              "configure",
-              "get"
-            ],
-            "operand": "(?:[A-Za-z0-9_-]{1,64}\\.){0,3}(?:aws_access_key_id|aws_secret_access_key|aws_session_token)",
-            "examples": [
-              "aws configure get aws_secret_access_key",
-              "aws configure get aws_access_key_id --profile dev",
-              "aws configure get default.aws_session_token",
-              "aws --profile p configure get aws_secret_access_key"
-            ],
-            "not": [
-              "aws configure get region",
-              "aws configure get output",
-              "aws configure get region --profile dev",
-              "aws configure list",
-              "aws configure get aws_secret_access_key --help"
-            ]
-          },
-          {
-            "row": "aws_export_credentials",
-            "cmd": "aws",
-            "words": [
-              "configure",
-              "export-credentials"
-            ],
-            "examples": [
-              "aws configure export-credentials --profile p"
-            ],
-            "not": [
-              "aws configure export-credentials help"
-            ]
-          },
-          {
-            "row": "aws_sts_credentials",
-            "cmd": "aws",
-            "words": [
-              "sts",
-              "get-session-token|get-federation-token|assume-role(?:-with-saml|-with-web-identity)?"
-            ],
-            "examples": [
-              "aws sts get-session-token",
-              "aws sts assume-role --role-arn arn:aws:iam::1:role/x --role-session-name s"
-            ],
-            "not": [
-              "aws sts get-caller-identity",
-              "aws sts get-session-token help"
-            ]
-          },
-          {
-            "row": "aws_ecr_password",
-            "cmd": "aws",
-            "words": [
-              "ecr|ecr-public",
-              "get-login-password"
-            ],
-            "examples": [
-              "aws ecr get-login-password --region us-east-1"
-            ],
-            "not": [
-              "aws ecr describe-repositories"
-            ]
-          },
-          {
-            "row": "aws_secret_value",
-            "cmd": "aws",
-            "words": [
-              "secretsmanager",
-              "get-secret-value|batch-get-secret-value"
-            ],
-            "examples": [
-              "aws secretsmanager get-secret-value --secret-id prod/db"
-            ],
-            "not": [
-              "aws secretsmanager list-secrets"
-            ]
-          },
-          {
-            "row": "aws_ssm_decrypted",
-            "cmd": "aws",
-            "words": [
-              "ssm",
-              "get-parameters?|get-parameters-by-path"
-            ],
-            "with": [
-              "--with-decryption"
-            ],
-            "examples": [
-              "aws ssm get-parameter --name /db/pw --with-decryption"
-            ],
-            "not": [
-              "aws ssm get-parameter --name /app/region"
-            ]
-          },
-          {
-            "row": "aws_codeartifact_token",
-            "cmd": "aws",
-            "words": [
-              "codeartifact",
-              "get-authorization-token"
-            ],
-            "examples": [
-              "aws codeartifact get-authorization-token --domain d"
-            ],
-            "not": [
-              "aws codeartifact list-domains"
-            ]
-          },
-          {
-            "row": "git_credential_fill",
-            "cmd": "git",
-            "words": [
-              "credential",
-              "fill"
-            ],
-            "examples": [
-              "git credential fill"
-            ],
-            "not": [
-              "git credential reject",
-              "git config credential.helper"
-            ]
-          },
-          {
-            "row": "gcloud_print_token",
-            "cmd": "gcloud",
-            "words": [
-              "auth",
-              "print-access-token|print-identity-token"
-            ],
-            "examples": [
-              "gcloud auth print-access-token",
-              "gcloud auth print-identity-token --audiences x"
-            ],
-            "not": [
-              "gcloud auth list",
-              "gcloud auth print-access-token --help"
-            ]
-          },
-          {
-            "row": "gcloud_adc_token",
-            "cmd": "gcloud",
-            "words": [
-              "auth",
-              "application-default",
-              "print-access-token"
-            ],
-            "examples": [
-              "gcloud auth application-default print-access-token"
-            ],
-            "not": [
-              "gcloud auth application-default login"
-            ]
-          },
-          {
-            "row": "gcloud_secret_access",
-            "cmd": "gcloud",
-            "words": [
-              "secrets",
-              "versions",
-              "access"
-            ],
-            "examples": [
-              "gcloud secrets versions access latest --secret db"
-            ],
-            "not": [
-              "gcloud secrets list"
-            ]
-          },
-          {
-            "row": "az_access_token",
-            "cmd": "az",
-            "words": [
-              "account",
-              "get-access-token"
-            ],
-            "examples": [
-              "az account get-access-token"
-            ],
-            "not": [
-              "az account show"
-            ]
-          },
-          {
-            "row": "az_keyvault_secret",
-            "cmd": "az",
-            "words": [
-              "keyvault",
-              "secret",
-              "show|download"
-            ],
-            "examples": [
-              "az keyvault secret show --vault-name v --name db"
-            ],
-            "not": [
-              "az keyvault secret list --vault-name v"
-            ]
-          },
-          {
-            "row": "heroku_auth_token",
-            "cmd": "heroku",
-            "words": [
-              "auth:token"
-            ],
-            "examples": [
-              "heroku auth:token"
-            ],
-            "not": [
-              "heroku auth:whoami"
-            ]
-          },
-          {
-            "row": "security_password",
-            "cmd": "security",
-            "words": [
-              "find-generic-password|find-internet-password"
-            ],
-            "with": [
-              "-[A-Za-z]{0,8}[wg][A-Za-z]{0,8}"
-            ],
-            "examples": [
-              "security find-generic-password -s x -w",
-              "security find-internet-password -gs host",
-              "security find-generic-password -w -s x"
-            ],
-            "not": [
-              "security find-generic-password -s x",
-              "security list-keychains"
-            ]
-          },
-          {
-            "row": "op_read",
-            "cmd": "op",
-            "words": [
-              "read|inject"
-            ],
-            "examples": [
-              "op read op://v/i/f",
-              "op inject -i tpl.env"
-            ],
-            "not": [
-              "op whoami",
-              "op read --help"
-            ]
-          },
-          {
-            "row": "op_item_reveal",
-            "cmd": "op",
-            "words": [
-              "item",
-              "get"
-            ],
-            "with": [
-              "--reveal"
-            ],
-            "examples": [
-              "op item get db --fields password --reveal"
-            ],
-            "not": [
-              "op item get db --fields username",
-              "op item list"
-            ]
-          },
-          {
-            "row": "vault_read",
-            "cmd": "vault",
-            "words": [
-              "read"
-            ],
-            "examples": [
-              "vault read secret/x"
-            ],
-            "not": [
-              "vault status",
-              "vault read -help"
-            ]
-          },
-          {
-            "row": "vault_kv_get",
-            "cmd": "vault",
-            "words": [
-              "kv",
-              "get"
-            ],
-            "examples": [
-              "vault kv get secret/x",
-              "vault kv get -field=password secret/x"
-            ],
-            "not": [
-              "vault kv list secret/"
-            ]
-          },
-          {
-            "row": "vault_print_token",
-            "cmd": "vault",
-            "words": [
-              "print",
-              "token"
-            ],
-            "examples": [
-              "vault print token"
-            ],
-            "not": [
-              "vault token lookup -help"
-            ]
-          },
-          {
-            "row": "kubectl_secret_output",
-            "cmd": "kubectl",
-            "words": [
-              "get",
-              "secrets?(?:/[^\\s;&|()<>`'\"\\\\]{1,128})?"
-            ],
-            "with": [
-              "(?:-o|--output)(?:=|[^\\S\\n]+)?['\"]?(?:yaml|json|jsonpath|go-template|custom-columns)"
-            ],
-            "examples": [
-              "kubectl get secret -o yaml",
-              "kubectl get secret/db -o json",
-              "kubectl -n prod get secret db -o yaml",
-              "kubectl get secrets -ojsonpath={.items}",
-              "kubectl get secret db --output=json",
-              "kubectl get -o yaml secret db",
-              "kubectl get -o jsonpath={.data.cookie} secret session",
-              "kubectl -o json get secret/db"
-            ],
-            "not": [
-              "kubectl get secrets",
-              "kubectl get secret db",
-              "kubectl get pods -o yaml",
-              "kubectl get secret -o yaml --help",
-              "kubectl get -o yaml pods",
-              "kubectl get --help secret db -o yaml"
-            ]
-          },
-          {
-            "row": "kubectl_describe_secret",
-            "cmd": "kubectl",
-            "words": [
-              "describe",
-              "secrets?(?:/[^\\s;&|()<>`'\"\\\\]{1,128})?"
-            ],
-            "examples": [
-              "kubectl describe secret db"
-            ],
-            "not": [
-              "kubectl describe pod db"
-            ]
-          },
-          {
-            "row": "doppler_secrets",
-            "cmd": "doppler",
-            "words": [
-              "secrets"
-            ],
-            "alone": true,
-            "examples": [
-              "doppler secrets",
-              "doppler secrets --project p"
-            ],
-            "not": [
-              "doppler secrets set X=1",
-              "doppler secrets delete X"
-            ]
-          },
-          {
-            "row": "doppler_secrets_get",
-            "cmd": "doppler",
-            "words": [
-              "secrets",
-              "get|download"
-            ],
-            "examples": [
-              "doppler secrets get DB_URL",
-              "doppler secrets download --no-file"
-            ],
-            "not": [
-              "doppler setup"
-            ]
-          },
-          {
-            "row": "pass_show",
-            "cmd": "pass|gopass",
-            "words": [
-              "show"
-            ],
-            "examples": [
-              "pass show email/work",
-              "gopass show db"
-            ],
-            "not": [
-              "pass ls",
-              "gopass list"
-            ]
-          },
-          {
-            "row": "bw_get",
-            "cmd": "bw",
-            "words": [
-              "get",
-              "password|totp|notes|item"
-            ],
-            "examples": [
-              "bw get password github"
-            ],
-            "not": [
-              "bw list folders",
-              "bw get template item --help"
-            ]
-          }
-        ]
-      },
-      {
-        "id": "secret_file",
-        "needs": [
-          "secret",
-          "SECRET",
-          "Secret"
-        ],
-        "re": [
-          {
-            "def": "sh_at"
-          },
-          {
-            "def": "sh_prefix"
-          },
-          {
-            "def": "sh_reader"
-          },
-          "(?:'(?:\\./)?(?:secrets?|SECRETS?|Secrets?)'|\"(?:\\./)?(?:secrets?|SECRETS?|Secrets?)\"|(?:\\./)?(?:secrets?|SECRETS?|Secrets?))",
-          {
-            "def": "sh_stop"
-          }
-        ]
-      }
+      "A tool call that runs one of these commands, or touches one of these paths, blanks its whole turn (commands are checked first).",
+      "keys: the tool input members (at any depth) whose strings are read: paths, commands, and patches (Codex's apply_patch",
+      "arrives as {\"input\": patch}). A string tool input is a command.",
+      "Paths: every string under those keys, and each @word of the prompt, is split into tokens at the split characters.",
+      "A token is sensitive when its last component (after the last / or :) matches one of a rule's globs and none of its",
+      "! globs. A glob holding a / matches the token's last components (.kube/config). * is any run of characters but / and :,",
+      "? one such character. A token is a mention: a read, a write, a patch header, or a word in a patch's body all count. Over-blanking",
+      "is the accepted direction: it loses one turn's text and never leaks.",
+      "Commands: each command string is matched on its own. A command counts at the start of the string or after ; & | ( `",
+      "or a newline, behind an optional sudo (command.prefix). One with --help, -h, or --version before the next ; & | ) `",
+      "or newline does not count (command.unless).",
+      "glob: how a project's redactPaths glob becomes a regex, one character at a time. There * is any run of characters, / included."
     ],
     "keys": {
       "file_path": "path",
@@ -1404,30 +260,10 @@
       "command": "command",
       "cmd": "command",
       "commands": "command",
-      "script": "command"
-    },
-    "definite": {
-      "prefix": "./",
-      "absolute": [
-        "/",
-        "~"
-      ]
-    },
-    "glob": {
-      "*": "[^\\n]*",
-      "?": "[^\\n]",
-      ".": "\\.",
-      "\\": "\\\\",
-      "+": "\\+",
-      "^": "\\^",
-      "$": "\\$",
-      "(": "\\(",
-      ")": "\\)",
-      "[": "\\[",
-      "]": "\\]",
-      "{": "\\{",
-      "}": "\\}",
-      "|": "\\|"
+      "script": "command",
+      "input": "patch",
+      "patch": "patch",
+      "diff": "patch"
     },
     "split": [
       " ",
@@ -1464,117 +300,327 @@
         ")"
       ]
     },
-    "patch": {
-      "_comment": [
-        "Patch inputs are path sources too: Codex's apply_patch arrives as {\"input\": patch} (its transcript and its hook), and",
-        "any tool may pass a unified diff. The patch-header parser reads the values under keys (at any depth) and every path or",
-        "command value (apply_patch <<'EOF' in a shell). For each header row, each line that starts with its prefix names a",
-        "target: the rest of the line, of line's characters (a diff's tab and timestamp cut off), its surrounding double quotes",
-        "removed (git quotes odd names), without one of strip (git's a/ and b/), split at blanks when words (diff --git a/x b/x).",
-        "skip: not a path. scripts/gen_redact.py composes line, strip, and the quotes into one regex, target, so the hook reads a",
-        "target with one match and walks no table. Each target is a definite path (sensitive.definite), checked by the path",
-        "rules before anything is redacted: a patch that touches .env or credentials blanks its turn, one that touches",
-        "src/app.py does not. Only header lines count: a patch's body that mentions .env is text. More than limits.patch_headers",
-        "headers in one event fail closed."
-      ],
-      "keys": {
-        "input": true,
-        "patch": true,
-        "diff": true
-      },
-      "headers": [
-        {
-          "prefix": "*** Update File: "
-        },
-        {
-          "prefix": "*** Add File: "
-        },
-        {
-          "prefix": "*** Delete File: "
-        },
-        {
-          "prefix": "*** Move to: "
-        },
-        {
-          "prefix": "--- "
-        },
-        {
-          "prefix": "+++ "
-        },
-        {
-          "prefix": "diff --git ",
-          "words": true
-        },
-        {
-          "prefix": "rename from "
-        },
-        {
-          "prefix": "rename to "
-        },
-        {
-          "prefix": "copy from "
-        },
-        {
-          "prefix": "copy to "
-        }
-      ],
-      "line": "[^\\t\\r\\n]",
-      "skip": {
-        "/dev/null": true
-      },
-      "strip": [
-        "a/",
-        "b/"
-      ]
+    "glob": {
+      "*": "[^\\n]*",
+      "?": "[^\\n]",
+      ".": "\\.",
+      "\\": "\\\\",
+      "+": "\\+",
+      "^": "\\^",
+      "$": "\\$",
+      "(": "\\(",
+      ")": "\\)",
+      "[": "\\[",
+      "]": "\\]",
+      "{": "\\{",
+      "}": "\\}",
+      "|": "\\|"
     },
-    "not_readers": {
-      "_comment": [
-        "Commands whose operands are not files a bare credentials or secrets operand would read (defs sh_reader): search tools",
-        "(their pattern), git (its own branch), echo and lookups, every command of the secret_cli table, whose operands name",
-        "remote resources (kubectl get secrets lists names; doppler secrets set X=1 writes), and the wrappers sh_prefix skips",
-        "(sudo kubectl get secrets is kubectl's, never sudo's operand). patterns: words that are not commands (assignments).",
-        "patterns: words that are not commands (assignments; an option or a number, a wrapper's argument). Composed as sh_not_reader, each followed by sh_stop."
-      ],
-      "words": [
-        "grep",
-        "egrep",
-        "fgrep",
-        "rg",
-        "ag",
-        "ack",
-        "git",
-        "echo",
-        "printf",
-        "which",
-        "whatis",
-        "man",
-        "help",
-        "type",
-        "command",
-        "sudo",
-        "doas",
-        "exec",
-        "nohup",
-        "builtin",
-        "setsid",
-        "time",
-        "nice",
-        "ionice",
-        "stdbuf",
-        "chrt",
-        "taskset",
-        "caffeinate",
-        "unbuffer",
-        "xargs",
-        "timeout",
-        "env"
-      ],
-      "and_cli": true,
-      "patterns": [
-        "[A-Za-z_][A-Za-z0-9_]{0,63}=[^\\s;&|()<>`]{0,256}",
-        "[-0-9][^\\s;&|()<>`]{0,64}"
-      ]
-    }
+    "command": {
+      "prefix": "(?:(?<![\\s\\S])|(?<=[;&|\\n(`]))[^\\S\\n]*(?:sudo[^\\S\\n]+)?",
+      "unless": "(?![^;&|\\n)`]*[^\\S\\n](?:--help|-h|--version)(?![^\\s;&|)`]))"
+    },
+    "paths": [
+      {
+        "id": "dotenv",
+        "globs": [
+          ".env",
+          ".env.*",
+          ".env~",
+          ".envrc",
+          "!.env.example",
+          "!.env.sample",
+          "!.env.template",
+          "!.env.dist",
+          "!.env.default",
+          "!.env.defaults",
+          "!.env.schema"
+        ],
+        "examples": [
+          ".env",
+          ".env.local",
+          "app/.env.production",
+          ".envrc",
+          "HEAD:.env",
+          ".env~",
+          ".env.local~"
+        ],
+        "not": [
+          ".env.example",
+          "src/environment.ts",
+          "docs/env.md"
+        ]
+      },
+      {
+        "id": "ssh_private_key",
+        "globs": [
+          "id_rsa*",
+          "id_dsa*",
+          "id_ecdsa*",
+          "id_ed25519*",
+          "!*.pub"
+        ],
+        "examples": [
+          "id_rsa",
+          "~/.ssh/id_ed25519",
+          "id_ecdsa_sk"
+        ],
+        "not": [
+          "id_rsa.pub",
+          "~/.ssh/known_hosts"
+        ]
+      },
+      {
+        "id": "key_file",
+        "globs": [
+          "?*.pem",
+          "?*.key",
+          "?*.p12",
+          "?*.pfx",
+          "?*.jks",
+          "?*.keystore",
+          "?*.ppk"
+        ],
+        "examples": [
+          "server.pem",
+          "certs/tls.key",
+          "store.p12"
+        ],
+        "not": [
+          "src/key.py",
+          "docs/pem.md",
+          ".key"
+        ]
+      },
+      {
+        "id": "credentials_file",
+        "globs": [
+          "credentials",
+          "*credentials.json",
+          "*credentials.yaml",
+          "*credentials.yml",
+          "*credentials.toml",
+          "*credentials.ini",
+          "*credentials.csv",
+          "*credentials.xml",
+          "*credentials.db"
+        ],
+        "examples": [
+          "~/.aws/credentials",
+          "gcp-credentials.json",
+          "credentials"
+        ],
+        "not": [
+          "src/credentials.py",
+          "docs/credentials.md"
+        ]
+      },
+      {
+        "id": "secret_file",
+        "globs": [
+          "secret",
+          "secrets",
+          "Secret",
+          "Secrets",
+          "SECRET",
+          "SECRETS",
+          "secret.*",
+          "secrets.*",
+          "client_secret*.json",
+          "*.tfvars",
+          "!*.py",
+          "!*.pyi",
+          "!*.js",
+          "!*.ts",
+          "!*.tsx",
+          "!*.jsx",
+          "!*.go",
+          "!*.rs",
+          "!*.rb",
+          "!*.java",
+          "!*.kt",
+          "!*.php",
+          "!*.cs",
+          "!*.swift",
+          "!*.md",
+          "!*.rst"
+        ],
+        "examples": [
+          "secrets.yaml",
+          "config/secret.json",
+          "secrets",
+          "prod.tfvars",
+          "client_secret_123.apps.json",
+          "SECRETS"
+        ],
+        "not": [
+          "src/secrets.py",
+          "lib/secret_manager.ts",
+          "docs/secrets.md"
+        ]
+      },
+      {
+        "id": "auth_file",
+        "globs": [
+          ".netrc",
+          "_netrc",
+          ".npmrc",
+          ".pypirc",
+          ".git-credentials",
+          ".pgpass",
+          ".htpasswd",
+          ".dockercfg",
+          "auth.json",
+          ".boto",
+          ".s3cfg",
+          ".vault-token",
+          ".docker/config.json",
+          ".kube/config",
+          "kubeconfig"
+        ],
+        "examples": [
+          ".netrc",
+          ".npmrc",
+          "~/.docker/config.json",
+          "~/.kube/config",
+          "kubeconfig"
+        ],
+        "not": [
+          "src/config.json",
+          "docs/netrc.md"
+        ]
+      },
+      {
+        "id": "proc_environ",
+        "globs": [
+          "proc/*/environ"
+        ],
+        "examples": [
+          "/proc/self/environ"
+        ],
+        "not": [
+          "/proc/self/status"
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "id": "env_dump",
+        "needs": [
+          "env",
+          "set",
+          "export",
+          "declare",
+          "typeset"
+        ],
+        "re": [
+          "(?:env|printenv|set|export(?:[^\\S\\n]+-p)?)[^\\S\\n]*(?:[;&|\\n)`>]|(?![\\s\\S]))",
+          "(?:declare|typeset)[^\\S\\n]+-[A-Za-z]{0,8}[px][A-Za-z]{0,8}(?![A-Za-z0-9_-])"
+        ],
+        "examples": [
+          "env",
+          "printenv",
+          "set",
+          "export",
+          "export -p",
+          "declare -x",
+          "declare -p FOO",
+          "env | grep KEY",
+          "env > out.txt"
+        ],
+        "not": [
+          "env FOO=1 make",
+          "set -e",
+          "export FOO=1",
+          "which env",
+          "grep set README.md"
+        ]
+      },
+      {
+        "id": "printenv",
+        "needs": [
+          "printenv"
+        ],
+        "re": [
+          "printenv(?![A-Za-z0-9_-])"
+        ],
+        "examples": [
+          "printenv GITHUB_TOKEN"
+        ],
+        "not": [
+          "printenv --help",
+          "which printenv",
+          "grep printenv README.md",
+          "man printenv"
+        ]
+      },
+      {
+        "id": "secret_cli",
+        "needs": [
+          "gh",
+          "aws",
+          "kubectl",
+          "gcloud",
+          "op",
+          "security",
+          "vault",
+          "heroku",
+          "git",
+          "az",
+          "doppler",
+          "pass",
+          "bw"
+        ],
+        "re": [
+          "gh[^\\S\\n]+auth[^\\S\\n]+token(?![A-Za-z0-9_-])",
+          "aws[^\\S\\n]+configure[^\\S\\n]+(?:get|export-credentials)(?![A-Za-z0-9_-])",
+          "aws[^\\S\\n]+sts[^\\S\\n]+(?:get-session-token|get-federation-token|assume-role(?:-with-saml|-with-web-identity)?)(?![A-Za-z0-9_-])",
+          "aws[^\\S\\n]+(?:ecr|ecr-public)[^\\S\\n]+get-login-password(?![A-Za-z0-9_-])",
+          "aws[^\\S\\n]+secretsmanager[^\\S\\n]+(?:get-secret-value|batch-get-secret-value)(?![A-Za-z0-9_-])",
+          "aws[^\\S\\n]+ssm[^\\S\\n]+(?:get-parameters?|get-parameters-by-path)(?![A-Za-z0-9_-])",
+          "aws[^\\S\\n]+codeartifact[^\\S\\n]+get-authorization-token(?![A-Za-z0-9_-])",
+          "kubectl[^\\S\\n]+(?:get|describe)[^\\S\\n]+secrets?(?![A-Za-z0-9_-])",
+          "gcloud[^\\S\\n]+auth[^\\S\\n]+(?:application-default[^\\S\\n]+)?(?:print-access-token|print-identity-token)(?![A-Za-z0-9_-])",
+          "gcloud[^\\S\\n]+secrets[^\\S\\n]+versions[^\\S\\n]+access(?![A-Za-z0-9_-])",
+          "az[^\\S\\n]+account[^\\S\\n]+get-access-token(?![A-Za-z0-9_-])",
+          "az[^\\S\\n]+keyvault[^\\S\\n]+secret[^\\S\\n]+(?:show|download)(?![A-Za-z0-9_-])",
+          "op[^\\S\\n]+(?:read|inject|item[^\\S\\n]+get)(?![A-Za-z0-9_-])",
+          "security[^\\S\\n]+find-(?:generic|internet)-password(?![A-Za-z0-9_-])",
+          "vault[^\\S\\n]+(?:read|kv[^\\S\\n]+get|print[^\\S\\n]+token)(?![A-Za-z0-9_-])",
+          "heroku[^\\S\\n]+(?:config|auth:token)(?![A-Za-z0-9_-])",
+          "git[^\\S\\n]+credential[^\\S\\n]+fill(?![A-Za-z0-9_-])",
+          "doppler[^\\S\\n]+secrets(?![A-Za-z0-9_-])",
+          "(?:pass|gopass)[^\\S\\n]+show(?![A-Za-z0-9_-])",
+          "bw[^\\S\\n]+get(?![A-Za-z0-9_-])"
+        ],
+        "examples": [
+          "gh auth token",
+          "aws configure get aws_secret_access_key",
+          "aws configure export-credentials --profile p",
+          "kubectl get secret db -o yaml",
+          "kubectl describe secrets",
+          "gcloud auth print-access-token",
+          "op read op://v/i/f",
+          "op item get x --reveal",
+          "security find-generic-password -w -s x",
+          "vault kv get secret/x",
+          "vault read secret/x",
+          "heroku config",
+          "aws secretsmanager get-secret-value --secret-id x",
+          "git credential fill"
+        ],
+        "not": [
+          "gh auth token --help",
+          "gh auth status",
+          "kubectl get pods",
+          "aws s3 ls",
+          "op --version",
+          "which gh",
+          "vault status",
+          "grep 'gh auth token' notes.md"
+        ]
+      }
+    ]
   },
   "fields": {
     "_comment": [
@@ -1659,346 +705,5 @@
       "agent_transcript_path": "transport",
       "env_found": "keep"
     }
-  },
-  "secret_keys": {
-    "_comment": [
-      "Keys and names that hold a secret whatever the value looks like. A word is lowercase parts joined by _; it matches lower, UPPER,",
-      "and Capitalized parts joined by _, -, ., or nothing (api_key, API-KEY, apiKey, ApiKey). names match as the whole key, or as its",
-      "end after a separator or a camelCase boundary (db_password, smtpPassword, X-Api-Key). whole match only as the whole key (in text: the whole identifier, after a flag's -- or a member's . too).",
-      "Generic words are left out on purpose: token, key, auth (max_tokens, token_count, tokenizer, sort_key). Those keep the shape test.",
-      "shaped: generic words that keep the shape test (secret_assignment, the second secret_field) and count only as the whole",
-      "identifier, never as an end (sort_key, monkey, oauth stay names): {\"key\": \"<credential-shaped>\"} loses its value, \"key\": \"name\"",
-      "and \"auth\": \"oauth2\" do not. They are never in names or whole, which take any value.",
-      "shaped_not: what a shaped key also never loses: a lowercase snake_case name (\"key\": \"user_id_2024_v1\"), which code uses as one.",
-      "A structured member {\"<key>\": \"<string>\"} under such a key loses any nonempty string value but a reference or placeholder",
-      "(literals below); booleans, numbers, and null stay. In text, <name> = \"<quoted>\" loses the quoted value the same way."
-    ],
-    "names": [
-      "password",
-      "passwd",
-      "passphrase",
-      "secret",
-      "api_key",
-      "api_secret",
-      "api_token",
-      "access_token",
-      "refresh_token",
-      "auth_token",
-      "id_token",
-      "session_token",
-      "bearer_token",
-      "private_key",
-      "secret_key",
-      "secret_access_key",
-      "signing_key",
-      "encryption_key",
-      "master_key"
-    ],
-    "whole": [
-      "pwd",
-      "apikey",
-      "authorization",
-      "proxy_authorization",
-      "credential",
-      "credentials"
-    ],
-    "shaped": [
-      "key",
-      "auth"
-    ],
-    "shaped_not": "[a-z][a-z0-9]{1,63}(?:_[a-z0-9]{1,64}){1,16}(?![A-Za-z0-9_\\-+/.~!@#%^*])"
-  },
-  "literals": {
-    "_comment": [
-      "Values under a secret key that are not secrets: references and placeholders, each matched against the WHOLE value as JSON",
-      "escapes it (so \" is \\\"). refs: complete reference grammars (${VAR}, $VAR, process.env.X, os.environ[\"X\"], ...);",
-      "a reference followed by any literal text is a literal, and is redacted. words: whole value, in lower, UPPER, and",
-      "Capitalized. forms: whole value, regex."
-    ],
-    "refs": [
-      "\\$\\{[A-Za-z_][A-Za-z0-9_]{0,127}\\}",
-      "\\$\\{\\{\\s{0,4}[A-Za-z_][A-Za-z0-9_]{0,127}(?:\\.[A-Za-z_][A-Za-z0-9_-]{0,127}){0,8}\\s{0,4}\\}\\}",
-      "\\$[A-Za-z_][A-Za-z0-9_]{0,127}",
-      "\\{\\{-?\\s{0,4}[.$A-Za-z_][A-Za-z0-9_.$]{0,127}(?:\\s{0,4}\\|\\s{0,4}[A-Za-z_][A-Za-z0-9_]{0,63}){0,4}\\s{0,4}-?\\}\\}",
-      "\\{%-?\\s{0,4}[A-Za-z_][A-Za-z0-9_.]{0,127}\\s{0,4}-?%\\}",
-      "%\\([A-Za-z_][A-Za-z0-9_]{0,127}\\)[sdr]",
-      "process\\.env\\.[A-Za-z_][A-Za-z0-9_]{0,127}",
-      "process\\.env\\[\\\\{0,3}[\\\"'][A-Za-z_][A-Za-z0-9_]{0,127}\\\\{0,3}[\\\"']\\]",
-      "os\\.environ\\[\\\\{0,3}[\\\"'][A-Za-z_][A-Za-z0-9_]{0,127}\\\\{0,3}[\\\"']\\]",
-      "os\\.environ\\.get\\(\\\\{0,3}[\\\"'][A-Za-z_][A-Za-z0-9_]{0,127}\\\\{0,3}[\\\"']\\)",
-      "os\\.getenv\\(\\\\{0,3}[\\\"'][A-Za-z_][A-Za-z0-9_]{0,127}\\\\{0,3}[\\\"']\\)",
-      "getenv\\(\\\\{0,3}[\\\"'][A-Za-z_][A-Za-z0-9_]{0,127}\\\\{0,3}[\\\"']\\)",
-      "ENV\\[\\\\{0,3}[\\\"'][A-Za-z_][A-Za-z0-9_]{0,127}\\\\{0,3}[\\\"']\\]",
-      "ENV\\.fetch\\(\\\\{0,3}[\\\"'][A-Za-z_][A-Za-z0-9_]{0,127}\\\\{0,3}[\\\"']\\)",
-      "env\\(\\\\{0,3}[\\\"'][A-Za-z_][A-Za-z0-9_]{0,127}\\\\{0,3}[\\\"']\\)",
-      "secrets\\.[A-Za-z_][A-Za-z0-9_]{0,127}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,127}){0,8}",
-      "vault:[A-Za-z0-9_./#:-]{1,256}",
-      "op://[A-Za-z0-9 _./-]{1,256}",
-      "arn:aws:secretsmanager:[a-z0-9-]{1,32}:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]{1,512}",
-      "\\[REDACTED:[A-Za-z0-9_:.-]{1,128}\\](?:#[0-9]{1,6})?"
-    ],
-    "words": [
-      "changeme",
-      "change_me",
-      "change-me",
-      "placeholder",
-      "dummy",
-      "example",
-      "sample",
-      "redacted",
-      "secret",
-      "password",
-      "null",
-      "none",
-      "nil",
-      "undefined",
-      "true",
-      "false",
-      "todo",
-      "tbd"
-    ],
-    "forms": [
-      "x{3,}",
-      "X{3,}",
-      "\\*{3,}",
-      "\\.{3,}",
-      "<[^<>\"\\\\\\n]{1,128}>",
-      "%[A-Za-z_][A-Za-z0-9_]{0,63}%",
-      "(?:your|YOUR|Your)[_-][A-Za-z0-9_-]{0,128}"
-    ]
-  },
-  "shell_options": {
-    "_comment": [
-      "Option grammars the shell tokenizer reads, as data (redact.py composes {\"gen\": \"<tool>_short_flag\"} and the rest from them).",
-      "short_arg: short options that take an argument, the rest of their cluster or the next word (getopt: -uX, -u X, -iu X).",
-      "short_split, long_split: the option whose argument is itself a command line (env -S). long: every long option, so an",
-      "abbreviation is accepted only as far as getopt_long accepts it (--uns for --unset). long_arg: those taking an argument as",
-      "--opt arg or --opt=arg. A long option not listed in long_arg takes one only as --opt=arg (GNU's --block-signal[=SIG]).",
-      "env: GNU coreutils env and BSD env (-P altpath, -L/-U user, -S string)."
-    ],
-    "env": {
-      "short_arg": "uCPLUa",
-      "short_split": "S",
-      "long": [
-        "ignore-environment",
-        "null",
-        "unset",
-        "chdir",
-        "default-signal",
-        "ignore-signal",
-        "block-signal",
-        "list-signal-handling",
-        "debug",
-        "split-string",
-        "argv0",
-        "help",
-        "version"
-      ],
-      "long_arg": [
-        "unset",
-        "chdir",
-        "argv0"
-      ],
-      "long_split": [
-        "split-string"
-      ]
-    }
-  },
-  "members": [
-    {
-      "_comment": [
-        "A member under a secret key (secret_keys) loses any nonempty string value but a reference or placeholder (literals).",
-        "json_re runs over the compact JSON of the event's text fields in both layers, as jq writes it.",
-        "A value that runs to the end of a window is a match there: one no window holds whole fails closed (limits)."
-      ],
-      "id": "secret_field",
-      "json_re": [
-        "(?<p>(?<=[{,])\"(?:",
-        {
-          "gen": "secret_key_name"
-        },
-        ")\":\")(?!(?:",
-        {
-          "gen": "literal"
-        },
-        ")\")(?:[^\"\\\\]|\\\\.)+(?:(?=\")|(?![\\s\\S]))"
-      ],
-      "needs": "secret_key_name",
-      "needs_suffix": "\":\""
-    },
-    {
-      "_comment": [
-        "A member whose key ends in a secret word, and whose string value looks like a secret, loses its value (the shape test).",
-        "secret_assignment sees `key = value` in text. This sees {\"token\": value} in structured tool input and output.",
-        "secret_value has no quote or backslash, so a value matches the same escaped or not."
-      ],
-      "id": "secret_field",
-      "needs": [
-        "key\":\"",
-        "KEY\":\"",
-        "Key\":\"",
-        "secret\":\"",
-        "SECRET\":\"",
-        "Secret\":\"",
-        "token\":\"",
-        "TOKEN\":\"",
-        "Token\":\"",
-        "password\":\"",
-        "PASSWORD\":\"",
-        "Password\":\"",
-        "passwd\":\"",
-        "PASSWD\":\"",
-        "Passwd\":\"",
-        "passphrase\":\"",
-        "PASSPHRASE\":\"",
-        "Passphrase\":\"",
-        "credential\":\"",
-        "CREDENTIAL\":\"",
-        "Credential\":\"",
-        "credentials\":\"",
-        "CREDENTIALS\":\"",
-        "Credentials\":\"",
-        "auth\":\"",
-        "AUTH\":\"",
-        "Auth\":\""
-      ],
-      "json_re": [
-        "(?<p>(?<=[{,])\"(?:",
-        {
-          "def": "secret_key"
-        },
-        "\":\"|",
-        {
-          "gen": "shaped_word"
-        },
-        "\":\"(?!",
-        {
-          "gen": "shaped_not"
-        },
-        ")))",
-        {
-          "def": "secret_value"
-        },
-        "(?:(?=\")|(?![\\s\\S]))"
-      ]
-    }
-  ],
-  "members_comment": [
-    "Structured members, as {\"key\":\"value\"} in the compact JSON of each event's text fields, in order: the secret key",
-    "tier, then the shape tier. Both are the rule secret_field. needs \"secret_key_name\": the last word of each secret key name."
-  ],
-  "assignment": {
-    "_comment": [
-      "The assignment recognizer quoted_secret runs: <context><key><close><operator><opening quote><value><after>. Rows, composed by",
-      "redact.generated() into the fragments assign_ctx, assign_close, assign_op, and assign_after (scripts/gen_redact.py writes them",
-      "out). A quote after the operator is a value's OPENING quote only when the key sits in code, which one of these contexts says:",
-      "  line         the key starts its line (after a location, indentation, a list bullet or comment mark, keywords, $), itself",
-      "               quoted or not. A location is what grep, rg, nl, and cat -n put before a line they print (locations below)",
-      "  quoted_key   the key is a whole quoted string (\"password\": ...), its quote right before it (zero width: the span starts",
-      "               at the key, as secret_assignment's does)",
-      "  escaped_key  the same, quoted with an escaped quote (\\\"password\\\":\\\"...\\\" in JSON encoded in a string)",
-      "  flag         --password=, --password \"x\" (the one context whose operator may be a blank), -e PASSWORD=",
-      "  code         after code punctuation ({ ( [ , ;) or a shell assignment word, then optional keywords: f(x, password=\"...\")",
-      "Each context sets its group. close: a quoting context's group (lq, kq, ke) must match again right after the key, so a",
-      "quote the key opened closes before the operator; the others match empty. Only then is ok set, and every value needs ok.",
-      "after: a check made after the value, only when its context was read (\\k<group> matches only a group that took part).",
-      "code's: the punctuation was outside quoted text. A regex cannot look back over a line, so this looks forward: the value is",
-      "one string, so the rest of its line after the closing quote must hold whole strings only (\"...\", '...', `...`; an",
-      "apostrophe between letters is no quote). print(\"username, password:\", username, password, \"done\") reads `, username,",
-      "password, ` as a value whose closing quote opens \"done\", so the rest, done\"), is not whole and nothing is redacted. A",
-      "line with more than after_bound characters left is taken as code (the check stays bounded, never quadratic).",
-      "So the states are: no context (nothing matches), context open (key read, its quote not yet closed), ok (operator and",
-      "opening quote may follow), value read, checked (after). Impossible: ok without a context, a key whose own quote is still",
-      "open at the operator, or a code-context value whose line goes on inside a string. Known limit: a key mid-line after a",
-      "plain word (The new password: \"x\") has no context; a credential-shaped value there is still secret_assignment's."
-    ],
-    "keywords": [
-      "export",
-      "readonly",
-      "local",
-      "declare",
-      "typeset",
-      "const",
-      "let",
-      "var",
-      "set",
-      "setenv",
-      "val",
-      "final",
-      "static",
-      "private",
-      "public",
-      "protected"
-    ],
-    "operators": [
-      ":=",
-      "=>",
-      ":",
-      "="
-    ],
-    "locations": [
-      {
-        "id": "line_number",
-        "re": "(?:[^\\s\"'`:]{1,255}[:-])?[0-9]{1,9}[:-]",
-        "_comment": "grep -n, rg -n: 12:, config.yml:12:, and a context line's config.yml-12-",
-        "examples": [
-          "12:",
-          "config.yml:12:",
-          "config.yml-12-"
-        ]
-      },
-      {
-        "id": "file",
-        "re": "[^\\s\"'`:]{1,255}:",
-        "_comment": "grep -r without -n: config.yml:",
-        "examples": [
-          "./config/app.yml:"
-        ]
-      },
-      {
-        "id": "numbered",
-        "re": "[^\\S\\n]{0,16}[0-9]{1,9}\\t",
-        "_comment": "nl, cat -n: blanks, the number, a tab",
-        "examples": [
-          "    12\t",
-          "3\t"
-        ]
-      }
-    ],
-    "contexts": [
-      {
-        "id": "line",
-        "group": "lq",
-        "closes": true,
-        "re": "(?<![^\\n]){location}[^\\S\\n]{0,64}(?:(?:[-*+#]|//)[^\\S\\n]{0,8})?{keywords}\\$?(?<lq>[\"']?)"
-      },
-      {
-        "id": "quoted_key",
-        "group": "kq",
-        "closes": true,
-        "re": "(?<=(?<kq>[\"']))(?<!\\\\[\"'])"
-      },
-      {
-        "id": "escaped_key",
-        "group": "ke",
-        "closes": true,
-        "re": "(?<=(?<ke>\\\\[\"']))"
-      },
-      {
-        "id": "flag",
-        "group": "kd",
-        "blank_operator": true,
-        "re": "(?<![^\\s])(?:--|-e[^\\S\\n]+)(?<kd>)"
-      },
-      {
-        "id": "code",
-        "group": "cx",
-        "re": "(?:[{(\\[,;]|(?<![^\\s])[A-Za-z_][A-Za-z0-9_]{0,63}=[^\\s'\"`;&|()<>\\\\]{0,256})[^\\S\\n]{0,8}{keywords}\\$?(?<cx>)",
-        "after": "{line_whole}"
-      }
-    ],
-    "key_prefix": "[A-Za-z0-9_.-]{0,64}?",
-    "after_bound": 1024,
-    "line_whole": "(?=[^\\n]{{bound}}|(?:\\\\?[\"'`]|(?![\\s\\S]))(?:[^\"'`\\\\\\n]|\\\\[^\\n]|(?<=[A-Za-z])'(?=[A-Za-z])|\"(?:[^\"\\\\\\n]|\\\\[^\\n])*\"|(?:(?<![A-Za-z])|(?![A-Za-z]))'(?:[^'\\\\\\n]|\\\\[^\\n])*'|`(?:[^`\\\\\\n]|\\\\[^\\n])*`)*(?:\\n|(?![\\s\\S])))"
   }
 }

@@ -87,7 +87,7 @@ def blanked_rule(sink: Sink) -> tuple[str, str] | None:
 
 class PatchTargetTests(unittest.TestCase):
     """Finding 1: Codex apply_patch arrives as {"input": patch}, and input was no path source, so a patch editing .env was
-    exported unchanged. Patch headers are now parsed (sensitive.patch) and their targets checked before redaction."""
+    exported unchanged. A patch input is now read token by token like a command, so any path it names counts."""
 
     def setUp(self):
         self.cookie = "Ck" + _rand(26)  # an opaque value no rule matches: only blanking keeps it out
@@ -110,21 +110,8 @@ class PatchTargetTests(unittest.TestCase):
         py = assert_parity(self, [tool({"input": patch}, "Success")])[0][0]
         self.assertNotIn("sensitive", py)
         self.assertEqual(leaked(key, json.dumps(py)), [])
-        # key= is a shaped key since review 7 (finding 5): the credential-shaped value goes with the assignment's span, which
-        # is longer than the anthropic_key match, as it does under token=.
-        self.assertEqual(py["tool_input"]["input"], patch.replace(key, "[REDACTED:secret_assignment]"))
-
-    def test_targets_are_plain_records(self):
-        text = codex_patch(("Update File", "a b/.env"), ("Move to", "x.py")) + "\n" + unified("lib/k.pem") + '\n--- "a/q z"\n+++ /dev/null'
-        targets = redact.patch_targets([text])
-        # In table order: by header row, then by line.
-        self.assertEqual([t.path for t in targets], ["a b/.env", "x.py", "lib/k.pem", "q z", "lib/k.pem"])
-        self.assertEqual(targets[0].header, "*** Update File: ")
-
-    def test_header_flood_fails_closed(self):
-        flood = "".join(f"*** Update File: f{n}.py\n" for n in range(redact.rules()["limits"]["patch_headers"] + 1))
-        py = assert_parity(self, [tool({"input": flood})])[0][0]
-        self.assertTrue(py["redaction_error"])
+        # key is not a secret name: the format rule takes the value.
+        self.assertEqual(py["tool_input"]["input"], patch.replace(key, "[REDACTED:anthropic_key]"))
 
     def test_hook_route_end_to_end(self):
         marker = "please rotate " + _rand(8)
@@ -166,21 +153,37 @@ SINGLE_LINE = [
     'echo "password:" "$PASSWORD" "done"', 'console.log("user:", u, "password:", p, "done")', 'logger.warn("Enter secret: ", s, "now")',
     'puts "token: #{token}", "done"', 'print("API_KEY:", API_KEY, "done")', 'assert resp == "password:", "done"',
 ]
+# Known limit (code-after-name): a format placeholder or reference right after the name is replaced, and only that.
+PLACEHOLDER_AFTER_NAME = ['logging.info("secret: %s", secret, extra={"a": 1})', 'log.debug("token=%s", token, "x")',
+                          'printf("api_key: %s\\n", api_key); exit(0);', 'fmt.Printf("password: %s", password, "x")',
+                          'console.log(`api_key: ${apiKey}`, "done")', 'String.format("password: %s", password, "x")', 'puts "token: #{token}", "done"']
 # Real single-line assignments: the value goes, whatever its shape.
-ASSIGNMENTS = ['password = "{v}"', '"password": "{v}"', "PASSWORD='{v}'", 'mysql --password "{v}"', 'run --password="{v}"',
+ASSIGNMENTS = ['password = "{v}"', '"password": "{v}"', "PASSWORD='{v}'", 'run --password="{v}"',
                'x = {{"password": "{v}", "user": "bob"}}', 'self.password = "{v}"', 'f(user, password="{v}")', 'FOO=1 PASSWORD="{v}" run',
                'secret: "{v}"', "  api_key: '{v}'", 'export API_KEY="{v}"', 'docker run -e PASSWORD="{v}" img']
 
 
 class SingleLineQuoteTests(unittest.TestCase):
     """Finding 2: on one line, a string's closing quote (print("password:", ...) was still read as a value's opening quote,
-    deleting the arguments between. Every value now needs an assignment context (the assignment table): the key in code,
-    or a whole quoted key that closed before the operator."""
+    deleting the arguments between. A quoted value now cannot start with a blank, a comma, or + ) ; ] }, which follow a
+    string that just closed."""
 
     def test_preservation_corpus_byte_for_byte(self):
-        texts = SINGLE_LINE + [text + "\nrun()\nprint('ok')" for text in SINGLE_LINE]
+        kept = [text for text in SINGLE_LINE if text not in PLACEHOLDER_AFTER_NAME]
+        texts = kept + [text + "\nrun()\nprint('ok')" for text in kept]
         py = assert_parity(self, [tool({"command": "x"}, text) for text in texts])[0]
         self.assertEqual([(text, out["tool_output"]) for text, out in zip(texts, py) if out["tool_output"] != text or "redactions" in out], [])
+
+    def test_known_limit_placeholders_after_the_name(self):
+        py = assert_parity(self, [tool({"command": "x"}, text) for text in PLACEHOLDER_AFTER_NAME])[0]
+        for text, out in zip(PLACEHOLDER_AFTER_NAME, py):
+            self.assertEqual([item["rule"] for item in out["redactions"]], ["secret_assignment"], text)
+
+    def test_known_limit_a_value_after_a_blank(self):
+        """Known limit (space-separated): with no : or = the value is not found."""
+        value = "pw" + _rand(6, string.ascii_letters)
+        py = assert_parity(self, [tool({"command": "x"}, 'mysql --password "' + value + '"')])[0]
+        self.assertIn(value, py[0]["tool_output"])
 
     def test_real_assignments_are_redacted(self):
         cases = [(form, "s3cr3t-" + _rand(10)) for form in ASSIGNMENTS] + [(form, "pw" + _rand(4, string.ascii_letters)) for form in ASSIGNMENTS]
@@ -189,44 +192,44 @@ class SingleLineQuoteTests(unittest.TestCase):
         self.assertEqual(py[0]["tool_output"], 'password = "[REDACTED:secret_assignment]"')
 
     def test_end_to_end(self):
-        text = "\n".join(SINGLE_LINE)
+        text = "\n".join(text for text in SINGLE_LINE if text not in PLACEHOLDER_AFTER_NAME)
         sb, sink, inbox = pi_run(self, output=text)
         for where in everywhere(sb, sink, inbox):
             self.assertIn(json.dumps(text)[1:-1], where)
         value = "pw" + _rand(6, string.ascii_letters)
-        sb, sink, inbox = pi_run(self, output='print("password:", password, "done")\nmysql --password "' + value + '"')
+        sb, sink, inbox = pi_run(self, output='print("password:", password, "done")\nmysql --password="' + value + '"')
         self.assertEqual(leaked(value, *everywhere(sb, sink, inbox)), [])
         self.assertIn(json.dumps('print("password:", password, "done")')[1:-1], sink.text())
 
 
 class SecretCliOperandTests(unittest.TestCase):
-    """Finding 3: secret_cli blanked configuration and help requests. Its rows (sensitive.commands secret_cli rows) now say
-    which invocations print a credential: getter operands, required flags, and help or version requests excluded."""
+    """Finding 3: secret_cli blanked configuration and help requests. A help or version request still never counts.
+    Known limits: a listed CLI blanks the turn whatever it was asked for (cli-any-args), and a CLI the list leaves out
+    does not (unlisted-cli: gh auth status --show-token prints a token the github_token format rule redacts)."""
 
-    HARMLESS = ["aws configure get region", "aws configure get output", "aws configure get region --profile dev", "gh auth token --help",
-                "gh auth token -h", "gh auth status", "kubectl get secrets", "kubectl get secret db", "vault read -help",
-                "aws sts get-caller-identity", "op item get db --fields username", "security find-generic-password -s x",
-                "doppler secrets set X=1", "gcloud secrets list", "sudo kubectl get secrets", "timeout 5 gcloud secrets list"]
+    HARMLESS = ["gh auth token --help", "gh auth token -h", "gh auth status", "aws sts get-caller-identity", "aws configure list", "op --version"]
+    ANY_ARGS = ["aws configure get region", "aws configure get region --profile dev", "kubectl get secrets", "kubectl get secret db",
+                "op item get db --fields username", "security find-generic-password -s x", "doppler secrets set X=1", "sudo kubectl get secrets"]
     PRINTS = ["aws configure get aws_secret_access_key", "aws configure get profile.dev.aws_session_token", "aws configure export-credentials",
-              "gh auth token", "gh auth status --show-token", "gh auth status -t", "kubectl get secret db -o yaml",
-              "kubectl get secret db -o jsonpath='{.data.password}'", "kubectl describe secret db", "gcloud auth print-access-token",
-              "az account get-access-token", "heroku auth:token", "op read op://v/i/f", "vault kv get secret/x", "vault read secret/x",
-              "doppler secrets", "doppler secrets get DB_URL", "aws sts get-session-token", "aws secretsmanager get-secret-value --secret-id x",
-              "aws ssm get-parameter --name /p --with-decryption", "security find-generic-password -s x -w"]
+              "gh auth token", "kubectl get secret db -o yaml", "kubectl get secret db -o jsonpath='{.data.password}'", "kubectl describe secret db",
+              "gcloud auth print-access-token", "az account get-access-token", "heroku auth:token", "op read op://v/i/f", "vault kv get secret/x",
+              "vault read secret/x", "doppler secrets", "doppler secrets get DB_URL", "aws sts get-session-token",
+              "aws secretsmanager get-secret-value --secret-id x", "aws ssm get-parameter --name /p --with-decryption", "security find-generic-password -s x -w"]
+    UNLISTED = ["gh auth status --show-token", "gh auth status -t"]
 
     def test_both_layers(self):
-        py = assert_parity(self, [tool({"command": c}, "out") for c in self.HARMLESS + self.PRINTS])[0]
-        got = {c: out.get("sensitive_rule") for c, out in zip(self.HARMLESS + self.PRINTS, py)}
-        self.assertEqual({c: rule for c, rule in got.items() if c in self.HARMLESS and rule}, {})
-        self.assertEqual({c: rule for c, rule in got.items() if c in self.PRINTS and rule != "secret_cli"}, {})
+        commands = self.HARMLESS + self.ANY_ARGS + self.PRINTS + self.UNLISTED
+        py = assert_parity(self, [tool({"command": c}, "out") for c in commands])[0]
+        got = {c: out.get("sensitive_rule") for c, out in zip(commands, py)}
+        self.assertEqual({c: got[c] for c in self.HARMLESS + self.UNLISTED if got[c]}, {})
+        self.assertEqual({c: got[c] for c in self.ANY_ARGS + self.PRINTS if got[c] != "secret_cli"}, {})
 
     def test_end_to_end(self):
-        for command, output in (("aws configure get region", "us-east-1"), ("gh auth token --help", "Print the auth token")):
-            marker = output + " " + _rand(8)
-            sb, sink, inbox = pi_run(self, command=command, output=marker)
-            for where in everywhere(sb, sink, inbox):
-                self.assertIn(marker, where)
-            self.assertIsNone(blanked_rule(sink))
+        marker = "Print the auth token " + _rand(8)
+        sb, sink, inbox = pi_run(self, command="gh auth token --help", output=marker)
+        for where in everywhere(sb, sink, inbox):
+            self.assertIn(marker, where)
+        self.assertIsNone(blanked_rule(sink))
         value = "Ak" + _rand(30)
         sb, sink, inbox = pi_run(self, command="aws configure get aws_secret_access_key", output=value)
         self.assertEqual(leaked(value, *everywhere(sb, sink, inbox)), [])
@@ -234,7 +237,7 @@ class SecretCliOperandTests(unittest.TestCase):
 
 
 class LinearPatchTests(unittest.TestCase):
-    """The patch-header parser and the new rows cost linear work on adversarial input in Python (jq: tests/test_latency.py)."""
+    """Patch inputs and command rules cost linear work on adversarial input in Python (jq: tests/test_latency.py)."""
 
     def test_python(self):
         rs = redact.ruleset()

@@ -1,4 +1,4 @@
-"""Normal content that must pass both redaction layers byte for byte.
+"""Normal content that must pass both redaction layers byte for byte, except the cases in OVER_REDACTED.
 
     python3 tests/fp_report.py     print case -> redacted? for the hook (jq) and the sender (Python)
 """
@@ -59,6 +59,11 @@ CORPUS: list[tuple[str, str]] = [
     ("env commands", "env FOO=1 make test && /usr/bin/env python3 run.py\ngrep -rn credentials src/"),
 ]
 
+# Known limit (reference-value): a reference, placeholder, constant, or expression after a secret name is redacted like a
+# value. These cases change, and only by secret_assignment.
+OVER_REDACTED = {"get_token", "api_key env ref", "process.env ref", "placeholders", "github actions", "json numbers", "member expressions",
+                 "versioned identifiers", "structured members"}
+
 
 def check() -> list[dict]:
     """For each case: did jq or Python change it, and how many redactions each recorded."""
@@ -73,6 +78,7 @@ def check() -> list[dict]:
                 "jq": j.get("tool_output") != text or j.get("prompt") != text,
                 "py": p.get("tool_output") != text or p.get("prompt") != text,
                 "count": sum(item["count"] for item in j.get("redactions", []) + p.get("redactions", [])),
+                "rules": sorted({item["rule"] for item in j.get("redactions", []) + p.get("redactions", [])}),
                 "sensitive": bool(j.get("sensitive") or p.get("sensitive")),
             }
         )

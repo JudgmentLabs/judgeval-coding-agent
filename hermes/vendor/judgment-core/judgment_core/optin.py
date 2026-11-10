@@ -56,7 +56,9 @@ def _strings(value: object) -> list[str]:
     return [item for item in value if isinstance(item, str) and item] if isinstance(value, list) else []
 
 
-_CLOSED = {"enabled": False, "capture": "sanitized", "sessionDefault": "on", "environment": "production", "redactPatterns": [], "redactPaths": []}
+# The project's redaction settings (judgment_core.redact.ruleset says what each does). Each is a list of strings.
+REDACT_KEYS = ("redactPatterns", "redactPaths", "redactCommands", "redactNames", "redactAllow", "redactDisable")
+_CLOSED = {"enabled": False, "capture": "sanitized", "sessionDefault": "on", "environment": "production", **{key: [] for key in REDACT_KEYS}}
 
 
 def load_project(path: Path) -> dict:
@@ -76,8 +78,7 @@ def load_project(path: Path) -> dict:
         "capture": resolve_capture(data),
         "sessionDefault": "off" if session_default == "off" else "on",
         "environment": environment.strip(),
-        "redactPatterns": _strings(data.get("redactPatterns")),
-        "redactPaths": _strings(data.get("redactPaths")),
+        **{key: _strings(data.get(key)) for key in REDACT_KEYS},
     }
 
 

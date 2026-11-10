@@ -10,20 +10,19 @@ Everything is plain data through pure stages:
 
     table          redact-rules.json, as written
     compiled       every regex composed: what jq loads, and what this module compiles
-    Ruleset        compiled patterns, members, sensitive paths and commands (a user rule that fails: error)
+    Ruleset        the built-in rules a project kept (redactDisable), its own rules, its names and allowed literals
+                   (a project setting that fails: error)
     env_secrets    (name, literal) for each secret-named environment value, and each line of it
     tool_values    ToolValue(kind, text) for each string under a path, command, or patch key of the tool input
-    patch_targets  PatchTarget(header, path) for each header line of a patch in the tool input (the patch-header parser)
-    words          what path rules read: shell words, patch targets, @mentions, then definite paths (./name when relative)
-    sensitive      the sensitive path (from tool args, shell words, patch targets, @mentions), env dump, or
-                   credential-printing command a tool call names, as {rule, trigger}, or None
+    words          what path rules read: the tokens of every tool value and the prompt's @mentions, one per line
+    sensitive      the sensitive path or command a tool call names, as {rule, trigger}, or None
     findings       Finding(rule, start, end, kept): each rule's matches as spans of the unchanged blob, one
                    finditer per window (linear: no match is searched for twice)
     layers         the strings and keys of JSON nested deeper in a string than the rules read, one list per depth
     pairs          findings -> Pair(found, replacement, rule), one per distinct found text, longest first; a
                    nested layer's encoded as deep as it sits
     env_found      {name, field}: the env values each field's raw text held, whatever rule replaced them
-    scrub_fields   the secret-key members (exact "key":"value" tokens), then the pairs, applied to each field:
+    scrub_fields   the secret_field members (exact "key":"value" tokens), then the pairs, applied to each field:
                    in its JSON when every pair can only sit inside a string there, else to each string value,
                    so no number or JSON syntax is ever touched; a Counter of what was replaced, by rule. A found
                    text still there afterwards fails closed
@@ -33,8 +32,8 @@ Everything is plain data through pure stages:
 Each event ends in one state (``outcome``): clean, redacted, sensitive, or error. The hook allows fewer distinct
 finds than the sender (``hook_budget``, ``sender_budget``): jq matches a long window once per distinct find.
 
-A rule set with an error (a user regex that does not compile) redacts every text to nothing. No
-function records a secret, or a hash, prefix, or length of one.
+A rule set with an error (a user regex that does not compile, a bad name, an unknown rule id) redacts every text to
+nothing. No function records a secret, or a hash, prefix, or length of one.
 """
 
 from __future__ import annotations
@@ -43,7 +42,6 @@ import functools
 import json
 import os
 import re
-import string
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +53,8 @@ COMPILED_FILE = BIN / "redact-compiled.json"
 SENSITIVE_REASON = "sensitive_path"
 _NAMED = re.compile(r"\(\?<([A-Za-z_][A-Za-z0-9_]*)>")
 _BACKREF = re.compile(r"\\k<([A-Za-z_][A-Za-z0-9_]*)>")
+# A name a project adds with redactNames: lowercase-able parts joined by _. Anything else fails the rule set closed.
+_NAME = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)*")
 
 
 # ---------------------------------------------------------------- the table, composed
@@ -66,246 +66,113 @@ def rules() -> dict:
 
 
 def _cases(part: str) -> list[str]:
-    """A lowercase word as lower, UPPER, and Capitalized, without repeats."""
+    """A word as lower, UPPER, and Capitalized, without repeats."""
+    part = part.lower()
     return list(dict.fromkeys([part, part.upper(), part.capitalize()]))
 
 
-def _word(word: str) -> str:
-    """``api_key`` -> api_key, API-KEY, apiKey, ApiKey, apikey...: each part in three cases, joined by _, -, ., or nothing."""
-    return "[_.-]?".join("(?:" + "|".join(_cases(part)) + ")" for part in word.split("_"))
+def names_re(names: Iterable[str]) -> str:
+    """Secret names as one alternation: ``api_key`` -> api_key, API-KEY, apiKey, ApiKey, apikey...: each part in three
+    cases, joined by _, -, ., or nothing. prepare.jq's jp_word spells a project's redactNames the same way."""
+    return "|".join("[_.-]?".join("(?:" + "|".join(_cases(part)) + ")" for part in name.split("_")) for name in names)
 
 
-def generated(table: Mapping | None = None) -> dict[str, str]:
-    """The fragments composed from the tables: a secret key name, and a reference or placeholder value."""
-    table = table or rules()
-    keys = table["secret_keys"]
-    names = "|".join(_word(word) for word in keys["names"])
-    whole = "|".join(_word(word) for word in keys["whole"])
-    # A name is the whole key, or its end after a separator or a camelCase boundary.
-    name = "(?:(?:[A-Za-z0-9_.-]{0,64}?(?:[_.-]|(?<=[a-z0-9])(?=[A-Z])))?(?:" + names + ")|" + whole + ")"
-    lit = table["literals"]
-    # Each ref is a complete grammar: the value must be one reference and nothing else (literal text after it is a literal).
-    refs = "(?:" + "|".join(lit["refs"]) + ")"
-    words = "|".join(case for word in lit["words"] for case in _cases(word))
-    literal = "(?:" + refs + "|" + words + "|" + "|".join(lit["forms"]) + ")"
-    last = "|".join(dict.fromkeys(case for word in keys["names"] + keys["whole"] for case in _cases(word.split("_")[-1])))
-    # The same names where a match starts: at the name, after an identifier start, a separator, or a camelCase boundary.
-    # A text rule starts here rather than at the identifier, so no prefix is tried at every position.
-    tail = ("(?:(?:(?<![A-Za-z0-9_.-])|(?<=[_.-])|(?<=[a-z0-9])(?=[A-Z]))(?:" + names + ")|(?<![A-Za-z0-9_])(?:" + whole + "))")
-    out = {"secret_key_name": name, "secret_key_tail": tail, "literal": literal, "secret_key_last": last}
-    # Generic words that keep the shape test, as the whole identifier only: after no identifier character (a member's . and
-    # a flag's -- are fine), never as the end of one (sort_key, monkey, oauth).
-    shaped = "(?:" + "|".join(case for word in keys.get("shaped", []) for case in _cases(word)) + ")" if keys.get("shaped") else "(?!)"
-    out["shaped_word"] = shaped
-    out["shaped_text"] = "(?:(?<![A-Za-z0-9_-])|(?<=--))" + shaped
-    out["shaped_not"] = keys.get("shaped_not") or "(?!)"
-    if "assignment" in table:
-        out.update(_assignment_fragments(table["assignment"]))
-    readers = table.get("sensitive", {}).get("not_readers")
-    if readers:
-        cli = [item for item in table["sensitive"]["commands"] if "rows" in item] if readers.get("and_cli") else []
-        out["sh_not_reader"] = "|".join(dict.fromkeys([re.escape(word) for word in readers["words"]] + [cmd for item in cli for cmd in cli_needs(item)]
-                                                     + list(readers.get("patterns", []))))
-    for tool, opts in table.get("shell_options", {}).items():
-        if not tool.startswith("_"):
-            out.update(_option_fragments(tool, opts))
+def name_needs(names: Iterable[str], suffix: str = "") -> list[str]:
+    """The literals a name rule needs: the last part of each name, in its three cases, then ``suffix``."""
+    return list(dict.fromkeys(case + suffix for name in names for case in _cases(name.split("_")[-1])))
+
+
+def _split_names(regex: str) -> list[str]:
+    """A name rule's regex as the text before and after {names}, which the hook joins around the names it uses."""
+    before, after = regex.split("{names}")
+    return [before, after]
+
+
+def name_rules(names: Iterable[str]) -> list[dict]:
+    """secret_assignment and secret_field for these names, as compiled rules (needs only for the built-in names)."""
+    table = rules()["secretNames"]
+    names = list(names)
+    builtin = names == table["names"]
+    out = []
+    for key in ("assignment", "field"):
+        item = table[key]
+        before, after = _split_names(item["re"])
+        rule = {"id": item["id"], "re": before + "(?:" + names_re(names) + ")" + after, "placeholder": placeholder(item["id"])}
+        if builtin:
+            rule["needs"] = name_needs(names, item.get("needs_suffix", ""))
+        out.append(rule)
     return out
 
 
-def _assignment_fragments(table: Mapping) -> dict[str, str]:
-    """The assignment recognizer's rows (the assignment table) as fragments. assign_ctx: one of the contexts, each setting its
-    group, then the key's identifier prefix. assign_close: the group of the context that was read matches again (a quoting
-    context's quote closes; the others are empty), then ok is set. assign_op: an operator, or a blank after a flag.
-    assign_after: each context's check after the value, made only when that context was read: \\k<group> matches only a
-    group that took part, so (?:\\k<g>(?=check)|(?!\\k<g>)) is "if g then check" in both engines."""
-    keywords = "(?:(?:" + "|".join(map(re.escape, table["keywords"])) + ")[^\\S\\n]+(?:-[A-Za-z]{1,8}[^\\S\\n]+)?){0,3}"
-    location = "(?:" + "|".join(row["re"] for row in table.get("locations", [])) + ")?" if table.get("locations") else ""
-    contexts = table["contexts"]
-    ctx = "(?:" + "|".join(row["re"].replace("{keywords}", keywords).replace("{location}", location) for row in contexts) + ")" + table["key_prefix"]
-    close = "(?:" + "|".join("\\k<" + row["group"] + ">" for row in contexts) + ")(?<ok>)"
-    ops = "|".join(re.escape(op) for op in sorted(table["operators"], key=len, reverse=True))
-    blank = "".join("|\\k<" + row["group"] + ">[^\\S\\n]+" for row in contexts if row.get("blank_operator"))
-    whole = table.get("line_whole", "").replace("{bound}", str(table.get("after_bound", 1024)))
-    after = "".join("(?:\\k<" + row["group"] + ">" + row["after"].replace("{line_whole}", whole) + "|(?!\\k<" + row["group"] + ">))"
-                    for row in contexts if row.get("after"))
-    return {"assign_ctx": ctx, "assign_close": close, "assign_op": "(?:\\s{0,5}(?:" + ops + ")\\s{0,5}" + blank + ")", "assign_after": after}
+def path_glob_re(glob: str) -> str:
+    """A built-in path glob as a regex over one token's last components: * is any run of characters but / and : (a
+    placeholder such as [REDACTED:github_token] counts as one), ? one character but those. Neither crosses a / or a :
+    otherwise, so a rule scans one component from each start, and a token of many colons costs linear work."""
+    star = "(?:[^\\n/:\\[]|\\[(?:REDACTED:[^\\]\\n/]{1,128}\\])?)*"
+    return "".join(star if char == "*" else "[^\\n/:]" if char == "?" else re.escape(char) for char in glob)
 
 
-def cli_regex(item: Mapping, table: Mapping) -> list:
-    """A secret_cli table (rows) as one rule regex, composed like any other: at a command position (sh_at), behind wrappers
-    (sh_prefix), each row's command, its subcommand words with options between them (sh_opts), and its operand.
-
-    Flags are a property of the whole invocation, wherever they sit: kubectl get -o json secret db and kubectl get secret db
-    -o json print the same thing, and so do gh --help auth token and gh auth token --help. So both checks are lookaheads made
-    once, at the command word, over all of its arguments (at most limits.cli_args): none of `unless` may be among them
-    (one check for every row), and one of the row's `with` must be."""
-    stop = {"def": "sh_stop"}
-    word = compose(table["defs"]["sh_word"], table)
-    most = int(table["limits"].get("cli_args", 32))
-    groups = iter(range(1, 1 << 16))
-
-    def args() -> str:
-        name = f"cl{next(groups)}"
-        return "(?:[^\\S\\n]+(?=(?<" + name + ">" + word + "))\\k<" + name + ">){0," + str(most) + "}?[^\\S\\n]+"
-
-    # Each row as a path of parts (strings and defs), then all rows as one prefix tree, so rows that share a command and
-    # words share their regex: gh auth token and gh auth status read "gh auth" once.
-    paths = []
-    for row in item["rows"]:
-        part: list = ["(?:" + row["cmd"] + ")", stop]
-        if row.get("with"):
-            part += ["(?=" + args() + "(?:" + "|".join(row["with"]) + ")(?![A-Za-z0-9_-]))"]
-        if row.get("unless"):
-            part += ["(?!" + args() + "(?:" + "|".join(map(re.escape, row["unless"])) + ")", stop, ")"]
-        for sub in row["words"]:
-            part += [{"def": "sh_opts"}, "(?:" + sub + ")", stop]
-        if row.get("operand"):
-            part += [{"def": "sh_opts"}, "['\"]?(?:" + row["operand"] + ")['\"]?", stop]
-        if row.get("alone"):
-            part.append("(?![^\\S\\n]+[^-\\s;&|()<>`#])")
-        paths.append(part)
-    alts = _tree(paths)
-    unless = list(item.get("unless", []))
-    common = ["(?!(?:" + "|".join(cli_needs(item)) + ")", stop, args() + "(?:" + "|".join(map(re.escape, unless)) + ")", stop, ")"] if unless else []
-    return [{"def": "sh_at"}, {"def": "sh_prefix"}, {"def": "sh_path"}] + common + ["(?:"] + alts + [")"]
+def path_rule_re(globs: list[str]) -> str:
+    """A path rule's regex over the words (one token per line): from the start of a token's last components (after a
+    newline, / or :), one of its globs to the end of the token, unless one of its ! globs matches there."""
+    keep = [path_glob_re(glob) for glob in globs if not glob.startswith("!")]
+    drop = [path_glob_re(glob[1:]) for glob in globs if glob.startswith("!")]
+    unless = "(?!(?:" + "|".join(drop) + ")(?![^\\n]))" if drop else ""
+    return "(?<![^\\n/:])" + unless + "(?:" + "|".join(keep) + ")(?![^\\n])"
 
 
-def _tree(paths: list[list]) -> list:
-    """Alternatives of paths of parts as a prefix tree: paths that start with the same part share it. A list of parts that
-    matches what one of the paths matches."""
-    groups: dict[str, list[list]] = {}
-    for path in paths:
-        groups.setdefault(json.dumps(path[0], sort_keys=True), []).append(path)
-    alts: list = []
-    for key, members in groups.items():
-        rests = [path[1:] for path in members]
-        tails = _tree([rest for rest in rests if rest]) if any(rests) else []
-        branch = [json.loads(key)]
-        if tails:
-            branch += ["(?:"] + tails + (["|)"] if any(not rest for rest in rests) else [")"])
-        alts += (["|"] if alts else []) + branch
-    return alts
-
-
-def cli_needs(item: Mapping) -> list[str]:
-    """A secret_cli table's needed literals: its command words."""
-    return sorted({cmd for row in item["rows"] for cmd in row["cmd"].split("|")})
-
-
-def _option_fragments(tool: str, opts: Mapping) -> dict[str, str]:
-    """A command's option grammar (shell_options in the rules) as fragments: <tool>_short_flag, one short option that takes no
-    argument; <tool>_short_arg and <tool>_short_split, one that takes the next word (or the rest of its cluster);
-    <tool>_long_arg and <tool>_long_split, a long option that takes one, spelled whole or as any prefix getopt_long accepts
-    (the shortest one no other long option shares)."""
-    takes = opts["short_arg"] + opts.get("short_split", "")
-    flags = "".join(c for c in string.ascii_uppercase + string.ascii_lowercase + string.digits if c not in takes)
-    names = opts["long"]
-
-    def abbrev(name: str) -> str:
-        size = next(n for n in range(1, len(name) + 1) if not any(o != name and o.startswith(name[:n]) for o in names))
-        tail = ""
-        for char in reversed(name[size:]):
-            tail = "(?:" + re.escape(char) + tail + ")?"
-        return re.escape(name[:size]) + tail
-
-    def longs(key: str) -> str:
-        return "(?:" + "|".join(abbrev(name) for name in opts.get(key, [])) + ")" if opts.get(key) else "(?!)"
-
-    return {f"{tool}_short_flag": "[" + flags + "]", f"{tool}_short_arg": "[" + opts["short_arg"] + "]",
-            f"{tool}_short_split": "[" + opts.get("short_split", "") + "]" if opts.get("short_split") else "(?!)",
-            f"{tool}_long_arg": longs("long_arg"), f"{tool}_long_split": longs("long_split")}
-
-
-def compose(regex: Any, table: Mapping | None = None, depth: int = 0) -> str:
-    """A rule's regex. A list joins its parts; {"def": name} is a shared fragment (itself a string or a list), {"gen": name}
-    a generated one."""
-    if not isinstance(regex, list):
-        return regex
-    if depth > 16:
-        raise ValueError("defs nest too deep")
-    table = table or rules()
-    gen = generated(table) if any(isinstance(part, dict) and "gen" in part for part in regex) else {}
-    out = []
-    for part in regex:
-        if isinstance(part, dict):
-            out.append(compose(table["defs"][part["def"]], table, depth + 1) if "def" in part else gen[part["gen"]])
-        else:
-            out.append(part)
-    return "".join(out)
-
-
-def _needs(item: Mapping, table: Mapping) -> list[str] | None:
-    """A rule's needed literals. "secret_key_name": the last word of each secret key name, in its three cases."""
-    if item.get("needs") == "secret_key_name":
-        keys = table["secret_keys"]
-        suffix = item.get("needs_suffix", "")
-        return list(dict.fromkeys(case + suffix for word in keys["names"] + keys["whole"] for case in _cases(word.split("_")[-1])))
-    return item.get("needs")
+def command_re(regex: str, table: Mapping | None = None) -> str:
+    """A command regex at a command position, not asking for help or a version (sensitive.command)."""
+    command = (table or rules())["sensitive"]["command"]
+    return command["prefix"] + "(?:" + regex + ")" + command["unless"]
 
 
 def compiled(table: Mapping | None = None) -> dict:
-    """What the hook's jq loads: the table with every regex composed and the comments left out, so the hook walks no table
-    and builds no regex for the built-in rules: each rule's placeholder, each path rule's trigger regex, the patch-header
-    target regex, the key kinds (path, command, patch), and the definite-path test are composed here, once, by
-    scripts/gen_redact.py. Only a project's redactPatterns and redactPaths are composed at hook time."""
+    """What the hook's jq loads: the table with every built-in regex composed and the comments left out, so the hook
+    builds no regex for the built-in rules. The name rules also arrive as the text around {names} (``names``), so the
+    hook can join a project's redactNames in; a project's redactPatterns, redactPaths, and redactCommands are composed
+    at hook time too. ``ids``: every built-in rule id, the ones redactDisable may name."""
     table = table or rules()
+    names = table["secretNames"]
+    sensitive = table["sensitive"]
 
-    def rule(item: Mapping, key: str = "re") -> dict:
-        out = {"id": item["id"], "re": compose(cli_regex(item, table) if "rows" in item else item[key], table), "placeholder": placeholder(item["id"])}
-        needs = cli_needs(item) if "rows" in item else _needs(item, table)
-        if needs:
-            out["needs"] = needs
-        if item.get("pre"):
-            out["pre"] = compose(item["pre"], table)
-        for flag in ("whole", "most"):
-            if item.get(flag) is not None:
-                out[flag] = item[flag]
+    def rule(item: Mapping, regex: str) -> dict:
+        out = {"id": item["id"], "re": regex, "placeholder": placeholder(item["id"])}
+        for key in ("needs", "pre", "whole", "most"):
+            if item.get(key) is not None:
+                out[key] = item[key]
         return out
 
-    sensitive = table["sensitive"]
-    paths = [{**rule(item), "trigger": trigger_re(compose(item["re"], table))} for item in sensitive["paths"]]
+    assignment, field = name_rules(names["names"])
+    paths = [rule(item, path_rule_re(item["globs"])) for item in sensitive["paths"]]
+    commands = [rule(item, command_re("|".join(item["re"]), table)) for item in sensitive["commands"]]
+    patterns = [rule(item, item["re"]) for item in table["patterns"]]
+    ids = [item["id"] for item in patterns + paths + commands] + [assignment["id"], field["id"]]
     return {
         "version": table["version"],
         "limits": {key: value for key, value in table["limits"].items() if key != "_comment"},
         "env": {"name_re": table["env"]["name_re"], "min_length": table["env"]["min_length"]},
-        "patterns": [rule(item) for item in table["patterns"]],
-        "members": [rule(item, "json_re") for item in table["members"]],
-        "sensitive": {
-            "paths": paths,
-            "commands": [rule(item) for item in sensitive["commands"]],
-            "kinds": kinds(sensitive),
-            "definite": {"prefix": sensitive["definite"]["prefix"], "relative": relative_re(sensitive["definite"])},
-            **{key: sensitive[key] for key in ("glob", "split", "mention")},
-            "patch": _patch_table(sensitive["patch"]),
+        "patterns": patterns,
+        "names": {
+            "builtin": names_re(names["names"]),
+            "assignment": {**assignment, "parts": _split_names(names["assignment"]["re"])},
+            "field": {**field, "parts": _split_names(names["field"]["re"])},
         },
+        "sensitive": {
+            "paths": [{**item, "trigger": trigger_re(item["re"])} for item in paths],
+            "commands": commands,
+            "keys": sensitive["keys"],
+            "command": sensitive["command"],
+            **{key: sensitive[key] for key in ("glob", "split", "mention")},
+        },
+        "ids": {rule_id: True for rule_id in ids},
         "fields": _field_sets(table["fields"]),
     }
-
-
-def kinds(sensitive: Mapping) -> dict[str, str]:
-    """Each tool-input key the sensitive table names, with its kind: "path" or "command" (keys), or "patch" (patch.keys)."""
-    return {**{key: "patch" for key, on in sensitive["patch"]["keys"].items() if on}, **sensitive["keys"]}
-
-
-def relative_re(definite: Mapping) -> str:
-    """A definite path that gets definite.prefix: nonempty and starting with none of definite.absolute."""
-    return "^(?!" + "|".join(map(re.escape, definite["absolute"])) + ")(?=[\\s\\S])"
 
 
 def trigger_re(regex: str) -> str:
     """The word (line) holding the first match of a path rule: what the audit names as the trigger."""
     return "(?<![^\\n])[^\\n]*?(?:" + regex + ")[^\\n]*"
-
-
-def _patch_table(patch: Mapping) -> dict:
-    """The patch-header table as jq reads it: the header rows ({prefix, words}), the skip set, the keys, and `target`, one
-    regex composed from line (the characters a target may hold) and strip (a/, b/): a target is the rest of the line, its
-    surrounding double quotes removed when it has both (group 1), or as it is (group 2), either without one leading strip."""
-    lead = "(?:" + "|".join(map(re.escape, patch["strip"])) + ")?"
-    char = patch["line"]
-    target = "^(?:\"" + lead + "(" + char + "*)\"(?!" + char + ")|" + lead + "(" + char + "*))"
-    return {"keys": patch["keys"], "headers": [{"prefix": row["prefix"], "words": bool(row.get("words"))} for row in patch["headers"]],
-            "skip": patch["skip"], "target": target}
 
 
 def _field_sets(fields: Mapping) -> dict:
@@ -352,14 +219,14 @@ def _rule(item: Mapping) -> Rule:
 
 @functools.lru_cache(maxsize=1)
 def _built() -> dict:
-    table = rules()
-    done = compiled(table)
+    done = compiled(rules())
     return {
         "patterns": tuple(_rule(item) for item in done["patterns"]),
+        "names": (_rule(done["names"]["assignment"]), _rule(done["names"]["field"])),
         "paths": tuple(_rule(item) for item in done["sensitive"]["paths"]),
         "commands": tuple(_rule(item) for item in done["sensitive"]["commands"]),
-        "members": tuple(_rule(item) for item in done["members"]),
         "env": (_compile(done["env"]["name_re"]), int(done["env"]["min_length"])),
+        "ids": frozenset(done["ids"]),
     }
 
 
@@ -406,11 +273,12 @@ def unblank(event: Mapping) -> dict:
 
 @dataclass(frozen=True)
 class Ruleset:
-    patterns: tuple  # Rule, ... in table order, user patterns last
+    patterns: tuple  # Rule, ... in table order, then secret_assignment, then user patterns
     paths: tuple
     commands: tuple
     members: tuple = ()
-    error: str = ""  # a user rule that did not compile: every text is dropped, never sent raw
+    error: str = ""  # a project setting that failed: every text is dropped, never sent raw
+    allow: frozenset = frozenset()  # redactAllow: a find whose redacted text is one of these is left alone
 
 
 def glob_re(glob: str) -> str:
@@ -419,23 +287,53 @@ def glob_re(glob: str) -> str:
     return "(?<![^\\n/:])" + "".join(table.get(char, char) for char in glob) + "(?![^\\n])"
 
 
+def _setting(project: Mapping, key: str) -> list[str]:
+    """A project's list setting: its nonempty strings. Anything else in it is skipped, as optin.load_project does."""
+    value = project.get(key)
+    return [item for item in value if isinstance(item, str) and item] if isinstance(value, list) else []
+
+
+@functools.lru_cache(maxsize=16)
+def _named(names: tuple) -> tuple:
+    return tuple(_rule(item) for item in name_rules(rules()["secretNames"]["names"] + list(names)))
+
+
 def ruleset(project: Mapping | None = None) -> Ruleset:
-    """The built-in rules plus a project's ``redactPatterns`` and ``redactPaths``. User rules only add."""
+    """The built-in rules a project keeps, plus its own (tracing.json):
+
+        redactPatterns  regexes whose matches are redacted (custom)
+        redactPaths     globs over whole paths that blank a turn (custom_path)
+        redactCommands  regexes at a command position that blank a turn (custom_command)
+        redactNames     names whose values are redacted, as secretNames
+        redactAllow     literal texts never redacted
+        redactDisable   built-in rule ids turned off
+
+    A regex that does not compile, a name that is not parts joined by _, or an id no built-in rule has fails the
+    rule set closed (``error``), as an invalid redactPatterns regex always has."""
     built = _built()
-    patterns, paths, commands, members = built["patterns"], built["paths"], built["commands"], built["members"]
     project = project or {}
-    extra_patterns = []
-    extra_paths = []
+    off = set(_setting(project, "redactDisable"))
+    names = tuple(_setting(project, "redactNames"))
+
+    def kept(items: Iterable[Rule]) -> tuple:
+        return tuple(item for item in items if item.id not in off)
+
+    def failed(error: str) -> Ruleset:
+        return Ruleset(built["patterns"], built["paths"], built["commands"], built["names"][1:], error=error)
+
+    if off - built["ids"]:
+        return failed("redactDisable")
+    if not all(_NAME.fullmatch(name) for name in names):
+        return failed("redactNames")
     try:
-        for regex in project.get("redactPatterns") or []:
-            if isinstance(regex, str) and regex:
-                extra_patterns.append(Rule("custom", _compile(regex)))
-        for glob in project.get("redactPaths") or []:
-            if isinstance(glob, str) and glob:
-                extra_paths.append(Rule("custom_path", _compile(glob_re(glob))))
+        assignment, field = _named(names) if names else built["names"]
+        patterns = [Rule("custom", _compile(regex)) for regex in _setting(project, "redactPatterns")]
+        paths = [Rule("custom_path", _compile(glob_re(glob))) for glob in _setting(project, "redactPaths")]
+        commands = [Rule("custom_command", _compile(command_re(regex))) for regex in _setting(project, "redactCommands")]
     except (re.error, RecursionError, OverflowError) as exc:
-        return Ruleset(patterns, paths, commands, members, error=type(exc).__name__)
-    return Ruleset(patterns + tuple(extra_patterns), paths + tuple(extra_paths), commands, members)
+        return failed(type(exc).__name__)
+    return Ruleset(kept(built["patterns"] + (assignment,)) + tuple(patterns), kept(built["paths"]) + tuple(paths),
+                   kept(built["commands"]) + tuple(commands), kept((field,)), allow=frozenset(_setting(project, "redactAllow")))
 
 
 def env_secrets(env: Mapping[str, str] | None = None, api_key: str = "") -> list[tuple[str, str]]:
@@ -562,13 +460,18 @@ def _order(pairs: Iterable[Pair]) -> list[Pair]:
     return sorted(first.values(), key=lambda pair: (-len(pair.found), pair.found))
 
 
+def _allowed(pairs: Iterable[Pair], allow: frozenset) -> list[Pair]:
+    """Mirror of jp_allow: the pairs whose redacted text (the found text after its kept prefix) redactAllow does not name."""
+    return [pair for pair in pairs if pair.found[len(pair.replacement) - len(placeholder(pair.rule)):] not in allow]
+
+
 def _layer_pairs(blob: str, rs: Ruleset, secrets: list[tuple[str, str]], budget: int) -> list[Pair]:
     """The env values one layer's blob holds, then each rule whose needs it holds, over the unchanged blob."""
     out = [Pair(value, placeholder("env:" + name), "env:" + name) for name, value in secrets if value in blob]
     for rule in rs.patterns:
         if rule.applies(blob):
             out += found(rule, blob, budget)
-    return out
+    return _allowed(out, rs.allow)
 
 
 def escaped(text: str, depth: int) -> str:
@@ -668,7 +571,7 @@ def member_pairs(fields: Mapping[str, Any], rs: Ruleset, budget: int | None = No
     """Mirror of prepare.jq: each member rule over the compact JSON of the fields' values (a field's name is never a
     key), as text: "key":"value" -> "key":"[REDACTED:secret_field]". One pair per found text, longest first."""
     text = jq_json(list(fields.values()))
-    return _order(pair for rule in rs.members if rule.applies(text) for pair in found(rule, text, budget))
+    return _order(_allowed((pair for rule in rs.members if rule.applies(text) for pair in found(rule, text, budget)), rs.allow))
 
 
 _OUTSIDE_STRING = re.compile(r"[-+.0-9eEtrufalsn{}\[\],:]*")
@@ -870,8 +773,7 @@ def _all_strings(value: Any) -> Iterator[str]:
 
 
 class ToolValue(NamedTuple):
-    """One string in the tool input under a key the sensitive table names, as plain data: its kind is the key's (sensitive.keys:
-    "path" or "command") or "patch" (sensitive.patch.keys)."""
+    """One string in the tool input under a key sensitive.keys names, as plain data: its kind ("path", "command", or "patch")."""
 
     kind: str
     text: str
@@ -880,7 +782,7 @@ class ToolValue(NamedTuple):
 def tool_values(event: Mapping) -> list[ToolValue]:
     """Mirror of prepare.jq's walk: each string under a path, command, or patch key in the tool input (and each tool call's
     arguments and input), at any depth, in document order. A string tool input is a command."""
-    kind_of = kinds(rules()["sensitive"])
+    kind_of = rules()["sensitive"]["keys"]
     raw = [event.get("tool_input")]
     calls = event.get("tool_calls")
     for call in calls if isinstance(calls, list) else calls.values() if isinstance(calls, dict) else []:
@@ -907,44 +809,6 @@ def tool_values(event: Mapping) -> list[ToolValue]:
     return out
 
 
-def tool_texts(event: Mapping) -> list[str]:
-    """The path and command values: what command rules read, one per line, and path rules read word by word."""
-    return [value.text for value in tool_values(event) if value.kind != "patch"]
-
-
-class PatchTarget(NamedTuple):
-    """One file a patch header names: which header row (its prefix) and the path, as plain data."""
-
-    header: str
-    path: str
-
-
-def patch_targets(texts: Iterable[str]) -> list[PatchTarget]:
-    """Mirror of jp_patch: the patch-header parser. For each text and header row (sensitive.patch.headers), each line that
-    starts with the row's prefix names a target: what the composed `target` regex reads of the rest of the line (up to a
-    tab, unquoted, without one a/ or b/), split at blanks for a row marked words. More than ``limits.patch_headers`` header
-    lines fail closed."""
-    table = _patch_table(rules()["sensitive"]["patch"])
-    target = _target_re(table["target"])
-    found = [(row, piece) for text in texts for row in table["headers"] if row["prefix"] in text
-             for piece in ("\n" + text).split("\n" + row["prefix"])[1:]]
-    if len(found) > rules()["limits"]["patch_headers"]:
-        raise RedactionLimit("patch")
-    out = []
-    for row, piece in found:
-        match = target.match(piece)
-        path = match.group(1) if match.group(1) is not None else match.group(2)
-        for word in path.split(" ") if row["words"] else [path]:
-            if word and not table["skip"].get(word):
-                out.append(PatchTarget(row["prefix"], word))
-    return out
-
-
-@functools.lru_cache(maxsize=1)
-def _target_re(regex: str) -> re.Pattern:
-    return _compile(regex)
-
-
 def lines(text: str, at: list[str]) -> str:
     """Mirror of jp_lines: the text split at each of the literals, one piece per line."""
     for literal in at:
@@ -952,34 +816,18 @@ def lines(text: str, at: list[str]) -> str:
     return text
 
 
-def definite(path: str) -> str:
-    """A word that can only be a path, as path rules see it: relative ones as ./path (sensitive.definite), so a bare name such
-    as credentials is a basename after a directory separator. Empty when nothing is to add (empty, or already absolute)."""
-    table = rules()["sensitive"]["definite"]
-    return table["prefix"] + path if _relative(relative_re(table)).search(path) else ""
-
-
 def words(event: Mapping, values: list[ToolValue]) -> str:
-    """Mirror of prepare.jq: what path rules see, one word per line, in four parts: the words of the path and command values;
-    the target of each patch header in them and in the patch values (whole: a path may hold a blank); the prompt's
-    @mentions; then each definite path (every target, and every whole path value) as definite() gives it."""
+    """Mirror of prepare.jq: what path rules see, one token per line: the tokens of every tool value, then the prompt's
+    @mentions. More than limits.mentions @ signs in the prompt fail closed."""
     table = rules()["sensitive"]
-    texts = [value.text for value in values if value.kind != "patch"]
-    targets = patch_targets(texts + [value.text for value in values if value.kind == "patch"])
-    found_words = lines("\n".join(texts), table["split"]) + "\n" + "\n".join(target.path for target in targets) + "\n"
+    out = lines("\n".join(value.text for value in values), table["split"]) + "\n"
     prompt = event.get("prompt")
     if isinstance(prompt, str) and "@" in prompt:
         if prompt.count("@") > rules()["limits"]["mentions"]:
             raise RedactionLimit("mentions")
         mentions = [lines(word[1:], table["mention"]["end"]).split("\n")[0] for word in lines(prompt, table["mention"]["split"]).split("\n") if word.startswith("@")]
-        found_words += "\n".join(mention for mention in mentions if mention)
-    paths = [target.path for target in targets] + [value.text for value in values if value.kind == "path"]
-    return found_words + "\n" + "\n".join(word for word in map(definite, paths) if word)
-
-
-@functools.lru_cache(maxsize=1)
-def _relative(regex: str) -> re.Pattern:
-    return _compile(regex)
+        out += "\n".join(mention for mention in mentions if mention)
+    return out
 
 
 @functools.lru_cache(maxsize=64)
@@ -989,17 +837,17 @@ def _whole_word(regex: str) -> re.Pattern:
 
 
 def sensitive(event: Mapping, rs: Ruleset) -> dict | None:
-    """The first sensitive path or env dump the event's tool input names, as {rule, trigger}."""
+    """The first sensitive command, then path, the event's tool input names, as {rule, trigger}."""
     values = tool_values(event)
-    texts = [value.text for value in values if value.kind != "patch"]
+    # Each command is its own command line: a quote one leaves open never hides the next one's command.
+    commands = [value.text for value in values if value.kind == "command"]
+    for rule in rs.commands:
+        if any(rule.applies(text) and rule.pattern.search(text) for text in commands):
+            return {"rule": rule.id, "trigger": f"cmd:{rule.id}"}
     blob = words(event, values)
     for rule in rs.paths:
         if rule.applies(blob) and rule.pattern.search(blob):
             return {"rule": rule.id, "trigger": _whole_word(rule.pattern.pattern).search(blob).group(0)}
-    # Each value is its own command line: a quote one leaves open never hides the next one's command.
-    for rule in rs.commands:
-        if any(rule.applies(text) and rule.pattern.search(text) for text in texts):
-            return {"rule": rule.id, "trigger": f"cmd:{rule.id}"}
     return None
 
 
