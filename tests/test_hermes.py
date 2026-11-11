@@ -1,81 +1,54 @@
-"""Hermes plugin: hook kwargs -> inbox -> flusher -> fake sink. Spans, redaction, opt-out, latency, the sender.
+"""Hermes plugin: what a traced session looks like, when nothing is traced, and which conversation an event belongs to.
 
 Hook kwargs come from tests/hermes_support.py, shaped like what Hermes 0.19.0 passes. The plugin runs
 in-process, as in Hermes, with only the sandbox env. tests/e2e_hermes.py runs real Hermes.
+
+    SpanTree, Retries, Incomplete, Grandchild, Late    hook kwargs -> inbox -> flusher -> spans in the fake sink
+    OptOut, Workspace, CommandIdentity                 opt-in, the kill switch, /judgment on|off, which folder decides
+    Rotation, Rotated, Preflight                       Hermes renaming a session id mid-conversation
+    Install, Contract                                  the manifest, the hooks registered, the vendored core's API
 """
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import os
-import signal
-import statistics
 import subprocess
 import sys
-import textwrap
-import time
+import types
 import unittest
+from pathlib import Path
+from unittest import mock
 
-from fake_sink import Sink, attrs, roots
+from fake_sink import attrs, roots
 from hermes_support import (
-    LATENCY_GATE_P95_MS,
-    LATENCY_TARGET_P95_MS,
     PLUGIN_DIR,
     VENDOR_CORE,
+    Case,
+    Sandbox,
     Turn,
     finalize,
     fire_all,
     flush_vendor,
+    gh_token,
+    kinds,
     later,
-    latency_trials,
+    latest,
     load_plugin,
     new_session_id,
-    over,
     plugin_env,
+    preflight,
+    renamed,
     simple_turn,
     state_files,
     subagent_turn,
 )
-from hermes_support import Sandbox
-from support import ENV_SECRET_NAME, REPO, SECRETS, leaks, wait_for, whole_leaks
-
-ENV_FILE = "DATABASE_URL=postgres://app:" + "Lq" + "9xT" * 4 + "@db/app\nFEATURE_FLAG=on\n"
-GIT_SHA = "4f1e2d3c9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d"
-UUID = "123e4567-e89b-12d3-a456-426614174000"
-CODE = "response = client.create(model=m, max_tokens=4096, temperature=0.2)"
+from support import REPO, SECRETS, whole_leaks
 
 
-def by_kind(spans: list[dict], kind: str) -> list[dict]:
-    return [span for span in spans if attrs(span).get("judgment.span_kind") == kind]
-
-
-def latest(spans: list[dict]) -> list[dict]:
-    """The newest version of each span: a resend repeats span ids with a higher update id."""
-    found: dict[str, dict] = {}
-    for span in spans:
-        found[span["spanId"]] = span
-    return list(found.values())
-
-
-class HermesCase(unittest.TestCase):
-    def setUp(self):
-        self.sink = Sink().__enter__()
-        self.sb = Sandbox(sink_url=self.sink.url)
-        self.addCleanup(self.sb.cleanup)
-        self.addCleanup(self.sink.__exit__)
-
-    def run_events(self, events: list, *, flush: bool = True, **env) -> tuple:
-        with plugin_env(self.sb, **env) as (plugin, ctx):
-            results = fire_all(ctx, events, plugin)
-            errors = plugin.errors["count"]
-        self.assertEqual(results, [], "a callback returned a value to Hermes")
-        if flush:
-            result = flush_vendor(self.sb)
-            self.assertEqual(result.returncode, 0, result.stderr[-2000:])
-        return errors, latest(self.sink.spans())
-
-
-class SpanTree(HermesCase):
+class SpanTree(Case):
     def test_tool_turn_tree_ids_tokens_and_text(self):
         sid = new_session_id()
         prompt = "Read notes.txt and say what it holds. Ünïcode ✓ \"quotes\" and\nnew lines."
@@ -102,7 +75,7 @@ class SpanTree(HermesCase):
         # Normal text arrives byte for byte.
         self.assertEqual(ra["judgment.input"], prompt)
         self.assertEqual(ra["judgment.output"], "The notes say hello. ✓")
-        llms = sorted(by_kind(spans, "llm"), key=lambda s: int(s["startTimeUnixNano"]))
+        llms = sorted(kinds(spans, "llm"), key=lambda s: int(s["startTimeUnixNano"]))
         self.assertEqual(len(llms), 2)
         first, second = (attrs(s) for s in llms)
         for a, (inp, out, cache) in zip((first, second), ((1001, 21, 0), (1002, 22, 512))):
@@ -117,7 +90,7 @@ class SpanTree(HermesCase):
         self.assertEqual(messages[0]["parts"][0]["content"], prompt)
         self.assertEqual(messages[2]["parts"][0]["response"], result)
         self.assertEqual(json.loads(second["judgment.output"])[0]["parts"][0]["content"], "The notes say hello. ✓")
-        tool = attrs(by_kind(spans, "tool")[0])
+        tool = attrs(kinds(spans, "tool")[0])
         self.assertEqual(tool["gen_ai.tool.name"], "read_file")
         self.assertEqual(json.loads(tool["judgment.input"]), {"path": str(self.sb.project / "notes.txt")})
         self.assertEqual(tool["judgment.output"], result)
@@ -154,7 +127,7 @@ class SpanTree(HermesCase):
         self.assertEqual(len({s["traceId"] for s in rs}), 2)
         self.assertEqual({attrs(s)["judgment.session_id"] for s in spans}, {sid})
         second = next(s for s in rs if attrs(s)["judgment.input"] == "second")
-        llm = next(s for s in by_kind(spans, "llm") if s["traceId"] == second["traceId"])
+        llm = next(s for s in kinds(spans, "llm") if s["traceId"] == second["traceId"])
         texts = [p.get("content") for m in json.loads(attrs(llm)["judgment.input"]) for p in m["parts"]]
         self.assertIn("first", texts)  # the earlier turn rides along as context
         self.assertIn("second", texts)
@@ -167,7 +140,7 @@ class SpanTree(HermesCase):
         root = roots(spans)
         self.assertEqual(len(root), 1)
         root = root[0]
-        agents = [s for s in by_kind(spans, "agent") if s is not root]
+        agents = [s for s in kinds(spans, "agent") if s is not root]
         self.assertEqual(len(agents), 1)
         agent = agents[0]
         aa = attrs(agent)
@@ -184,32 +157,6 @@ class SpanTree(HermesCase):
         # The child's own turn never became a trace.
         self.assertFalse(any(attrs(s)["judgment.input"] == "count to three" for s in roots(spans)))
 
-    def test_subagent_still_running_at_exit_is_closed(self):
-        sid = new_session_id()
-        _parent, child_sid, events = subagent_turn(sid)
-        events = [event for event in events if event[0] != "subagent_stop"]
-        _errors, spans = self.run_events(events + [finalize(sid) + (later(events, 0.5),)])
-        agent = [s for s in by_kind(spans, "agent") if s.get("parentSpanId")]
-        self.assertEqual(len(agent), 1)
-        self.assertEqual(attrs(agent[0])["judgment.agent_id"], child_sid)
-
-    def test_failed_attempt_and_retry(self):
-        sid = new_session_id()
-        turn = Turn(sid, "hello")
-        turn.api(error={"status_code": 503, "message": "overloaded", "retry_count": 1})
-        turn.api(text="hi there")
-        turn.end("hi there")
-        _errors, spans = self.run_events(turn.events)
-        llms = sorted(by_kind(spans, "llm"), key=lambda s: int(s["startTimeUnixNano"]))
-        self.assertEqual(len(llms), 2)
-        failed, ok = llms
-        self.assertEqual(failed.get("status"), {"code": 2})
-        self.assertIn("503", attrs(failed)["judgment.output"])
-        self.assertIn("overloaded", attrs(failed)["judgment.output"])
-        self.assertNotIn("status", ok)
-        # The error never reached the model, so the retry's input does not hold it.
-        self.assertNotIn("overloaded", attrs(ok)["judgment.input"])
-
     def test_interrupted_turns(self):
         sid = new_session_id()
         one = Turn(sid, "long task")
@@ -225,28 +172,13 @@ class SpanTree(HermesCase):
         _errors, spans = self.run_events(one.events + two.events + three.events)
         rs = {attrs(s)["judgment.input"]: s for s in roots(spans)}
         self.assertEqual(set(rs), {"long task", "never closed", "after"})
-        tool = [s for s in by_kind(spans, "tool") if s["traceId"] == rs["long task"]["traceId"]]
+        tool = [s for s in kinds(spans, "tool") if s["traceId"] == rs["long task"]["traceId"]]
         self.assertEqual(len(tool), 1)
         self.assertEqual(tool[0].get("status"), {"code": 2})
         self.assertIn("no result", attrs(tool[0])["judgment.output"])
         events = [json.loads(line) for path in (self.sb.state / "turns").rglob("*.jsonl") for line in path.read_text().splitlines()]
         ends = [e for e in events if e["event"] == "turn_end"]
         self.assertEqual(sorted(bool(e.get("interrupted")) for e in ends), [False, True, True])
-
-    def test_blocked_and_cancelled_tools_are_errors(self):
-        sid = new_session_id()
-        turn = Turn(sid, "do things")
-        call = turn.api(tool=("terminal", {"command": "rm -rf /tmp/x"}))
-        turn.tool(call, "terminal", {"command": "rm -rf /tmp/x"}, json.dumps({"error": "BLOCKED: denied"}), status="blocked", pre=False)
-        call2 = turn.api(tool=("terminal", {"command": "sleep 5"}))
-        turn.tool(call2, "terminal", {"command": "sleep 5"}, json.dumps({"error": "Tool execution cancelled by user interrupt", "status": "cancelled"}), status="cancelled")
-        turn.api(text="stopped")
-        turn.end("stopped")
-        _errors, spans = self.run_events(turn.events)
-        tools = by_kind(spans, "tool")
-        self.assertEqual(len(tools), 2)
-        self.assertTrue(all(s.get("status") == {"code": 2} for s in tools))
-        self.assertIn("BLOCKED", " ".join(attrs(s)["judgment.output"] for s in tools))
 
     def test_capture_metadata_and_full(self):
         secret = SECRETS["github_token"]["core"]
@@ -258,7 +190,7 @@ class SpanTree(HermesCase):
                 turn = simple_turn(sid, "show " + secret, path="a", result="token " + secret, answer="ok " + secret)
                 _errors, spans = self.run_events(turn.events)
                 body = self.sink.text()
-                llm = attrs(by_kind([s for s in spans if attrs(s)["judgment.session_id"] == sid], "llm")[0])
+                llm = attrs(kinds([s for s in spans if attrs(s)["judgment.session_id"] == sid], "llm")[0])
                 self.assertEqual(int(llm["judgment.usage.non_cached_input_tokens"]), 1001)
                 if expect_text:
                     self.assertIn(secret, body)  # redact: false is raw text, as the project asked
@@ -267,90 +199,110 @@ class SpanTree(HermesCase):
                     self.assertEqual(attrs(roots([s for s in spans if attrs(s)["judgment.session_id"] == sid])[0])["judgment.input"], "")
 
 
-class Redaction(HermesCase):
-    def test_fake_secrets_everywhere_are_redacted(self):
+class Retries(Case):
+    def test_attempts_of_one_request_are_separate_spans_with_their_own_start(self):
+        """Hermes reuses api_request_id and started_at for every attempt, and a credential-pool retry keeps retry_count."""
         sid = new_session_id()
-        gh, oa, aws, slack = (SECRETS[k]["core"] for k in ("github_token", "openai_key", "aws_access_key_id", "slack_token"))
-        env_value = SECRETS["env_value"]["core"]
-        turn = Turn(sid, f"deploy with key {oa}, keep it safe")
-        call = turn.api(tool=("terminal", {"command": f"curl -H 'Authorization: Bearer {SECRETS['bearer_token']['core']}' https://x"}), usage=(1001, 21, 0))
-        turn.tool(call, "terminal", {"command": f"echo {aws}"}, json.dumps({"output": f"token={gh}\npushed with {gh}\nservice {env_value}\n{SECRETS['private_key']['text']}", "exit_code": 0}))
-        turn.api(error={"status_code": 401, "message": f"invalid key {SECRETS['anthropic_key']['core']}"})
-        turn.api(text=f"Deployed. The slack token {slack} still works. Build {GIT_SHA}, id {UUID}.\n{CODE}")
-        turn.end(f"Deployed. The slack token {slack} still works. Build {GIT_SHA}, id {UUID}.\n{CODE}")
-        _errors, spans = self.run_events(turn.events + [finalize(sid) + (later(turn.events, 0.5),)])
-        body = self.sink.text()
-        self.assertEqual(leaks(body, hashes=False), [], "a fake secret reached the sink")
-        self.assertEqual(leaks(self.sb.state_text(), hashes=False), [], "a fake secret stayed under the state dir")
-        # PR1's rules take `token=<value>` whole as secret_assignment (the longer pair applies first); the bare
-        # token on the next line is github_token's.
-        for rule in ("openai_key", "github_token", "secret_assignment", "aws_access_key_id", "slack_token", "env:" + ENV_SECRET_NAME, "anthropic_key", "private_key", "authorization_header"):
-            self.assertIn(f"[REDACTED:{rule}]", body, rule)
-        # False positives stay byte for byte.
-        for text in (GIT_SHA, UUID, CODE):
-            self.assertIn(json.dumps(text)[1:-1], body)
-        root = attrs(roots(spans)[0])
-        self.assertTrue(root["judgment.redacted"])
-        self.assertGreaterEqual(int(root["judgment.redaction_count"]), 8)
-        # Structure and tokens survive redaction.
-        self.assertEqual(sorted(attrs(s)["judgment.span_kind"] for s in spans), ["agent", "llm", "llm", "llm", "tool"])
-        self.assertEqual(sum(int(attrs(s).get("judgment.usage.output_tokens", 0)) for s in by_kind(spans, "llm")), 21 + 21)
+        turn = Turn(sid, "hello")
+        turn.api(error={"status_code": 429, "retry_count": 0, "message": "rate limited"})
+        turn.api(error={"status_code": 429, "retry_count": 0, "message": "rate limited"}, retry=True)
+        turn.api(text="finally", retry=True)
+        turn.end("finally")
+        pres = [kwargs for hook, kwargs, _at in turn.events if hook == "pre_api_request"]
+        self.assertEqual(len({kwargs["api_request_id"] for kwargs in pres}), 1)
+        self.assertEqual(len({kwargs["started_at"] for kwargs in pres}), 1)
+        self.fire(turn.events)
+        self.flushed()
+        llms = kinds(self.sink.spans(), "llm")
+        self.assertEqual(len({span["spanId"] for span in llms}), 3, "one span per attempt")
+        ordered = sorted(latest(llms), key=lambda span: int(span["startTimeUnixNano"]))
+        self.assertEqual([span.get("status", {}).get("code") for span in ordered], [2, 2, None])
+        self.assertIn("rate limited", attrs(ordered[0])["judgment.output"])
+        # The error never reached the model, so the attempt that worked does not hold it.
+        self.assertNotIn("rate limited", attrs(ordered[2])["judgment.input"])
+        for before, after in zip(ordered, ordered[1:]):
+            self.assertGreaterEqual(int(after["startTimeUnixNano"]), int(before["endTimeUnixNano"]))
 
-    def test_dotenv_read_blanks_the_turn_and_not_the_next(self):
+
+class Incomplete(Case):
+    def test_an_answered_turn_hermes_reports_incomplete_is_interrupted(self):
+        """Hermes can answer with an error explanation and then end the turn with completed=False."""
+        turn = Turn(new_session_id(), "go")
+        turn.api(text="the provider failed")
+        turn.end("the provider failed")
+        hook, kwargs, at = turn.events[-1]
+        turn.events[-1] = (hook, {**kwargs, "completed": False, "failed": True}, at)
+        self.fire(turn.events)
+        [end] = [event for event in self.sb.inbox() if event["event"] == "turn_end"]
+        self.assertTrue(end["interrupted"])
+
+
+class Grandchild(Case):
+    def test_grandchild_started_after_the_next_turn_opened_stays_on_its_turn(self):
         sid = new_session_id()
-        env_path = str(self.sb.project / ".env")
-        one = simple_turn(sid, "what is in the env file", path=env_path, result=json.dumps({"content": ENV_FILE}), answer="It sets DATABASE_URL.")
-        two = simple_turn(sid, "now run the tests", path="tests.log", result="42 passed", answer="All 42 tests pass.", first=False,
-                          tool_name="terminal", args={"command": "make test"}, start=later(one.events, 2))
-        _errors, spans = self.run_events(one.events + two.events)
-        rs = {s["traceId"]: s for s in roots(spans)}
-        blanked = next(s for s in rs.values() if attrs(s).get("judgment.redacted_reason"))
-        ba = attrs(blanked)
-        self.assertEqual(ba["judgment.redacted_reason"], "sensitive_path")
-        self.assertEqual(ba["judgment.redacted_rule"], "dotenv")
-        self.assertEqual(ba["judgment.redacted_trigger"], "~/proj/.env")
-        same = [s for s in spans if s["traceId"] == blanked["traceId"]]
-        self.assertEqual(len(same), 4)
-        for span in same:
-            self.assertEqual(attrs(span).get("judgment.input", ""), "")
-            self.assertEqual(attrs(span).get("judgment.output", ""), "")
-        self.assertEqual(sum(int(attrs(s).get("judgment.usage.output_tokens", 0)) for s in by_kind(same, "llm")), 43)
-        other = next(s for s in rs.values() if s is not blanked)
-        self.assertEqual(attrs(other)["judgment.input"], "now run the tests")
-        self.assertEqual(attrs(other)["judgment.output"], "All 42 tests pass.")
-        self.assertNotIn("judgment.redacted_reason", attrs(other))
-        everything = self.sink.text() + self.sb.state_text()
-        self.assertNotIn("Lq9xT", everything)
-        self.assertNotIn("FEATURE_FLAG", everything)
+        one = Turn(sid, "turn one delegates")
+        call = one.api(tool=("delegate_task", {"goal": "g"}))
+        child = sid + "c"
+        child_tid = f"{child}:task:1"
+        one._add("subagent_start", {"parent_session_id": sid, "parent_turn_id": one.tid, "child_session_id": child, "child_role": "orchestrator",
+                                    "child_goal": "plan"})
+        one._add("pre_llm_call", {"session_id": child, "turn_id": child_tid, "user_message": "plan", "platform": "subagent", "model": "m"})
+        one.tool(call, "delegate_task", {"goal": "g"}, '{"status": "started"}')
+        one.api(text="started in background")
+        one.end("started in background")
+        two = Turn(sid, "turn two", first=False, start=later(one.events, 1))
+        two.api(text="two")
+        grand = sid + "g"
+        # The child, still running from turn one, delegates after turn two opened.
+        two._add("subagent_start", {"parent_session_id": child, "parent_turn_id": child_tid, "child_session_id": grand, "child_role": "leaf",
+                                    "child_goal": "leaf work"})
+        two._add("post_tool_call", {"session_id": grand, "turn_id": f"{grand}:task:1", "tool_name": "terminal", "args": {"command": "true"},
+                                    "tool_call_id": "gc1", "result": "{}", "duration_ms": 5, "status": "ok"})
+        two._add("subagent_stop", {"parent_session_id": child, "child_session_id": grand, "child_summary": "leaf done", "child_status": "completed"})
+        two._add("subagent_stop", {"parent_session_id": sid, "child_session_id": child, "child_summary": "plan done", "child_status": "completed"})
+        two.end("two")
+        self.fire(one.events + two.events + [finalize(sid) + (later(two.events, 1),)])
+        spans = self.flushed()
+        trace_of = {attrs(root)["judgment.input"]: root["traceId"] for root in roots(spans)}
+        agents = {attrs(span)["judgment.agent_id"]: span for span in kinds(spans, "agent") if span.get("parentSpanId")}
+        self.assertEqual(agents[grand]["traceId"], trace_of["turn one delegates"])
+        self.assertEqual(agents[child]["traceId"], trace_of["turn one delegates"])
+        tool = next(span for span in kinds(spans, "tool") if attrs(span).get("gen_ai.tool.name") == "terminal")
+        self.assertEqual(tool["traceId"], trace_of["turn one delegates"])
 
-    def test_env_dump_command_blanks_the_turn(self):
+
+class Late(Case):
+    def test_a_closed_turns_late_tool_result_joins_no_turn(self):
+        """Turn one is off and ends with a tool still running. Its result arrives during turn two, which is traced."""
         sid = new_session_id()
-        turn = simple_turn(sid, "show the env", path="", result="PATH=/bin\n" + ENV_SECRET_NAME + "=" + SECRETS["env_value"]["core"],
-                           answer="Here it is.", tool_name="terminal", args={"command": "printenv"})
-        _errors, spans = self.run_events(turn.events)
-        root = attrs(roots(spans)[0])
-        self.assertEqual(root["judgment.redacted_reason"], "sensitive_path")
-        self.assertEqual(leaks(self.sink.text() + self.sb.state_text(), hashes=False), [])
+        secret = "late-" + gh_token()[4:20]
+        one = Turn(sid, "untraced")
+        call = one.api(tool=("terminal", {"command": "sleep 60"}))
+        one.tool(call, "terminal", {"command": "sleep 60"}, secret, pre=True, post=False)
+        one.end("gave up")
+        two = Turn(sid, "traced", first=False, start=later(one.events, 1))
+        two.api(text="ok")
+        late = Turn(sid, "x", first=False, start=later(two.events, 0.5))
+        late.task, late.tid, late.events = one.task, one.tid, []
+        late.tool(call, "terminal", {"command": "sleep 60"}, secret, pre=False, post=True)
+        with plugin_env(self.sb) as (plugin, ctx):
+            ctx.cli(sid)
+            fire_all(ctx, one.events[:1], plugin)
+            ctx.commands["judgment"]["handler"]("off")
+            fire_all(ctx, one.events[1:], plugin)
+            ctx.commands["judgment"]["handler"]("on")
+            fire_all(ctx, two.events + late.events, plugin)
+            self.assertEqual(plugin.errors["count"], 0)
+            two.events = []
+            two.end("ok")
+            fire_all(ctx, two.events, plugin)
+        inbox = self.sb.inbox()
+        self.assertEqual({event["turn_id"] for event in inbox if event.get("turn_id")}, {two.tid})
+        self.assertEqual([event["event"] for event in inbox if event["event"] == "tool"], [])
+        self.assertNotIn(secret, self.sb.state_text())
 
-    def test_inbox_holds_no_secret_before_the_flusher_runs(self):
-        sid = new_session_id()
-        turn = simple_turn(sid, "key " + SECRETS["openai_key"]["core"], path="n.txt", result="gh " + SECRETS["github_token"]["core"], answer="ok")
-        self.run_events(turn.events, flush=False)
-        self.assertEqual(leaks(self.sb.state_text(), hashes=False), [])
-        self.assertIn("[REDACTED:openai_key]", self.sb.state_text())
 
-    def test_a_cut_long_result_drops_the_partial_token(self):
-        """The cap comes after redaction: a token across the cap is redacted whole, then the cut drops the partial word."""
-        core = load_plugin().core
-        token = SECRETS["github_token"]["core"]
-        text = "x " * (core.TEXT_CAP // 2 - 10) + token + " tail"
-        gate = core.Gate("sanitized", core.settings({}), (), str(self.sb.state), ())
-        out = core.prepare({"event": "tool", "tool_output": text}, gate)["tool_output"]
-        self.assertTrue(out.endswith(core.CUT_MARK))
-        self.assertNotIn(token[4:12], out)
-
-
-class OptOut(HermesCase):
+class OptOut(Case):
     def assert_nothing(self, events: list, **env) -> None:
         """No inbox file from the plugin, and no span once the flusher has run."""
         errors, _ = self.run_events(events, flush=False, **env)
@@ -440,167 +392,189 @@ class OptOut(HermesCase):
         self.assert_nothing(events + [finalize(sid)])
 
 
-def pct(values: list[float], q: float) -> float:
-    ordered = sorted(values)
-    return ordered[min(len(ordered) - 1, int(round(q * (len(ordered) - 1))))]
+class Workspace(Case):
+    def setUp(self):
+        super().setUp()
+        self.elsewhere = self.sb.home / "elsewhere"
+        self.elsewhere.mkdir()
+
+    def hermes_modules(self, session_cwd: Path | None, task_cwd: dict | None = None) -> dict:
+        """agent.runtime_cwd and tools.terminal_tool as Hermes 0.19.0 has them, already imported."""
+        runtime = types.SimpleNamespace(resolve_agent_cwd=lambda: session_cwd if session_cwd else Path(os.environ.get("TERMINAL_CWD") or os.getcwd()))
+        terminal = types.SimpleNamespace(resolve_task_overrides=lambda task: (task_cwd or {}).get(task, {}))
+        return {"agent.runtime_cwd": runtime, "tools.terminal_tool": terminal}
+
+    def turn(self) -> Turn:
+        turn = Turn(new_session_id(), "hello")
+        turn.api(text="hi")
+        turn.end("hi")
+        return turn
+
+    def test_session_cwd_opted_in_while_process_cwd_is_not(self):
+        turn = self.turn()
+        with mock.patch.dict(sys.modules, self.hermes_modules(self.sb.project)):
+            self.fire(turn.events, TERMINAL_CWD=str(self.elsewhere))
+        starts = [event for event in self.sb.inbox() if event["event"] == "turn_start"]
+        self.assertEqual([event["cwd"] for event in starts], [str(self.sb.project)])
+
+    def test_process_cwd_opted_in_while_session_cwd_is_not(self):
+        turn = self.turn()
+        with mock.patch.dict(sys.modules, self.hermes_modules(self.elsewhere)):
+            self.fire(turn.events, TERMINAL_CWD=str(self.sb.project))
+        self.assertFalse((self.sb.state / "inbox").exists() and any((self.sb.state / "inbox").iterdir()))
+
+    def test_task_cwd_wins_and_only_for_its_task(self):
+        one, two = self.turn(), self.turn()
+        modules = self.hermes_modules(self.elsewhere, {one.task: {"cwd": str(self.sb.project)}})
+        with mock.patch.dict(sys.modules, modules):
+            self.fire(one.events + two.events, TERMINAL_CWD=str(self.elsewhere))
+        self.assertEqual({event["session_id"] for event in self.sb.inbox()}, {one.sid})
 
 
-class Latency(HermesCase):
-    """Callback p95 per hook: reported against LATENCY_TARGET_P95_MS, failed at LATENCY_GATE_P95_MS (hermes_support)."""
-
-    REPORT: dict = {}
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls.REPORT:
-            print(f"\nHermes callback latency, in-process, traced path (ms; target p95 < {LATENCY_TARGET_P95_MS}):", file=sys.stderr)
-            for hook, (p50, p95, mx, count, tried) in sorted(cls.REPORT.items()):
-                flag = "  over target" if p95 >= LATENCY_TARGET_P95_MS else ""
-                print(f"  {hook:22s} n={count:5d} p50={p50:.3f} p95={p95:.3f} max={mx:.3f} (trials {tried}){flag}", file=sys.stderr)
-
-    def test_each_callback_p95_under_budget(self):
-        """Full traced Hermes sequences, timed per callback as Hermes would see it, until every hook has 1000 calls.
-
-        Each round is a new session: a tool turn whose first answer attempt fails and is retried, a turn
-        that starts a background child, then finalize (even rounds) or reset (odd rounds).
-        """
-        result = json.dumps({"content": "1|" + "hello world line\n" * 200})
-
-        def timed(ctx, plugin, events, times):
-            for hook, kwargs, at in events:
-                kwargs.setdefault("telemetry_schema_version", "hermes.observer.v1")
-                plugin.now_ms = lambda at=at: int(at * 1000)
-                (callback,) = ctx.hooks[hook]
-                start = time.perf_counter()
-                callback(**kwargs)
-                times.setdefault(hook, []).append((time.perf_counter() - start) * 1000)
-
-        def rounds(ctx, plugin, times, until: int):
-            n = 0
-            while min((len(times.get(hook, [])) for hook in plugin.HOOKS), default=0) < until:
-                sid = new_session_id()
-                turn = Turn(sid, f"prompt {n} with some ordinary text")
-                call = turn.api(tool=("read_file", {"path": "notes.txt"}))
-                turn.tool(call, "read_file", {"path": "notes.txt"}, result)
-                turn.api(error={"status_code": 500, "retry_count": 1})
-                turn.api(text=f"answer {n}")
-                turn.end(f"answer {n}")
-                _p, _c, sub = subagent_turn(sid)
-                sub = [event for event in sub if event[0] != "on_session_start"]
-                hook = "on_session_finalize" if n % 2 == 0 else "on_session_reset"
-                timed(ctx, plugin, turn.events + sub + [(hook, {"session_id": sid, "platform": "cli", "reason": "shutdown"}, later(sub, 0.1))], times)
-                n += 1
-
-        with plugin_env(self.sb, JUDGMENT_FLUSH="0") as (plugin, ctx):
-            rounds(ctx, plugin, {}, 1)  # warm-up, untimed
-
-            def trial() -> dict:
-                times: dict[str, list[float]] = {}
-                rounds(ctx, plugin, times, 1000)
-                self.assertEqual(plugin.errors["count"], 0)
-                return times
-
-            times, tried = latency_trials(trial)
-            self.assertGreater(len(list((self.sb.state / "inbox").iterdir())), 1000)
-        for hook, values in times.items():
-            self.REPORT[hook] = (statistics.median(values), pct(values, 0.95), max(values), len(values), tried)
-        self.assertEqual(over(times, LATENCY_GATE_P95_MS), {}, f"p95 over {LATENCY_GATE_P95_MS} ms in each of {tried} trials")
-
-    def test_a_failing_callback_never_raises(self):
+class CommandIdentity(Case):
+    def test_gateway_command_changes_no_conversation(self):
+        """Gateway: the command is dispatched before the message's session is bound (gateway/run.py:11194 vs 12128)."""
+        chat_a = new_session_id()
+        turn = Turn(chat_a, "hi from chat A", platform="telegram")
+        turn.api(text="hi")
+        turn.end("hi")
         with plugin_env(self.sb) as (plugin, ctx):
-            original = plugin.tracker.step
+            ctx.cli(None)
+            fire_all(ctx, turn.events, plugin)
+            os.environ["HERMES_SESSION_ID"] = chat_a  # process-wide leftovers name chat A
+            handler = ctx.commands["judgment"]["handler"]
+            for action in ("off", "on"):
+                self.assertIn("changed nothing", handler(action))
+            status = handler("status")
+            self.assertIn("project setting", status)
+        self.assertFalse((self.sb.state / "sessions").exists())
 
-            def broken(*args, **kwargs):
-                raise RuntimeError("boom")
+    def test_cli_command_targets_only_its_conversation(self):
+        mine, other = new_session_id(), new_session_id()
+        events = []
+        for sid in (other, mine):
+            turn = Turn(sid, "hi")
+            turn.api(text="hi")
+            turn.end("hi")
+            events += turn.events
+        with plugin_env(self.sb) as (plugin, ctx):
+            fire_all(ctx, events, plugin)
+            ctx.cli(mine)
+            self.assertIn("off for this session", ctx.commands["judgment"]["handler"]("off"))
+        self.assertEqual(sorted(path.name for path in (self.sb.state / "sessions").iterdir()), [mine])
 
-            plugin.tracker.step = broken
-            try:
-                for hook in ctx.hooks:
-                    self.assertEqual(ctx.fire(hook, session_id="s", turn_id="t"), [])
-            finally:
-                plugin.tracker.step = original
-            self.assertEqual(plugin.errors["count"], len(ctx.hooks))
-            # Garbage kwargs: wrong types everywhere.
-            before = plugin.errors["count"]
-            for hook in ctx.hooks:
-                self.assertEqual(ctx.fire(hook, session_id=object(), turn_id=None, args=object(), usage="x", started_at="soon", result=b"\x00"), [])
-            self.assertLessEqual(plugin.errors["count"] - before, len(ctx.hooks))
 
-    def test_unwritable_state_fails_open(self):
-        blocker = self.sb.dir / "not-a-dir"
-        blocker.write_text("x")
+class Rotation(Case):
+    def test_main_session_rotates_mid_turn(self):
+        sid, rotated = new_session_id(), new_session_id()
+        one = Turn(sid, "first")
+        call = one.api(tool=("read_file", {"path": "a"}))
+        rotate_at = len(one.events)  # Hermes compresses before the next request
+        one.tool(call, "read_file", {"path": "a"}, "contents")
+        one.api(text="done one")
+        one.end("done one")
+        two = Turn(rotated, "second", first=False, start=later(one.events, 1))
+        two.api(text="done two")
+        two.end("done two")
+        events = renamed(one.events, sid, rotated, rotate_at) + two.events + [finalize(rotated) + (later(two.events, 1),)]
+        plugin = self.fire(events)
+        self.assertEqual((plugin.tracker.ids, dict(plugin.tracker.convs), plugin.tracker.turns, plugin.tracker.owner), ({}, {}, {}, {}))
+        spans = self.flushed()
+        self.assertEqual({attrs(span)["judgment.session_id"] for span in spans}, {sid})
+        self.assertEqual(sorted(attrs(root)["judgment.input"] for root in roots(spans)), ["first", "second"])
+        first = next(root for root in roots(spans) if attrs(root)["judgment.input"] == "first")
+        under = [span for span in spans if span.get("parentSpanId") == first["spanId"]]
+        self.assertEqual(sorted(attrs(span)["judgment.span_kind"] for span in under), ["llm", "llm", "tool"])
+
+    def test_override_survives_rotation(self):
+        """/judgment off, then a turn in which Hermes rotates the id: the next turn, under the new id, stays off."""
+        sid, rotated = new_session_id(), new_session_id()
+        one = Turn(sid, "traced")
+        one.api(text="a")
+        one.end("a")
+        two = Turn(sid, "off, rotates", first=False, start=later(one.events, 1))
+        two.api(text="b")
+        rotate_at = len(two.events)
+        two.api(text="b2")
+        two.end("b2")
+        three = Turn(rotated, "still off", first=False, start=later(two.events, 1))
+        three.api(text="c")
+        three.end("c")
+        with plugin_env(self.sb) as (plugin, ctx):
+            ctx.cli(sid)
+            fire_all(ctx, one.events, plugin)
+            self.assertIn("off for this session", ctx.commands["judgment"]["handler"]("off"))
+            fire_all(ctx, renamed(two.events, sid, rotated, rotate_at) + three.events, plugin)
+            ctx.cli(rotated)  # Hermes's CLI follows the new id (cli.py:12285)
+            self.assertIn("off for this session", ctx.commands["judgment"]["handler"]("status"))
+        self.assertEqual([attrs(root)["judgment.input"] for root in roots(self.flushed())], ["traced"])
+        # A resume under the new id in another process keeps it too.
+        self.assertEqual((self.sb.state / "sessions" / rotated).read_text().strip(), "off")
+
+    def test_child_rotates_during_a_delegated_turn(self):
         sid = new_session_id()
-        with plugin_env(self.sb, JUDGMENT_STATE_DIR=str(blocker / "state")) as (plugin, ctx):
-            self.assertEqual(fire_all(ctx, simple_turn(sid, "hi", path="a", result="b", answer="c").events, plugin), [])
-            # Callbacks touch no file, so they never see the error; the writer thread and the helper do, off Hermes's threads.
-            self.assertEqual(plugin.errors["count"], 0)
+        _parent, child_sid, events = subagent_turn(sid)
+        rotated = new_session_id() + "r"
+        # The child compresses after its first request: its later calls and its stop carry the new id.
+        first_child_api = next(i for i, event in enumerate(events) if event[0] == "post_api_request" and event[1]["session_id"] == child_sid)
+        events = renamed(events, child_sid, rotated, first_child_api + 1, keys=("session_id", "child_session_id"))
+        plugin = self.fire(events + [finalize(sid) + (later(events, 0.5),)])
+        self.assertEqual((plugin.tracker.ids, dict(plugin.tracker.convs), plugin.tracker.owner), ({}, {}, {}))
+        spans = self.flushed()
+        agent = [span for span in kinds(spans, "agent") if span.get("parentSpanId")]
+        self.assertEqual(len(agent), 1)
+        self.assertEqual(attrs(agent[0])["judgment.output"], "one two three")
+        self.assertNotIn("judgment.interrupted", attrs(agent[0]))
+        under = [span for span in spans if span.get("parentSpanId") == agent[0]["spanId"]]
+        self.assertEqual(sorted(attrs(span)["judgment.span_kind"] for span in under), ["llm", "llm", "tool"])
 
 
-SENDER = textwrap.dedent(
-    """
-    import json, os, sys, time
-    sys.path.insert(0, {tests!r})
-    from hermes_support import load_plugin, FakeCtx, simple_turn, fire_all, new_session_id
-    plugin = load_plugin()
-    ctx = FakeCtx()
-    plugin.register(ctx)
-    sid = new_session_id()
-    turn = simple_turn(sid, "survive", path="a", result="b", answer="lands after the kill")
-    start = time.perf_counter()
-    fire_all(ctx, turn.events, plugin)
-    took = (time.perf_counter() - start) * 1000
-    # The hand-off to the helper is asynchronous; a real turn lasts long enough for it. Wait for it (at most 5 s),
-    # then die: what Hermes handed over must survive the kill.
-    handed = time.perf_counter()
-    while not plugin.spool.handed_over() and time.perf_counter() - handed < 5:
-        time.sleep(0.001)
-    print(json.dumps({{"ms": took, "handoff_ms": (time.perf_counter() - handed) * 1000, "helper": plugin.spool.proc.pid if plugin.spool.proc else 0}}), flush=True)
-    time.sleep(60)
-    """
-)
+class Rotated(Case):
+    def test_off_after_a_rotation_reaches_the_new_id(self):
+        """Hermes rotates the id mid-turn, then the user turns tracing off: a later Hermes process resumes under the
+        new id and must read off."""
+        sid, rotated = new_session_id(), new_session_id()
+        one = Turn(sid, "rotates")
+        one.api(text="a")
+        rotate_at = len(one.events)
+        one.api(text="a2")
+        one.end("a2")
+        with plugin_env(self.sb) as (plugin, ctx):
+            fire_all(ctx, renamed(one.events, sid, rotated, rotate_at), plugin)
+            ctx.cli(rotated)
+            self.assertIn("off for this session", ctx.commands["judgment"]["handler"]("off"))
+            modes = {name: (self.sb.state / "sessions" / name).read_text().strip() for name in (sid, rotated)}
+            self.assertEqual(modes, {sid: "off", rotated: "off"})
+            self.assertIn("on for this session", ctx.commands["judgment"]["handler"]("on"))
+        modes = {name: (self.sb.state / "sessions" / name).read_text().strip() for name in (sid, rotated)}
+        self.assertEqual(modes, {sid: "on", rotated: "on"})
 
 
-def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+class Preflight(Case):
 
+    def test_opted_out_conversation_stays_off_through_preflight_rotation(self):
+        sid, rotated = new_session_id(), new_session_id()
+        one = self.simple(sid, "traced")
+        two = self.simple(sid, "off, rotated before pre_llm_call", first=False, start=later(one.events, 1))
+        three = self.simple(rotated, "still off", first=False, start=later(two.events, 1))
+        with plugin_env(self.sb) as (plugin, ctx):
+            ctx.cli(sid)
+            fire_all(ctx, one.events, plugin)
+            self.assertIn("off for this session", ctx.commands["judgment"]["handler"]("off"))
+            fire_all(ctx, preflight(two, rotated) + three.events, plugin)
+            ctx.cli(rotated)
+            self.assertIn("off for this session", ctx.commands["judgment"]["handler"]("status"))
+        self.assertEqual([attrs(root)["judgment.input"] for root in roots(self.flushed())], ["traced"])
+        self.assertEqual((self.sb.state / "sessions" / rotated).read_text().strip(), "off")
 
-class Sender(HermesCase):
-    def spawn(self, sink_url: str) -> subprocess.Popen:
-        env = {**self.sb.env, "JUDGMENT_API_URL": sink_url, "TERMINAL_CWD": str(self.sb.project), "JUDGMENT_FLUSH_GRACE_MS": "200"}
-        env.pop("JUDGMENT_FLUSH")
-        proc = subprocess.Popen([sys.executable, "-c", SENDER.format(tests=str(REPO / "tests"))], cwd=self.sb.project, env=env,
-                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, start_new_session=True)
-        self.addCleanup(proc.stdout.close)
-        return proc
-
-    def test_sender_survives_killing_the_process_group(self):
-        proc = self.spawn(self.sink.url)
-        line = proc.stdout.readline()
-        os.killpg(proc.pid, signal.SIGKILL)  # Hermes and its whole group die the moment the turn ends
-        proc.wait(timeout=10)
-        info = json.loads(line)
-        self.assertGreater(info["helper"], 0)
-        # The helper runs in its own session, so the kill missed it; it folds the turn and starts the sender.
-        self.assertNotEqual(os.getpgid(info["helper"]) if _alive(info["helper"]) else -1, proc.pid)
-        started = time.time()
-        self.assertTrue(wait_for(lambda: roots(self.sink.spans()), timeout=20), (self.sb.state / "flush.log").read_text() if (self.sb.state / "flush.log").exists() else "no flush.log")
-        self.assertEqual(attrs(roots(self.sink.spans())[0])["judgment.output"], "lands after the kill")
-        Sender.landed = time.time() - started
-
-    def test_sink_down_callbacks_stay_fast(self):
-        proc = self.spawn("http://127.0.0.1:9")
-        line = proc.stdout.readline()
-        os.killpg(proc.pid, signal.SIGKILL)
-        proc.wait(timeout=10)
-        info = json.loads(line)
-        self.assertLess(info["ms"], 250, "a whole turn's callbacks, sender launch included")
-        log = self.sb.state / "flush.log"
-        self.assertTrue(wait_for(lambda: log.exists() and "post attempt" in log.read_text(), timeout=30))
-        self.assertEqual(leaks(log.read_text(), hashes=False), [])
+    def test_resumed_off_session_rotating_in_its_first_turn_stays_off(self):
+        """A new Hermes process: the conversation was turned off earlier; its first turn here rotates before pre_llm_call."""
+        sid, rotated = new_session_id(), new_session_id()
+        (self.sb.state / "sessions").mkdir(parents=True)
+        (self.sb.state / "sessions" / sid).write_text("off\n")
+        self.fire(preflight(self.simple(sid, "resumed", first=False), rotated) + [finalize(rotated)])
+        self.assertFalse((self.sb.state / "inbox").exists() and any((self.sb.state / "inbox").iterdir()))
+        self.assertEqual((self.sb.state / "sessions" / rotated).read_text().strip(), "off")
 
 
 class Install(unittest.TestCase):
@@ -635,6 +609,20 @@ class Install(unittest.TestCase):
             self.assertFalse(sb.state.exists())
         finally:
             sb.cleanup()
+
+
+class Contract(unittest.TestCase):
+    def test_the_vendored_core_matches_what_the_bridge_calls(self):
+        core = load_plugin().core
+        self.assertEqual(core.contract_problems(), [], "judgment_core changed: update hermes/core_bridge.py (see CONTRACT)")
+
+    def test_every_core_call_in_the_bridge_is_declared(self):
+        core = load_plugin().core
+        tree = ast.parse(inspect.getsource(core))
+        declared = {(module_, name) for module_, name, _ in core.CONTRACT}
+        used = {(node.value.id, node.attr) for node in ast.walk(tree)
+                if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in ("optin", "redact")}
+        self.assertEqual(used - declared, set(), "core_bridge calls a core function CONTRACT does not list")
 
 
 if __name__ == "__main__":

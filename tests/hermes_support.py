@@ -10,15 +10,19 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import secrets
+import string
 import sys
 import time
 import types
+import unittest
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
-from support import REPO
+from fake_sink import Sink, attrs
+from support import REPO, SECRETS
 from support import Sandbox as _Sandbox
 
 PLUGIN_DIR = REPO / "hermes"
@@ -308,3 +312,107 @@ def state_files(state: Path) -> list[Path]:
 def flush_vendor(sb, env: dict | None = None):
     """The flusher from the plugin's vendored core, as the plugin launches it."""
     return sb.flush({"PYTHONPATH": str(VENDOR_CORE), **(env or {})})
+
+
+# ---- shared by the test_hermes*.py files ------------------------------------------------------------
+
+GH = SECRETS["github_token"]["core"]
+OPENAI = SECRETS["openai_key"]["core"]
+ENV_VALUE = SECRETS["env_value"]["core"]  # the value of ENV_SECRET_NAME in the sandbox env
+
+
+def gh_token() -> str:
+    """A fake GitHub token, built at runtime."""
+    return "gh" + "p_" + "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(36))
+
+
+def rows(count: int, width: int = 12) -> dict:
+    """Structured tool arguments: ``count`` small rows (the review's probe: 10,000 rows, 329 KB)."""
+    return {"rows": [{"i": n, "v": ("r%07d" % n).ljust(width, "x")} for n in range(count)]}
+
+
+def module(name: str):
+    return sys.modules[load_plugin().__name__ + "." + name]
+
+
+def kinds(spans: list[dict], kind: str) -> list[dict]:
+    return [span for span in spans if attrs(span).get("judgment.span_kind") == kind]
+
+
+def latest(spans: list[dict]) -> list[dict]:
+    """The newest version of each span: a resend repeats span ids with a higher update id."""
+    found: dict[str, dict] = {}
+    for span in spans:
+        found[span["spanId"]] = span
+    return list(found.values())
+
+
+def wait_until(predicate, timeout: float = 10.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return False
+
+
+def no_piece(text: str, secret: str, window: int = 6) -> list[str]:
+    return [secret[i : i + window] for i in range(len(secret) - window + 1) if secret[i : i + window] in text]
+
+
+def renamed(events: list, old: str, new: str, start: int, keys: tuple = ("session_id",)) -> list:
+    """Hermes's legacy compression: from event ``start`` on, ``old`` is called ``new`` (conversation_compression.py:1247)."""
+    out = []
+    for index, (hook, kwargs, *rest) in enumerate(events):
+        if index >= start:
+            kwargs = {key: (new if key in keys and value == old else value) for key, value in kwargs.items()}
+        out.append((hook, kwargs, *rest))
+    return out
+
+
+def preflight(turn: Turn, rotated: str) -> list:
+    """Hermes's preflight compression: turn_id was built from the old id, then session_id rotated before
+    pre_llm_call (agent/turn_context.py:369, :652, :697). Every hook of the turn carries the new id."""
+    out = []
+    for hook, kwargs, *rest in turn.events:
+        kwargs = {key: (rotated if key == "session_id" and value == turn.sid else value) for key, value in kwargs.items()}
+        out.append((hook, kwargs, *rest))
+    return out
+
+
+class Case(unittest.TestCase):
+    """A sandbox and a fake sink. ``fire`` runs events through the plugin; ``flushed`` sends and returns the spans."""
+
+    def setUp(self):
+        self.sink = Sink().__enter__()
+        self.sb = Sandbox(sink_url=self.sink.url)
+        self.addCleanup(self.sb.cleanup)
+        self.addCleanup(self.sink.__exit__)
+
+    def fire(self, events: list, *, cli: str | None = None, **env):
+        """The events through the plugin; the helper folds them all before this returns. Returns the plugin."""
+        with plugin_env(self.sb, **env) as (plugin, ctx):
+            if cli is not None:
+                ctx.cli(cli)
+            self.assertEqual(fire_all(ctx, events, plugin), [], "a callback returned a value to Hermes")
+            self.assertEqual(plugin.errors["count"], 0)
+        return plugin
+
+    def flushed(self) -> list[dict]:
+        result = flush_vendor(self.sb)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        return latest(self.sink.spans())
+
+    def run_events(self, events: list, *, flush: bool = True, **env) -> tuple:
+        """``fire`` without the no-error check, then ``flushed``: (callback errors, spans)."""
+        with plugin_env(self.sb, **env) as (plugin, ctx):
+            results = fire_all(ctx, events, plugin)
+            errors = plugin.errors["count"]
+        self.assertEqual(results, [], "a callback returned a value to Hermes")
+        return errors, (self.flushed() if flush else latest(self.sink.spans()))
+
+    def simple(self, sid: str, prompt: str = "hello", answer: str = "done", **kw) -> Turn:
+        turn = Turn(sid, prompt, **kw)
+        turn.api(text=answer)
+        turn.end(answer)
+        return turn
