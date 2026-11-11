@@ -28,7 +28,7 @@ _EMPTY = {
     "closed": {},  # "harness\tsession\tturn" -> true once the turn ended
     "hidden": {},  # session -> true for a thread the agent app started on its own
     "seen": {},  # session -> last event time, for pruning
-    "inbox": {},  # "last" -> [mtime_ns, name] of the last inbox file folded in
+    "inbox": {},  # "done" -> ids (name.mtime_ns) of the inbox files the last run folded
 }
 
 _KEEP_MS = 7 * 24 * 3600 * 1000

@@ -503,7 +503,8 @@ def _thread_io(
         outgoing = [_assistant_parts(_text(model.get("output")), calls, model.get("reasoning"))]
         head = len(context or []) + 1
         rendered.append((_messages_json(list(context or []) + incoming, head=head), _messages_json(outgoing), calls))
-        history = list(incoming) + outgoing
+        # A failed request's error text never reached the model. The next request does not see it.
+        history = list(incoming) + ([] if model.get("is_error") else outgoing)
         for call in calls:
             if not _fresh(call["id"]):
                 continue
@@ -850,6 +851,7 @@ def build_request(
                 start_ms=when,
                 end_ms=end,
                 attributes=_attrs(pairs),
+                error=bool(event.get("is_error")),
             )
         )
 

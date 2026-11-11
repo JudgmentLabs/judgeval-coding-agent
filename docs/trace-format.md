@@ -47,6 +47,8 @@ A subagent span holds its task and answer as plain text when it has model spans,
 
 A tool span ends when the tool finished.
 
+A model call that failed, when the agent reports one (Hermes Agent does), is its own model span with error status. Its output is the error message. The next model call's input leaves that message out, because the model never saw it.
+
 ## Model input
 
 A model span's input is the conversation the model was sent, in this order:
