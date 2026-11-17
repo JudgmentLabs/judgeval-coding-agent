@@ -31,6 +31,8 @@ Tracing stays off until a project opts in. A hook writes each event to a local q
 
 The plugins run on macOS and Linux. The hooks need `jq` and `python3` (3.9 or later) on `PATH`. Without either one, the hooks still return and nothing is traced.
 
+The Pi plugin requires Pi >= 0.80.5, installed with `npm install -g @earendil-works/pi-coding-agent`. Older Pi versions, including the deprecated `@mariozechner/pi-coding-agent` package (which ends at 0.73.1), do not emit `agent_settled`, so nothing is traced.
+
 1. Save your credentials in `~/.config/judgment/credentials`, then run `chmod 600` on that file. See [Credentials](#credentials) for every field.
 
    ```text
