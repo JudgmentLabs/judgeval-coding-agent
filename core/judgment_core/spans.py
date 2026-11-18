@@ -503,7 +503,8 @@ def _thread_io(
         outgoing = [_assistant_parts(_text(model.get("output")), calls, model.get("reasoning"))]
         head = len(context or []) + 1
         rendered.append((_messages_json(list(context or []) + incoming, head=head), _messages_json(outgoing), calls))
-        history = list(incoming) + outgoing
+        # A failed request's error text never reached the model. The next request does not see it.
+        history = list(incoming) + ([] if model.get("is_error") else outgoing)
         for call in calls:
             if not _fresh(call["id"]):
                 continue
@@ -592,7 +593,7 @@ def _prompt_and_final(usable: list[dict]) -> tuple[str, str]:
             break
     if not final:
         for event in reversed(usable):
-            if event.get("event") == "model" and event.get("output") and not event.get("agent_id"):
+            if event.get("event") == "model" and not event.get("is_error") and event.get("output") and not event.get("agent_id"):
                 final = _text(event.get("output"))
                 break
     return prompt, final
@@ -830,7 +831,7 @@ def build_request(
         has_tokens = any(key.startswith("judgment.usage.") and key.endswith(("non_cached_input_tokens", "output_tokens")) for key, _value in usage_pairs)
         if harness == "cursor" and not has_tokens:
             return
-        if not own_prompt and not own_output and not usage_pairs and not calls:
+        if not own_prompt and not own_output and not usage_pairs and not calls and not event.get("is_error"):
             return
         if rendered:
             pairs.append(("judgment.input", rendered[0]))
@@ -850,6 +851,7 @@ def build_request(
                 start_ms=when,
                 end_ms=end,
                 attributes=_attrs(pairs),
+                error=bool(event.get("is_error")),
             )
         )
 
@@ -1041,7 +1043,8 @@ def build_request(
         if model_events and final and not model_events[-1].get("output"):
             model_events[-1] = {**model_events[-1], "output": final}
         if model_events and not model_events[-1].get("usage"):
-            found = next((item.get("usage") for item in reversed(main) if item.get("usage")), None)
+            # Usage reported for the turn as a whole. Another request's own usage is never copied: that counts it twice.
+            found = next((item.get("usage") for item in reversed(main) if item.get("usage") and item.get("event") != "model"), None)
             if found:
                 model_events[-1] = {**model_events[-1], "usage": found}
 

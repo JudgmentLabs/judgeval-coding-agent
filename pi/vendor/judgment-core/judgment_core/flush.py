@@ -237,13 +237,17 @@ def ingest(state: Path, env: dict | None = None) -> dict[str, dict]:
     fold.sent = {key for key, item in index.items() if item.get("update_id") is not None}
     fold.unsent_keys = {key for key, item in index.items() if item.get("update_id") is None}
     consumed = []
-    # The last inbox file folded in, saved with the fold. A crash before its files were deleted replays nothing.
-    mark = fold.s["inbox"].get("last")
+    # The inbox files folded in, by name and mtime, saved with the fold: a crash before they were deleted
+    # replays none of them. A file that appears late, with an older mtime than one already folded, is new.
+    done = set(fold.s["inbox"].get("done") or [])
+    # State from a build that kept only the newest file folded: what sorts at or before it was folded.
+    mark = fold.s["inbox"].get("last") if "done" not in fold.s["inbox"] else None
+    folded = []
     for path, event, order in _inbox(state):
-        if mark and order <= mark:
+        folded.append(event["_id"])
+        if event["_id"] in done or (mark and order <= mark):
             consumed.append(path)
             continue
-        fold.s["inbox"]["last"] = order
         if "capture" not in event and event.get("kind") != "command":
             # An older build wrote this event without redacting it. Redact it before it is stored.
             event = legacy.redact(event)
@@ -265,7 +269,18 @@ def ingest(state: Path, env: dict | None = None) -> dict[str, dict]:
         for child in set(fold.s["child"]) - children:
             _adopt(state, index, fold, child, legacy)
         consumed.append(path)
-    if consumed:
+    retained = []
+    for ident in done | set(folded):
+        name, _, mtime = ident.rpartition(".")
+        for folder in ("inbox.tmp", "inbox"):
+            try:
+                if str((state / folder / name).stat().st_mtime_ns) == mtime:
+                    retained.append(ident)
+                    break
+            except OSError:
+                pass
+    fold.s["inbox"] = {"done": sorted(retained)}
+    if consumed or set(retained) != done:
         _private_write(state / "fold.json", json.dumps(fold.state(int(time.time() * 1000), set(index))))
         _private_write(state / "index.json", json.dumps(index))
         for path in consumed:

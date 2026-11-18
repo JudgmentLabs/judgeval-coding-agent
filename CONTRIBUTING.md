@@ -10,7 +10,7 @@ You can contribute in these ways:
 
 The shared code lives in `core/`. Each plugin carries a copy of it under `<agent>/vendor/judgment-core`, because an agent installs only that plugin's folder.
 
-1. Edit `core/`, or the agent's own folder (`claude-code/`, `codex/`, `cursor/`, `pi/`).
+1. Edit `core/`, or the agent's own folder (`claude-code/`, `codex/`, `cursor/`, `pi/`, `hermes/`).
 2. Copy `core/` into every plugin:
 
    ```bash
@@ -22,6 +22,8 @@ The shared code lives in `core/`. Each plugin carries a copy of it under `<agent
    ```bash
    python3 -m unittest discover -s tests
    ```
+
+   `python3 tests/e2e_hermes.py` runs a real Hermes Agent against a local mock model and fake sink. It's skipped without Hermes installed, and CI doesn't run it.
 
    A change to `core/bin/` runs on every hook. Compare the hook's latency with `main` using `python3 tests/bench_hook.py <checkout>` on both checkouts.
 

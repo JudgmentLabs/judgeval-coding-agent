@@ -1,6 +1,6 @@
 {
   "name": "judgment-tracing",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Send Codex sessions to Judgment.",
   "author": {
     "name": "Judgment Labs",
