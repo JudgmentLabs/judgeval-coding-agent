@@ -4,6 +4,8 @@ This extension sends a Pi session to Judgment when the project opts in. It runs 
 
 ## Install
 
+Requires Pi >= 0.80.5, installed with `npm install -g @earendil-works/pi-coding-agent`. Older Pi versions, including the deprecated `@mariozechner/pi-coding-agent` package (which ends at 0.73.1), do not emit `agent_settled`, so nothing is traced.
+
 ```bash
 pi install git:github.com/JudgmentLabs/judgeval-coding-agent
 ```
