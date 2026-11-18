@@ -196,7 +196,7 @@ Blanked although nothing sensitive was read:
 > [!IMPORTANT]
 > **Upgrading?** `judgment-trace enable` in earlier versions wrote `"capture": "full"` into `.judgment/tracing.json`. Such a project stays raw after you upgrade: nothing is redacted. To redact, set `"capture": "sanitized"`, delete the `capture` key, or run `judgment-trace enable` again (it preserves custom settings, including `redact*` fields).
 
-With `capture` set to `metadata`, the plugin keeps names, models, token counts, cost, timing, and ids. It drops the text and the folder name from the local queue, the spans, and the saved session history. That includes text read back from the agent's transcript.
+With `capture` set to `metadata`, the plugin keeps names, models, token counts, cost, timing, and ids. It drops the text from the local queue, the spans, and the saved session history. That includes text read back from the agent's transcript. The folder name is not sent either. The project's path stays in the local queue and the saved session history, because the sender reads the project's own redaction rules from `.judgment/tracing.json` there. It never leaves your machine.
 
 Your API key is never sent anywhere but Judgment, and never saved with a turn. Each turn records a fingerprint of the key, so it goes only to the project it was recorded for. The local queue lives in `~/.local/state/judgment` (`$XDG_STATE_HOME/judgment` when that is set), readable only by your user. It holds the text as redacted, and a blank turn is saved blank.
 
