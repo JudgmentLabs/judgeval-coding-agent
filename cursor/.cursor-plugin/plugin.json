@@ -1,7 +1,7 @@
 {
   "name": "judgment-tracing",
   "displayName": "Judgment Tracing",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Send Cursor agent sessions to Judgment.",
   "author": {
     "name": "Judgment Labs",
