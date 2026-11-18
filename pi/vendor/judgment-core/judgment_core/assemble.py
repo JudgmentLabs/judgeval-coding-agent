@@ -10,8 +10,11 @@ only folds the events that arrived since the last one.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
+
+from judgment_core.identity import text_id
 
 _EMPTY = {
     "open": {},  # session -> open main turn
@@ -55,14 +58,24 @@ def _cursor_parent_of(event: dict) -> str:
     return Path(path).parent.parent.name
 
 
+def _task_route(value: str) -> str:
+    return value if re.fullmatch(r"task:[0-9a-f]{32}", value) else "task:" + text_id(value)
+
+
 def _agent_path(transcript: str) -> str:
     try:
         with open(transcript, "rb") as handle:
             head = handle.read(65536).decode("utf-8", "replace")
     except OSError:
         return ""
-    found = re.search(r'"agent_path":\s*"([^"]*)"', head)
-    return found.group(1) if found else ""
+    found = re.search(r'"agent_path":\s*("(?:[^"\\]|\\.)*")', head)
+    if found:
+        try:
+            path = json.loads(found.group(1))
+            return "task:" + text_id(path) if path else ""
+        except ValueError:
+            pass
+    return ""
 
 
 class Fold:
@@ -73,6 +86,8 @@ class Fold:
         for key, value in (state or {}).items():
             if key in self.s and isinstance(value, dict):
                 self.s[key] = value
+        self.s["spawn"] = {_key(key.partition("\t")[0], _task_route(key.partition("\t")[2])): turn
+                           for key, turn in self.s["spawn"].items() if "\t" in key}
         self.sent: set[str] = set()  # turns sent at least once; a late event sends them again
         self.unsent_keys: set[str] = set()  # turns stored but not sent yet
 
@@ -239,6 +254,8 @@ class Fold:
         agent = str(event.get("agent_id") or "")
         bind_agent = str(event.get("bind_agent") or "")
         bind_task = str(event.get("bind_task") or "")
+        if bind_task:
+            bind_task = event["bind_task"] = _task_route(bind_task)
         background = event.get("background") is True
 
         if kind == "turn_start" and turn:
