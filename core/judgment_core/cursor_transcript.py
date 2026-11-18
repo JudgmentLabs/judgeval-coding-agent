@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from judgment_core.identity import text_id
 from judgment_core.rows import records as _records
 
 _EOS = "<|eos|>"
@@ -84,12 +85,16 @@ def _current_turn(rows: list[dict]) -> tuple[str, str]:
     return prompt, answer
 
 
-def _answer_for(rows: list[dict], hint: str, current: str) -> str:
+def _matches_prompt(prompt: str, hint: str, exact: bool) -> bool:
+    return bool(prompt and hint and (hint == prompt or (not exact and (hint in prompt or prompt in hint))))
+
+
+def _answer_for(rows: list[dict], hint: str, current: str, exact: bool = False) -> str:
     """The final assistant text of the turn this hook output belongs to."""
     turns = _turns(rows)
     if hint:
         for prompt, answer, _texts in reversed(turns):
-            if prompt and (hint == prompt or hint in prompt or prompt in hint):
+            if _matches_prompt(prompt, hint, exact):
                 return answer
     if current:
         for _prompt, answer, texts in turns:
@@ -98,10 +103,10 @@ def _answer_for(rows: list[dict], hint: str, current: str) -> str:
     return ""
 
 
-def _texts_for(rows: list[dict], hint: str) -> list[str]:
+def _texts_for(rows: list[dict], hint: str, exact: bool = False) -> list[str]:
     """Every assistant text of the turn whose prompt matches ``hint``, in order."""
     for prompt, _answer, texts in reversed(_turns(rows)):
-        if hint and prompt and (hint == prompt or hint in prompt or prompt in hint):
+        if _matches_prompt(prompt, hint, exact):
             return texts
     return []
 
@@ -133,18 +138,27 @@ def enrich_cursor_events(events: list[dict]) -> list[dict]:
     prompt, answer = _current_turn(rows)
     # A resent turn reads a transcript that may already hold later turns. Match its own prompt.
     turn_prompt = next((str(event["prompt"]) for event in source if event.get("event") == "turn_start" and event.get("prompt") and not event.get("agent_id")), "")
+    prompt_key = next((str(event["prompt_key"]) for event in source if event.get("event") == "turn_start" and event.get("prompt_key") and not event.get("agent_id")), "")
+    if prompt_key:
+        matched = next((_unwrap_prompt(_text(row)) for row in reversed(rows) if _role(row) == "user"
+                        and prompt_key in {text_id(_text(row).strip()), text_id(_unwrap_prompt(_text(row)))}), None)
+        if matched is None:
+            return events
+        turn_prompt = matched
     if turn_prompt:
-        answer = _answer_for(rows, turn_prompt, "")
+        answer = _answer_for(rows, turn_prompt, "", exact=bool(prompt_key))
     # A background wake is folded into the turn that launched it and stops again.
     # Each stop ends one transcript turn, so the nth stop takes the nth turn from this prompt.
     turns = _turns(rows)
-    first_turn = next((index for index in reversed(range(len(turns))) if turn_prompt and turns[index][0] and (turn_prompt in turns[index][0] or turns[index][0] in turn_prompt)), None)
+    first_turn = next((index for index in reversed(range(len(turns))) if _matches_prompt(turns[index][0], turn_prompt, bool(prompt_key))), None)
     stop = 0
     filled = []
     saw_prompt = bool(turn_prompt)
     for event in events:
         item = dict(event)
         hint = str(item.get("prompt") or "") or turn_prompt
+        if prompt_key and not item.get("agent_id"):
+            hint = turn_prompt
         if prompt and not saw_prompt and item.get("event") in ("turn_end", "model", "thought", "tool") and not item.get("agent_id") and not item.get("prompt"):
             item["prompt"] = prompt
             hint = prompt
@@ -160,12 +174,12 @@ def enrich_cursor_events(events: list[dict]) -> list[dict]:
             stop += 1
         elif item.get("event") == "turn_end" and not item.get("agent_id"):
             stop += 1
-            chosen = _answer_for(rows, hint, str(item.get("output") or ""))
+            chosen = _answer_for(rows, hint, str(item.get("output") or ""), exact=bool(prompt_key))
             if chosen and not item.get("output"):
                 item["output"] = chosen
             elif chosen and str(item.get("output") or "") != chosen:
                 item["output"] = chosen
-            item["preamble"] = _texts_for(rows, hint)[:-1]
+            item["preamble"] = _texts_for(rows, hint, exact=bool(prompt_key))[:-1]
         agent_id = str(item.get("agent_id") or "")
         if agent_id and item.get("event") in ("subagent_end", "subagent_start") and not item.get("output"):
             child = _subagent_file(main, agent_id, str(item.get("agent_transcript_path") or ""))

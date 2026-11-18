@@ -22,3 +22,17 @@ jobs:
           for file in $(git diff --name-only "origin/${{ github.base_ref }}...HEAD" -- codex/hooks/hooks.json claude-code/hooks/hooks.json); do
             echo "::warning file=$file::$file changed. Codex users must approve the changed hooks again before they run."
           done
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Unit, hook, and end-to-end tests
+        run: python3 -m unittest discover -s tests -v

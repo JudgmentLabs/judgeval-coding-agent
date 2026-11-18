@@ -11,6 +11,8 @@ import os
 import re
 from pathlib import Path
 
+from judgment_core import redact
+
 OFF_VALUES = {"0", "false", "no", "off"}
 
 
@@ -34,24 +36,59 @@ def find_optin(start: str | Path) -> tuple[Path, Path] | None:
         current = current.parent
 
 
+# Capture modes, strictest last. "sanitized" sends the text with secrets redacted; "full" sends it raw.
+CAPTURE_MODES = ("full", "sanitized", "metadata")
+
+
+def resolve_capture(data: dict) -> str:
+    """The one capture table. core/bin/prepare.jq judgment_prepare has the same table; tests check both.
+
+    An explicit ``capture`` wins. Without one, ``"redact": false`` means raw text, and anything
+    else, including a missing or unknown value, means sanitized.
+    """
+    capture = data.get("capture")
+    if capture in CAPTURE_MODES:
+        return capture
+    if data.get("redact") is False:
+        return "full"
+    return "sanitized"
+
+
+# The project's redaction settings, as written: judgment_core.redact.ruleset reads them and says what each does. It is
+# the one place that decides what a malformed value means, so nothing here reshapes one.
+REDACT_KEYS = tuple(redact.settings())
+
+
+# A file that cannot be read is no opt-in, and its rules are unknown: every rule setting is malformed, so a turn already
+# recorded under it loses its text in the sender (redact.ruleset fails closed) instead of going out under the built-in rules alone.
+_CLOSED = {"enabled": False, "capture": "sanitized", "sessionDefault": "on", "environment": "production",
+           **{key: False if kind == "rule" else None for key, kind in redact.settings().items()}}
+
+
 def load_project(path: Path) -> dict:
+    """The project's settings. Read as the hook's jq reads the file: a byte order mark is skipped, the first JSON
+    document is the file, and every document after it must parse too."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {"enabled": False, "capture": "full", "sessionDefault": "on", "environment": "production"}
+        text = path.read_text(encoding="utf-8-sig").strip()
+        data, end = json.JSONDecoder().raw_decode(text)
+        while text[end:].strip():
+            end += len(text[end:]) - len(text[end:].lstrip())
+            end = json.JSONDecoder().raw_decode(text, end)[1]
+    except (OSError, ValueError):
+        return dict(_CLOSED)
     if not isinstance(data, dict):
-        return {"enabled": False, "capture": "full", "sessionDefault": "on", "environment": "production"}
+        return dict(_CLOSED)
     enabled = data.get("enabled", True)
-    capture = data.get("capture", "full")
     session_default = data.get("sessionDefault", "on")
     environment = data.get("environment") or "production"
     if not isinstance(environment, str) or not environment.strip():
         environment = "production"
     return {
         "enabled": enabled is not False,
-        "capture": "metadata" if capture == "metadata" else "full",
+        "capture": resolve_capture(data),
         "sessionDefault": "off" if session_default == "off" else "on",
         "environment": environment.strip(),
+        **{key: data.get(key) for key in REDACT_KEYS},
     }
 
 

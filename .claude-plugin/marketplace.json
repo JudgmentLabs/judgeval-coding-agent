@@ -10,7 +10,7 @@
       "name": "judgment-tracing",
       "source": "./claude-code",
       "description": "Send Claude Code sessions to Judgment.",
-      "version": "0.2.2"
+      "version": "0.3.0"
     }
   ]
 }
