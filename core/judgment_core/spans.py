@@ -10,27 +10,17 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from judgment_core import __version__
+from judgment_core.messages import assistant_message, text_message, tool_message
 
-TEXT_LIMIT = 64 * 1024
-# Earlier turns ride along in every main-thread llm input, so keep them well under TEXT_LIMIT.
-HISTORY_LIMIT = 8 * 1024
-HISTORY_MESSAGE_LIMIT = 2 * 1024
 _NS = 1_000_000
 
 
 def _ident(size: int, *parts: str) -> str:
     digest = hashlib.sha256("\0".join(("judgment-tracing-v1", *parts)).encode("utf-8")).hexdigest()
     return digest[:size]
-
-
-def _truncate(text: str, limit: int = TEXT_LIMIT) -> str:
-    if len(text) <= limit:
-        return text
-    marker = "… [truncated]"
-    return text[: limit - len(marker)] + marker
 
 
 def _text(value: Any) -> str:
@@ -51,14 +41,14 @@ def _attr(key: str, value: Any) -> dict | None:
     if isinstance(value, str):
         if value == "" and key not in _KEEP_EMPTY:
             return None
-        return {"key": key, "value": {"stringValue": _truncate(value)}}
+        return {"key": key, "value": {"stringValue": value}}
     if isinstance(value, bool):
         return {"key": key, "value": {"boolValue": value}}
     if isinstance(value, int):
         return {"key": key, "value": {"intValue": str(value)}}
     if isinstance(value, float):
         return {"key": key, "value": {"doubleValue": value}}
-    return {"key": key, "value": {"stringValue": _truncate(_text(value))}}
+    return {"key": key, "value": {"stringValue": _text(value)}}
 
 
 def _attrs(pairs: list[tuple[str, Any]]) -> list[dict]:
@@ -273,71 +263,8 @@ def _span(
     return body
 
 
-def _string_leaves(value: Any) -> list[tuple[Any, Any]]:
-    if isinstance(value, dict):
-        items = value.items()
-    elif isinstance(value, list):
-        items = enumerate(value)
-    else:
-        return []
-    leaves = []
-    for key, item in items:
-        if isinstance(item, str):
-            leaves.append((value, key))
-        else:
-            leaves.extend(_string_leaves(item))
-    return leaves
-
-
-def _json_within(value: Any, limit: int = TEXT_LIMIT) -> str:
-    """JSON of ``value`` in at most ``limit`` characters.
-
-    _attr cuts a long string at the limit. For JSON that would end inside a
-    string, so the longest strings inside are cut first and the JSON stays whole.
-    """
-    text = json.dumps(value, ensure_ascii=False, default=str)
-    if len(text) <= limit:
-        return text
-    value = json.loads(text)
-    marker = "… [truncated]"
-    while len(text) > limit:
-        leaves = _string_leaves(value)
-        if not leaves:
-            break
-        container, key = max(leaves, key=lambda leaf: len(leaf[0][leaf[1]]))
-        longest = container[key]
-        if len(longest) <= len(marker):
-            break
-        keep = max(len(longest) - (len(text) - limit) - len(marker), 0)
-        container[key] = longest[:keep] + marker
-        text = json.dumps(value, ensure_ascii=False)
-    if len(text) > limit:
-        # Many short values cannot be trimmed this way. A cut string is still valid JSON; a cut array is not.
-        text = json.dumps(text[: limit // 3] + marker, ensure_ascii=False)
-    return text
-
-
-def _messages_json(messages: list[dict], limit: int = TEXT_LIMIT, head: int = 1) -> str:
-    """The messages as JSON within ``limit``. Past it, the first ``head`` messages and the newest ones that fit stay whole.
-
-    Sizes are measured from the newest back only until the budget runs out, so a long turn costs no more per request.
-    """
-    if not messages:
-        messages = [{"role": "user", "parts": [{"type": "text", "content": ""}]}]
-    head = max(1, min(head, len(messages)))
-    budget = limit - len(json.dumps(messages[:head], ensure_ascii=False, default=str)) - 200
-    newest = len(messages)
-    while newest > head:
-        size = len(json.dumps(messages[newest - 1], ensure_ascii=False, default=str)) + 2
-        if size > budget:
-            break
-        budget -= size
-        newest -= 1
-    if newest <= head + 1:
-        return _json_within(messages, limit)
-    newest = min(newest, len(messages) - 1)
-    marker = {"role": "system", "parts": [{"type": "text", "content": f"[{newest - head} earlier messages omitted]"}]}
-    return _json_within([*messages[:head], marker, *messages[newest:]], limit)
+def _json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str)
 
 
 def _calls_of(event: dict) -> list[dict]:
@@ -369,10 +296,6 @@ def _call_from_tool(event: dict) -> dict:
     }
 
 
-def _user_parts(text: str) -> dict:
-    return {"role": "user", "parts": [{"type": "text", "content": text}]}
-
-
 def _unique(texts) -> list[str]:
     """Texts in order, each once. Cursor delivers some thoughts twice."""
     seen: list[str] = []
@@ -382,43 +305,16 @@ def _unique(texts) -> list[str]:
     return seen
 
 
-def _assistant_parts(text: str, calls: list[dict], reasoning: list[str] | None = None) -> dict:
-    """An empty reply keeps no parts. The view drops it instead of drawing a blank bubble."""
-    parts: list[dict] = [{"type": "reasoning", "content": thought} for thought in reasoning or [] if thought]
-    if text:
-        parts.append({"type": "text", "content": text})
-    for call in calls:
-        parts.append(
-            {
-                "type": "tool_call",
-                "id": call["id"],
-                "name": call["name"],
-                "arguments": call["arguments"],
-            }
-        )
-    return {"role": "assistant", "parts": parts}
+def _user(text: str) -> dict:
+    return text_message("user", text)
 
 
-def _tool_parts(call_id: str, response: str) -> dict:
-    return {"role": "tool", "parts": [{"type": "tool_call_response", "id": call_id, "response": response}]}
+class _Rendered(NamedTuple):
+    """One llm request: its input messages, its output message, and the tool calls it made."""
 
-
-def _history_messages(history: list[dict]) -> list[dict]:
-    """Earlier turns of the session, oldest first, as the model had them: each prompt and final answer.
-
-    The newest turns win when they do not all fit in HISTORY_LIMIT.
-    """
-    picked: list[dict] = []
-    budget = HISTORY_LIMIT
-    for turn in reversed(history):
-        prompt = _truncate(str(turn.get("prompt") or ""), HISTORY_MESSAGE_LIMIT)
-        answer = _truncate(str(turn.get("answer") or ""), HISTORY_MESSAGE_LIMIT)
-        budget -= len(prompt) + len(answer)
-        if budget < 0:
-            break
-        pair = ([_user_parts(prompt)] if prompt else []) + ([_assistant_parts(answer, [])] if answer else [])
-        picked[:0] = pair
-    return picked
+    input: list[dict]
+    output: dict
+    calls: list[dict]
 
 
 def _thread_io(
@@ -428,19 +324,33 @@ def _thread_io(
     *,
     context: list[dict] | None = None,
     tools_in_input: bool = False,
-) -> list[tuple[str, str, list[dict]]]:
-    """One GenAI messages array per llm request, plus that request's tool calls.
+) -> tuple[list[_Rendered], list[dict] | None]:
+    """Each llm request's messages, and the messages this turn added to the thread.
 
-    The input is ``context`` (earlier turns), the user prompt, and every tool
-    call and result that came before the request. The output is the assistant
-    message, including tool_call parts when this request invoked tools. A
-    result the model saw (``tool_results`` on the request) wins over the
-    hook's tool output.
+    A request read from a transcript carries the exact ``input_messages`` it
+    sent and its ``output_message``. Those are used as they are, and the turn's
+    messages are None: the next turn reads its history from the transcript too.
+
+    Otherwise the input is ``context`` (the session's earlier turns, whole),
+    the user prompt, and every tool call and result that came before the
+    request. The output is the assistant message, including tool_call parts
+    when this request invoked tools. A result the model saw (``tool_results``
+    on the request) wins over the hook's tool output.
 
     ``tools_in_input`` is for a harness that reports one span for many
     requests (Cursor, one per stop). The tools that ran before the span ends go
     in its input with their results, and the output is the final text.
     """
+    if models and all(isinstance(model.get("input_messages"), list) for model in models):
+        return [
+            _Rendered(
+                model["input_messages"],
+                model.get("output_message") or assistant_message(_text(model.get("output")), _calls_of(model), model.get("reasoning")),
+                _calls_of(model),
+            )
+            for model in models
+        ], None
+    context = list(context or [])
     by_id = {}
     for tool in tools:
         call_id = str(tool.get("tool_call_id") or "")
@@ -452,8 +362,8 @@ def _thread_io(
     pending.sort(key=lambda tool: _ms(tool, 0))
     used: set[int] = set()
     seen_calls: set[str] = set()
-    history = [_user_parts(prompt or "")]
-    rendered: list[tuple[str, str, list[dict]]] = []
+    history = [_user(prompt or "")]
+    rendered: list[_Rendered] = []
 
     def _fresh(call_id: str) -> bool:
         if call_id and call_id in seen_calls:
@@ -479,11 +389,11 @@ def _thread_io(
             call = _call_from_tool(tool)
             if not _fresh(call["id"]):
                 continue
-            history.append(_assistant_parts(preamble, [call]))
+            history.append(assistant_message(preamble, [call]))
             preamble = ""
-            history.append(_tool_parts(call["id"], _text(tool.get("tool_output")) if tool.get("tool_output") is not None else ""))
+            history.append(tool_message(call["id"], _text(tool.get("tool_output")) if tool.get("tool_output") is not None else ""))
         for received in model.get("received") or []:
-            history.append(_user_parts(_text(received)))
+            history.append(_user(_text(received)))
         calls = _calls_of(model)
         if not calls and not tools_in_input:
             for tool in pending:
@@ -496,15 +406,14 @@ def _thread_io(
         own = _typed(_text(model.get("prompt")))
         incoming = list(history)
         if own and own != (prompt or "") and len(history) == 1:
-            incoming = [_user_parts(own)]
+            incoming = [_user(own)]
         elif own and own != (prompt or "") and index > 0:
             # A later request answering a new user message, such as a Cursor background wake.
-            incoming.append(_user_parts(own))
-        outgoing = [_assistant_parts(_text(model.get("output")), calls, model.get("reasoning"))]
-        head = len(context or []) + 1
-        rendered.append((_messages_json(list(context or []) + incoming, head=head), _messages_json(outgoing), calls))
+            incoming.append(_user(own))
+        outgoing = assistant_message(_text(model.get("output")), calls, model.get("reasoning"))
+        rendered.append(_Rendered(context + incoming, outgoing, calls))
         # A failed request's error text never reached the model. The next request does not see it.
-        history = list(incoming) + ([] if model.get("is_error") else outgoing)
+        history = [*incoming] if model.get("is_error") else [*incoming, outgoing]
         for call in calls:
             if not _fresh(call["id"]):
                 continue
@@ -514,8 +423,8 @@ def _thread_io(
             response = _response(model, call["id"])
             if response is None:
                 response = _text(tool.get("tool_output")) if tool is not None and tool.get("tool_output") is not None else ""
-            history.append(_tool_parts(call["id"], response))
-    return rendered
+            history.append(tool_message(call["id"], response))
+    return rendered, history
 
 
 def _contain(spans: list[dict]) -> None:
@@ -602,27 +511,32 @@ def _prompt_and_final(usable: list[dict]) -> tuple[str, str]:
     return prompt, final
 
 
-def turn_summary(events: list[dict]) -> dict | None:
-    """The turn as a later turn's context: when it started, its prompt, and its final answer."""
+def turn_start(events: list[dict]) -> int | None:
+    """When the turn started, in milliseconds, so later turns can find the turns before them."""
     usable = _usable(events)
     if not usable or not usable[0].get("turn_id"):
         return None
-    prompt, final = _prompt_and_final(usable)
-    return {
-        "turn_id": str(usable[0]["turn_id"]),
-        "start": min(_stamp_start(event, 0) for event in usable),
-        "prompt": _truncate(prompt, HISTORY_MESSAGE_LIMIT),
-        "answer": _truncate(final, HISTORY_MESSAGE_LIMIT),
-    }
+    return min(_stamp_start(event, 0) for event in usable)
+
+
+class Turn(NamedTuple):
+    """One turn's trace, and the messages it added to the main thread.
+
+    ``messages`` is None when the turn's llm inputs came from a transcript:
+    the next turn reads its history from the transcript as well.
+    """
+
+    payload: dict
+    messages: list[dict] | None
 
 
 def _conversation(role: str, text: str) -> str:
     """Agent span input or output as one GenAI message, so the view does not show it raw."""
-    message = _user_parts(text) if role == "user" else _assistant_parts(text, [])
-    return _messages_json([message])
+    message = _user(text) if role == "user" else assistant_message(text, [])
+    return _json([message])
 
 
-_TEXT_KEYS = ("judgment.input", "judgment.output")
+_TEXT_KEYS = ("judgment.input", "judgment.output", "gen_ai.system_instructions", "gen_ai.tool.definitions")
 _PLACEHOLDER = "[REDACTED:"
 
 
@@ -679,8 +593,8 @@ def build_request(
     update_id: int | None = None,
     history: list[dict] | None = None,
     redaction: dict | None = None,
-) -> dict | None:
-    """``history`` is the session's earlier turns, oldest first, as ``turn_summary`` returns them.
+) -> Turn | None:
+    """``history`` is the messages the session's earlier turns added to the main thread, oldest first.
 
     ``redaction`` is ``redact.turn_redaction``'s record, or None for raw (``capture: full``) text.
     """
@@ -813,14 +727,14 @@ def build_request(
             item["end_ts"] = _ms(item, started)
         return item
 
-    def add_model(event: dict, index: int, parent: str, agent_id: str, rendered: tuple[str, str, list[dict]] | None) -> None:
+    def add_model(event: dict, index: int, parent: str, agent_id: str, rendered: _Rendered | None) -> None:
         model = _catalog_model(str(event.get("model") or ""))
         if model.lower() in _UNPRICED_MODELS and concrete_model:
             model = _catalog_model(concrete_model)
         provider = _provider(model, harness, str(event.get("provider") or ""))
         own_prompt = _text(event.get("prompt"))
         own_output = _text(event.get("output"))
-        calls = rendered[2] if rendered else _calls_of(event)
+        calls = rendered.calls if rendered else _calls_of(event)
         pairs = [
             ("judgment.span_kind", "llm"),
             ("judgment.session_id", session_id),
@@ -839,10 +753,17 @@ def build_request(
         if not own_prompt and not own_output and not usage_pairs and not calls and not event.get("is_error"):
             return
         if rendered:
-            pairs.append(("judgment.input", rendered[0]))
-            pairs.append(("judgment.output", rendered[1]))
+            output = rendered.output
+            if event.get("finish_reason"):
+                output = {**output, "finish_reason": str(event["finish_reason"])}
+            pairs.append(("judgment.input", _json(rendered.input or [_user("")])))
+            pairs.append(("judgment.output", _json([output])))
+        if event.get("system_instructions"):
+            pairs.append(("gen_ai.system_instructions", _json([{"type": "text", "content": _text(event["system_instructions"])}])))
+        if event.get("tool_definitions"):
+            pairs.append(("gen_ai.tool.definitions", _json(event["tool_definitions"])))
         if calls:
-            pairs.append(("judgment.llm.tool_calls", _json_within(calls)))
+            pairs.append(("judgment.llm.tool_calls", _json(calls)))
         pairs.extend(usage_pairs)
         when, end = _bounds(event, start_ms)
         message_id = str(event.get("message_id") or "")
@@ -931,7 +852,7 @@ def build_request(
         child_parent = _ident(16, trace_id, "sub", agent_id)
         agent_models = [timed(event, "model") for event in agent_events if event.get("event") == "model"]
         agent_tools = [event for event in agent_events if event.get("event") == "tool"]
-        agent_io = _thread_io(agent_models, agent_tools, info["prompt"] or prompt)
+        agent_io, _ = _thread_io(agent_models, agent_tools, info["prompt"] or prompt)
         model_queue = list(agent_models)
         io_at = 0
         for index, event in enumerate(agent_events):
@@ -1055,11 +976,11 @@ def build_request(
 
     main_tools = [event for event in main if event.get("event") == "tool"]
     timed_models = [timed(event, "model") for event in model_events]
-    main_io = _thread_io(
+    main_io, turn_messages = _thread_io(
         timed_models,
         main_tools,
         prompt,
-        context=_history_messages(history or []),
+        context=history,
         tools_in_input=harness == "cursor",
     )
     for index, event in enumerate(timed_models):
@@ -1121,7 +1042,7 @@ def build_request(
     ]
     if harness_version:
         resource_pairs.append(("agent.harness.version", harness_version))
-    return {
+    payload = {
         "resourceSpans": [
             {
                 "resource": {"attributes": _attrs(resource_pairs)},
@@ -1134,3 +1055,4 @@ def build_request(
             }
         ]
     }
+    return Turn(payload, turn_messages)

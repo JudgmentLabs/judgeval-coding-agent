@@ -161,7 +161,7 @@ class LateSensitivityTests(unittest.TestCase):
             self.assertEqual(sb.hook("pi", "", payload).returncode, 0)
         return sink, sb, marker, t0
 
-    def test_next_turn_never_carries_the_old_summary(self):
+    def test_next_turn_never_carries_the_old_messages(self):
         sink, sb, marker, t0 = self.run_turns()
         sent = len(sink.requests)
         for _, payload in pi_turn(str(sb.project), "lc-1", "lc-1:2", t0 + 20_000, prompt="next step", answer="done"):
@@ -172,12 +172,12 @@ class LateSensitivityTests(unittest.TestCase):
         self.assertNotIn(marker, later)
         index = json.loads((sb.state / "index.json").read_text())
         first = index["pi\tlc-1\tlc-1:1"]
-        self.assertEqual((first["blanked"]["rule"], first["summary"]), ("dotenv", None))
+        self.assertEqual((first["blanked"]["rule"], first["messages"]), ("dotenv", False))
         from judgment_core.flush import _turn_file
 
         self.assertNotIn(marker, _turn_file(sb.state, "pi\tlc-1\tlc-1:1").read_text())
 
-    def test_failed_resend_leaves_no_old_summary(self):
+    def test_failed_resend_leaves_no_old_messages(self):
         sink, sb, marker, _ = self.run_turns()
         sink.status = 500
         base = {"v": 1, "harness": "pi", "session_id": "lc-1", "turn_id": "lc-1:1", "cwd": str(sb.project)}
@@ -187,11 +187,11 @@ class LateSensitivityTests(unittest.TestCase):
         self.assertNotIn(marker, index_text)
         first = json.loads(index_text)["pi\tlc-1\tlc-1:1"]
         self.assertTrue(first["blanked"])
-        self.assertIsNone(first["summary"])
+        self.assertFalse(first["messages"])
         self.assertNotIn(marker, sb.state_text())
 
     def test_blank_found_only_in_the_transcript_is_settled_before_the_post(self):
-        """The sender finds the .env read in the transcript at resend. The post fails: the summary is gone anyway."""
+        """The sender finds the .env read in the transcript at resend. The post fails: its messages are gone anyway."""
         with Sink() as sink:
             sb = Sandbox(sink_url=sink.url)
             self.addCleanup(sb.cleanup)
@@ -211,7 +211,7 @@ class LateSensitivityTests(unittest.TestCase):
             self.assertEqual(sb.hook("claude", "PostToolUse", late).returncode, 0)
             sb.flush()
             item = json.loads((sb.state / "index.json").read_text())["claude-code\ttr-1\tp1"]
-            self.assertEqual((item["blanked"]["rule"], item["summary"]), ("dotenv", None))
+            self.assertEqual((item["blanked"]["rule"], item["messages"]), ("dotenv", False))
 
 
 class DetachTests(unittest.TestCase):

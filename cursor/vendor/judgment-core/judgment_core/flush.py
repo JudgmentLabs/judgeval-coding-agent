@@ -5,8 +5,9 @@ events through ``assemble.Fold`` in the order they happened, appends each to
 its turn's file under ``turns/``, and sends every turn the fold marked ready.
 Persistent state is the fold's small routing table (``fold.json``) and one
 record per turn (``index.json``): its file, whether it is waiting to be
-sent, the last ``judgment.update_id`` sent, and a short summary for later
-turns' history.
+sent, the last ``judgment.update_id`` sent, and when it started. A turn whose
+llm inputs were not read from a transcript also keeps the messages it added to
+the thread (``<turn>.messages.json``), so later turns replay them whole.
 
 Each turn's events pass through plain stages: inbox -> fold -> turn file -> enrich (transcript
 text) -> capture policy (metadata strips text; sanitized redacts it, and blanks the whole turn
@@ -46,7 +47,7 @@ from judgment_core.codex_transcript import enrich_codex_events
 from judgment_core.cursor_transcript import enrich_cursor_events
 from judgment_core.config import DEFAULT_API_URL, load_credentials, traces_url
 from judgment_core.optin import load_project, safe_id, state_dir, tracing_forced_off
-from judgment_core.spans import build_request, turn_summary
+from judgment_core.spans import build_request, turn_start
 
 ATTEMPTS = 3
 TIMEOUT_SECONDS = 10
@@ -195,6 +196,17 @@ def _turn_file(state: Path, key: str) -> Path:
     return state / "turns" / safe_id(harness) / safe_id(session) / f"{safe_id(turn)}.jsonl"
 
 
+def _messages_file(state: Path, key: str) -> Path:
+    return _turn_file(state, key).with_suffix(".messages.json")
+
+
+def _forget(state: Path, key: str, item: dict) -> None:
+    """No later turn replays this one's messages."""
+    item.pop("summary", None)  # written by earlier versions
+    item["messages"] = False
+    _messages_file(state, key).unlink(missing_ok=True)
+
+
 def _inbox(state: Path) -> list[tuple[Path, dict, list]]:
     """Event files in the order hooks wrote them, up to the first one still being written."""
     folder = state / "inbox"
@@ -292,7 +304,7 @@ def _store(state: Path, index: dict, fold: Fold, event: dict, redactor: "_Redact
     """Append one event to its turn's file.
 
     A turn's sensitivity is sticky and set as soon as one of its events shows it: the turn is marked blanked, its
-    summary cleared, and its file rewritten without text, before any wait or history. A later event of a blanked turn,
+    messages dropped, and its file rewritten without text, before any wait or history. A later event of a blanked turn,
     such as a child's that arrives after the turn was sent, is stored without text.
     """
     key = turn_key(event)
@@ -326,11 +338,11 @@ def _sensitive(event: dict, redactor: "_Redactor") -> dict | None:
 
 
 def _blank(state: Path, index: dict, key: str, blank: dict) -> None:
-    """Mark a turn blanked, for good: no summary, and a turn file without text. Safe to repeat."""
+    """Mark a turn blanked, for good: no messages for later turns, and a turn file without text. Safe to repeat."""
     item = index[key]
     if not item.get("blanked"):
         item["blanked"] = blank
-    item["summary"] = None
+    _forget(state, key, item)
     path = _turn_file(state, key)
     events = _read_jsonl(path)
     stripped = [redact.strip_text(event) for event in events]
@@ -451,8 +463,13 @@ class _Redactor:
     def redact(self, event: dict) -> dict:
         return redact.redact_event(event, self.rules([event]), self.secrets)
 
-    def text(self, value: str, rs: redact.Ruleset, field: str) -> tuple[str, list[dict]]:
-        return redact.redact_text(value, rs, self.secrets, field)
+    def history(self, messages: list[dict], rs: redact.Ruleset) -> tuple[list[dict], list[dict]]:
+        """One earlier turn's messages redacted, and what that replaced as field history. None of them at a limit."""
+        try:
+            scrubbed, records = redact.scrub_fields({"history": messages}, rs, self.secrets, redact.sender_budget())
+        except redact.RedactionLimit:
+            return [], []
+        return scrubbed["history"], records
 
 
 def _sanitize(state: Path, key: str, item: dict, events: list[dict], prepared: list[dict], redactor: _Redactor) -> tuple[list[dict], dict | None]:
@@ -471,7 +488,7 @@ def _sanitize(state: Path, key: str, item: dict, events: list[dict], prepared: l
     stored = [redact.redact_event(event, rs, redactor.secrets) for event in events]
     if blank:
         item["blanked"] = blank
-        item["summary"] = None
+        _forget(state, key, item)
         stored = [redact.strip_text(event) for event in stored]
         # Spans are built from the whole turn and lose their text there. A free-form name would be a span name.
         prepared = [redact.unblank(event) for event in prepared]
@@ -533,14 +550,13 @@ def _env_refs(event: dict) -> set[tuple[str, str]]:
     return refs
 
 
-def _redact_history(history: list[dict], rs: redact.Ruleset, redactor: _Redactor) -> tuple[list[dict], list[dict]]:
-    """Earlier turns' prompts and answers redacted, and the records of what that replaced, as field history."""
+def _redact_history(history: list[list[dict]], rs: redact.Ruleset, redactor: _Redactor) -> tuple[list[list[dict]], list[dict]]:
+    """Earlier turns' messages redacted, and the records of what that replaced, as field history."""
     out, records = [], []
     for turn in history:
-        prompt, found_prompt = redactor.text(str(turn.get("prompt") or ""), rs, "history")
-        answer, found_answer = redactor.text(str(turn.get("answer") or ""), rs, "history")
-        out.append({**turn, "prompt": prompt, "answer": answer})
-        records += found_prompt + found_answer
+        messages, found = redactor.history(turn, rs)
+        out.append(messages)
+        records += found
     return out, records
 
 
@@ -580,19 +596,39 @@ def _requests(payload: dict) -> list[bytes]:
     return bodies
 
 
-def _history(index: dict, key: str, dest: str) -> list[dict]:
-    """Earlier turns of the same session sent to the same project, oldest first."""
+def _after_blanked(index: dict, key: str) -> bool:
+    """Whether an earlier turn of the same session was blanked."""
     harness, session, _turn = key.split("\t")
     prefix = f"{harness}\t{session}\t"
-    start = index[key].get("start") or index[key].get("first") or 0
+    start = int(index[key].get("start") or index[key].get("first") or 0)
+    return any(
+        other != key and other.startswith(prefix) and item.get("blanked") and int(item.get("start") or item.get("first") or 0) < start
+        for other, item in index.items()
+    )
+
+
+def _history(state: Path, index: dict, key: str, dest: str) -> list[list[dict]]:
+    """The messages each earlier turn of the same session, sent to the same project, added to the thread. Oldest first."""
+    harness, session, _turn = key.split("\t")
+    prefix = f"{harness}\t{session}\t"
+    start = int(index[key].get("start") or index[key].get("first") or 0)
     # A turn with events not yet sent (ready again: a late child, a failed resend) is left out: those events can still
     # blank it.
-    earlier = [
-        item["summary"]
+    earlier = sorted(
+        (int(item.get("start") or 0), other)
         for other, item in index.items()
-        if other != key and other.startswith(prefix) and item.get("summary") and not item.get("blanked") and not item.get("ready") and item.get("dest") == dest
-    ]
-    return sorted((turn for turn in earlier if int(turn.get("start") or 0) < start), key=lambda turn: int(turn.get("start") or 0))
+        if other != key and other.startswith(prefix) and item.get("messages") and not item.get("blanked") and not item.get("ready")
+        and item.get("dest") == dest and int(item.get("start") or 0) < start
+    )
+    turns: list[list[dict]] = []
+    for _start, other in earlier:
+        try:
+            turn = json.loads(_messages_file(state, other).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(turn, list):
+            turns.append([message for message in turn if isinstance(message, dict)])
+    return turns
 
 
 def _waiting(state: Path, index: dict) -> set[str]:
@@ -659,6 +695,10 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
             blank = None
             redaction = None
             rs = redactor.rules(events)
+            if capture == "sanitized" and _after_blanked(index, key):
+                # A transcript replays every earlier request whole, the blanked turn's included. Build this turn's inputs
+                # from its own events and the unblanked turns' kept messages instead.
+                prepared = [{name: value for name, value in event.items() if name != "input_messages"} for event in prepared]
             if capture == "metadata":
                 # Transcript enrichment has already run, so this is what gets sent and kept.
                 if not redactor.checked_environment(events):
@@ -668,32 +708,32 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
                 prepared, blank = _sanitize(state, key, item, events, prepared, redactor)
             # A blanked or metadata turn is no later turn's context. Nor is one whose rules failed.
             quiet = capture == "metadata" or bool(blank) or (capture != "full" and bool(rs.error))
-            if quiet and item.get("summary") is not None:
+            if quiet and item.get("messages"):
                 # Settled before any send, so a failed post cannot leave the old text as context.
-                item["summary"] = None
+                _forget(state, key, item)
                 _private_write(state / "index.json", json.dumps(index))
             elif blank:
                 _private_write(state / "index.json", json.dumps(index))
-            summary = turn_summary(prepared)
-            if summary:
-                item["start"] = summary["start"]
+            started = turn_start(prepared)
+            if started is not None:
+                item["start"] = started
             update_id = None if item.get("update_id") is None else int(item["update_id"]) + 1
             # Earlier turns may hold text from before the project switched to metadata.
             assert creds is not None
             dest = f"{creds['JUDGMENT_API_URL']} {creds['JUDGMENT_ORG_ID']} {creds['JUDGMENT_PROJECT_ID']}"
             # Rules that failed drop every text in the request, the earlier turns' included.
-            history = [] if quiet else _history(index, key, dest)
+            history = [] if quiet else _history(state, index, key, dest)
             if capture != "full":
                 # Earlier turns may have been captured in full, or stored by an older build. What is replaced in them now
                 # is this request's redaction, so it joins the root's audit as field history.
                 history, extra = _redact_history(history, rs, redactor)
                 redaction = redact.turn_redaction(prepared, blank, extra)
-            payload = build_request(prepared, update_id=update_id, history=history, redaction=redaction)
+            turn = build_request(prepared, update_id=update_id, history=[message for messages in history for message in messages], redaction=redaction)
         except (OSError, ValueError) as exc:
             # A ValueError's message can quote the transcript value it choked on.
             _log(state, f"skip a turn: {type(exc).__name__}")
             continue
-        if payload is None:
+        if turn is None:
             item["ready"] = False
             continue
         headers = {
@@ -706,7 +746,7 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
             headers["X-Organization-Id"] = creds["JUDGMENT_ORG_ID"]
         url = traces_url(creds["JUDGMENT_API_URL"])
         status = 200
-        for body in _requests(payload):
+        for body in _requests(turn.payload):
             for attempt in range(ATTEMPTS):
                 try:
                     status = _post(url, body, headers)
@@ -717,9 +757,13 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
                     break
                 _log(state, f"post status {status}")
                 time.sleep(0.2 * (2**attempt))
+            if status == 413:
+                # A span bigger than the server takes is sent whole and alone in its request. Only that request is lost.
+                _log(state, "drop a request: post status 413")
+                status = 200
             if status != 200:
                 break
-        if status in (400, 413):
+        if status == 400:
             # The server will never take this turn as built. Retrying it would hold back every turn after it.
             _log(state, f"skip a turn: post status {status}")
             item["ready"] = False
@@ -731,7 +775,12 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
             return -1
         item["update_id"] = 0 if update_id is None else update_id
         item["ready"] = False
-        item["summary"] = None if quiet else summary
+        if quiet or turn.messages is None:
+            _forget(state, key, item)
+        else:
+            item.pop("summary", None)  # written by earlier versions
+            item["messages"] = True
+            _private_write(_messages_file(state, key), json.dumps(turn.messages, ensure_ascii=False))
         item["dest"] = dest
         _private_write(state / "index.json", json.dumps(index))
         sent += 1
@@ -740,6 +789,7 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
 
 def _drop(state: Path, index: dict, key: str) -> None:
     _turn_file(state, key).unlink(missing_ok=True)
+    _messages_file(state, key).unlink(missing_ok=True)
     index.pop(key, None)
     _private_write(state / "index.json", json.dumps(index))
 
@@ -749,6 +799,7 @@ def _prune(state: Path, index: dict) -> None:
     old = [key for key, item in index.items() if not item.get("ready") and int(item.get("last") or 0) < cutoff]
     for key in old:
         _turn_file(state, key).unlink(missing_ok=True)
+        _messages_file(state, key).unlink(missing_ok=True)
         index.pop(key, None)
     if old:
         _private_write(state / "index.json", json.dumps(index))

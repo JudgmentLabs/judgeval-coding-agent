@@ -116,17 +116,18 @@ class SinkTests(unittest.TestCase):
         c = turns["now run the tests"]
         root_c = attrs(roots(c)[0])
         self.assertNotIn("judgment.redacted_reason", root_c)
+        # The transcript replays the blanked turn B in every later request, so turn C is built from its own events.
         self.assertEqual((root_c["judgment.redacted"], root_c["judgment.redaction_count"]), (False, "0"))
         self.assertEqual(root_c["judgment.output"], "All 42 tests pass.")
         history = next(attrs(span)["judgment.input"] for span in c if attrs(span).get("judgment.span_kind") == "llm")
-        self.assertIn("[REDACTED:openai_key]", history)  # turn A rides along, redacted
+        self.assertIn("now run the tests", history)
         self.assertNotIn("what is in the env file", history)  # the blanked turn does not
         self.assertNotIn("DATABASE_URL", history)
 
         index = json.loads((sb.state / "index.json").read_text())
         flagged = [item for item in index.values() if item.get("blanked")]
         self.assertEqual(len(flagged), 1)
-        self.assertIsNone(flagged[0]["summary"])
+        self.assertFalse(flagged[0]["messages"])
         stored = (sb.state / "turns" / "claude-code" / "cc-1" / "pb.jsonl").read_text()
         self.assertNotIn("what is in the env file", stored)
         self.assertNotIn("DATABASE_URL", stored)

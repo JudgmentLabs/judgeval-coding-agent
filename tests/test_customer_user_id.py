@@ -46,7 +46,9 @@ class Collector(BaseHTTPRequestHandler):
         pass
 
 
-class CustomerUserIdTest(unittest.TestCase):
+class HookCase(unittest.TestCase):
+    """A local collector, a project opted in to tracing, and the real hook and flusher."""
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.server = HTTPServer(("127.0.0.1", 0), Collector)
@@ -114,6 +116,8 @@ class CustomerUserIdTest(unittest.TestCase):
                 found.setdefault(attrs["judgment.session_id"], []).append(attrs)
         return found
 
+
+class CustomerUserIdTest(HookCase):
     def assert_person(self, spans: list[dict], person: str | None) -> None:
         self.assertTrue(spans)
         for span in spans:

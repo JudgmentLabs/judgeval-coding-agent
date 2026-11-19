@@ -64,7 +64,7 @@ from judgment_core.config import DEFAULT_API_URL, load_credentials  # noqa: E402
 __all__ = ["CORE", "Gate", "warm", "resolve", "needs_alias", "prepare", "stage", "publish", "launch_sender", "command",
            "copy_session_mode", "state_dir", "TEXT_CAP", "CUT_MARK", "OVERSIZE_RULE"]
 
-# The most text one field keeps, cut only after redaction. Spans cut at 64 KB anyway.
+# The most text one field keeps, cut only after redaction.
 TEXT_CAP = 64 * 1024
 CUT_MARK = "… [truncated]"
 # The fields sensitivity is read from (redact.tool_texts and the prompt's @mentions).

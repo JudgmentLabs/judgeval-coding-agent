@@ -40,8 +40,13 @@ def _parse(lines: list[bytes]) -> list[dict]:
     return rows
 
 
-def records(path: Path | None, since_ms: int | None = None) -> list[dict]:
-    """Rows of a JSONL transcript. With ``since_ms``, only the first row and rows from about then on."""
+def records(path: Path | None, since_ms: int | None = None, boundary: bytes = b"") -> list[dict]:
+    """Rows of a JSONL transcript. With ``since_ms``, only the first row and rows from about then on.
+
+    With ``boundary``, older rows are kept back to the last row containing it
+    (a compaction, where the model's history restarts), or to the start of the
+    file when there is none, so a reader can rebuild what the model saw.
+    """
     if path is None:
         return []
     try:
@@ -65,11 +70,17 @@ def records(path: Path | None, since_ms: int | None = None) -> list[dict]:
             handle.seek(pos)
             lines = (handle.read(step) + carry).split(b"\n")
             carry = lines.pop(0) if pos > start else b""
-            for row in reversed(_parse(lines)):
+            for line in reversed(lines):
+                parsed = _parse([line])
+                if not parsed:
+                    continue
+                row = parsed[0]
                 stamp = _ms(row)
                 if stamp is not None and stamp < cutoff:
                     old.append(row)
-                    if len(old) >= _OLD_RUN:
+                    if boundary and boundary in line:
+                        return first + list(reversed(kept + old))
+                    if not boundary and len(old) >= _OLD_RUN:
                         return first + list(reversed(kept))
                     continue
                 kept.extend(old)

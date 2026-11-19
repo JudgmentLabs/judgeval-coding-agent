@@ -6,12 +6,17 @@ and it is read here, after the turn has been spooled, not inside the hook.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from judgment_core.messages import assistant_message, media_part, tool_message
 from judgment_core.rows import records as _records
+
+# Rows before the last compaction are not in the model's history. Transcript rows are compact JSON.
+_COMPACT = b'"subtype":"compact_boundary"'
 
 
 def _tool_uses(message: dict) -> list[dict]:
@@ -304,6 +309,207 @@ def _subagent_transcript(main: Path | None, agent_id: str, explicit: str) -> Pat
     return None
 
 
+def _media(block: dict) -> dict | None:
+    source = block.get("source") if isinstance(block.get("source"), dict) else {}
+    modality = "image" if block.get("type") == "image" else "file"
+    media_type = str(source.get("media_type") or "") or None
+    if source.get("type") == "base64" and source.get("data"):
+        return media_part(modality, f"data:{media_type or ''};base64,{source['data']}", media_type)
+    if source.get("url"):
+        return media_part(modality, str(source["url"]), media_type)
+    if source.get("type") == "text" and source.get("data") is not None:
+        return {"type": "text", "content": str(source["data"])}
+    return None
+
+
+def _result_value(content: object) -> object:
+    """A tool_result as the model read it: text, or its parts when it holds an image or file."""
+    if not isinstance(content, list) or all(not isinstance(block, dict) or block.get("type") == "text" for block in content):
+        return _result_text(content)
+    parts = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append({"type": "text", "content": block})
+        elif isinstance(block, dict) and block.get("type") == "text":
+            parts.append({"type": "text", "content": str(block.get("text") or "")})
+        elif isinstance(block, dict) and _media(block):
+            parts.append(_media(block))
+    return parts
+
+
+def _assistant_of(content: object) -> dict:
+    """An Anthropic assistant message as one GenAI message. Thinking keeps its text only; empty or redacted thinking and signatures are dropped."""
+    if isinstance(content, str):
+        return assistant_message(content, [])
+    blocks = [block for block in content if isinstance(block, dict)] if isinstance(content, list) else []
+    reasoning = [str(block["thinking"]) for block in blocks if block.get("type") == "thinking" and block.get("thinking")]
+    text = "\n".join(str(block["text"]) for block in blocks if block.get("type") == "text" and block.get("text"))
+    calls = [
+        {"id": str(block.get("id") or ""), "name": str(block.get("name") or "tool"), "arguments": block.get("input") if block.get("input") is not None else {}}
+        for block in blocks
+        if block.get("type") in ("tool_use", "server_tool_use")
+    ]
+    return assistant_message(text, calls, reasoning)
+
+
+def _converted(message: dict) -> list[dict]:
+    """One Anthropic message as GenAI messages. A user message's tool results become tool messages, in place."""
+    content = message.get("content")
+    if message.get("role") == "assistant":
+        return [_assistant_of(content)]
+    if isinstance(content, str):
+        return [{"role": "user", "parts": [{"type": "text", "content": content}]}]
+    out: list[dict] = []
+    parts: list[dict] = []
+    for block in content if isinstance(content, list) else []:
+        if isinstance(block, str):
+            parts.append({"type": "text", "content": block})
+            continue
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_result":
+            if parts:
+                out.append({"role": "user", "parts": parts})
+                parts = []
+            out.append(tool_message(str(block.get("tool_use_id") or ""), _result_value(block.get("content"))))
+        elif block.get("type") == "text":
+            parts.append({"type": "text", "content": str(block.get("text") or "")})
+        elif _media(block):
+            parts.append(_media(block))
+    if parts:
+        out.append({"role": "user", "parts": parts})
+    return out
+
+
+def _tool_definition(tool: dict) -> dict:
+    if "input_schema" not in tool:
+        # A server tool such as web search: Anthropic names its type.
+        return {"type": "provider", "id": f"anthropic.{tool.get('type') or tool.get('name')}", "name": str(tool.get("name") or ""), "args": {key: value for key, value in tool.items() if key not in ("name", "type")}}
+    item = {"type": "function", "name": str(tool.get("name") or "")}
+    if tool.get("description"):
+        item["description"] = str(tool["description"])
+    item["inputSchema"] = tool["input_schema"]
+    return item
+
+
+def _call_ids(content: object) -> tuple[str, ...]:
+    return tuple(str(block.get("id")) for block in content if isinstance(block, dict) and block.get("type") == "tool_use") if isinstance(content, list) else ()
+
+
+def _exact_requests(rows: list[dict]) -> tuple[dict[str, dict], dict[tuple[str, ...], dict]]:
+    """Each logged API request by id (its system prompt, tools, and messages), and each logged reply by its tool call ids.
+
+    A transcript row fills in a call's default arguments. The logged reply is what the model wrote.
+
+    Claude Code logs a request as a shape (system and tools), the messages it
+    kept from a base request, and new messages by content hash.
+    """
+    shapes = {str(row.get("shapeHash")): row.get("shape") for row in rows if row.get("type") == "api-request-shape" and isinstance(row.get("shape"), dict)}
+    blobs = {str(row.get("hash")): row.get("message") for row in rows if row.get("type") == "api-request-blob" and isinstance(row.get("message"), dict)}
+    sent_replies = {_call_ids(message.get("content")): message for message in blobs.values() if message.get("role") == "assistant" and _call_ids(message.get("content"))}
+    logged = {str(row.get("id")): row for row in rows if row.get("type") == "api-request" and row.get("id")}
+    # A response is not logged as a blob. Its hash is that of the assistant message the transcript rows add up to.
+    replies: dict[str, list[dict]] = {}
+    for row in rows:
+        if _role(row) == "assistant" and row.get("requestRef") and isinstance(_message(row).get("content"), list):
+            replies.setdefault(str(row["requestRef"]), []).extend(_message(row)["content"])
+    for content in replies.values():
+        message = {"role": "assistant", "content": content}
+        for ascii_only in (False, True):
+            text = json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=ascii_only)
+            blobs.setdefault(hashlib.sha256(text.encode("utf-8")).hexdigest(), message)
+    built: dict[str, list[dict] | None] = {}
+
+    def messages(request_id: str, depth: int = 0) -> list[dict] | None:
+        if request_id in built:
+            return built[request_id]
+        row = logged.get(request_id)
+        if row is None or depth > 10_000:
+            return None
+        built[request_id] = None  # a cycle reads as missing
+        base: list[dict] = []
+        if row.get("base"):
+            found = messages(str(row["base"]), depth + 1)
+            if found is None:
+                return None
+            base = found
+        try:
+            keep = int(row.get("keep") or 0)
+        except (TypeError, ValueError):
+            return None
+        tail = [blobs.get(str(key)) for key in row.get("tail") or []]
+        if keep > len(base) or any(blob is None for blob in tail):
+            return None
+        built[request_id] = base[:keep] + tail
+        return built[request_id]
+
+    found = {}
+    for request_id, row in logged.items():
+        sent = messages(request_id)
+        shape = shapes.get(str(row.get("shapeHash")))
+        if sent is None or shape is None:
+            continue
+        system = "\n".join(str(block.get("text") or "") for block in shape.get("system") or [] if isinstance(block, dict) and block.get("type") == "text")
+        found[request_id] = {
+            "messages": sent,
+            "system": system,
+            "tools": [_tool_definition(tool) for tool in shape.get("tools") or [] if isinstance(tool, dict)],
+        }
+    return found, sent_replies
+
+
+def _replayed(rows: list[dict], before: dict, side: bool) -> list[dict]:
+    """Without a logged request, the transcript's messages before ``before`` since the last compaction, as the request replayed them."""
+    messages: list[dict] = []
+    current = ""
+    for row in rows:
+        if row is before:
+            break
+        if row.get("type") == "system" and row.get("subtype") == "compact_boundary":
+            messages, current = [], ""
+            continue
+        if _role(row) not in ("user", "assistant") or (row.get("isSidechain") is True) != side:
+            continue
+        message = _message(row)
+        if _role(row) == "assistant":
+            content = message.get("content") if isinstance(message.get("content"), list) else []
+            mid = _message_id(row)
+            if mid and mid == current and messages and messages[-1].get("content") is not None:
+                messages[-1]["content"].extend(content)
+            else:
+                messages.append({"role": "assistant", "content": list(content)})
+            current = mid
+        else:
+            messages.append({"role": "user", "content": message.get("content")})
+            current = ""
+    return messages
+
+
+def _add_context(rows: list[dict], groups: list[dict]) -> None:
+    """Set each request's exact input messages, output message, system prompt, tools, and stop reason."""
+    exact, sent_replies = _exact_requests(rows) if any(row.get("type") == "api-request" for row in rows) else ({}, {})
+    for group in groups:
+        own = group.get("rows") or []
+        if not own:
+            continue
+        blocks = [block for row in own for block in (_message(row).get("content") or []) if isinstance(block, dict)]
+        reply = sent_replies.get(_call_ids(blocks)) if _call_ids(blocks) else None
+        group["output_message"] = _assistant_of(reply["content"] if reply else blocks)
+        stop = next((_message(row).get("stop_reason") for row in reversed(own) if _message(row).get("stop_reason")), None)
+        if stop:
+            group["finish_reason"] = str(stop)
+        logged = exact.get(str(own[0].get("requestRef") or ""))
+        if logged is not None:
+            sent = logged["messages"]
+            if logged["system"]:
+                group["system_instructions"] = logged["system"]
+            if logged["tools"]:
+                group["tool_definitions"] = logged["tools"]
+        else:
+            sent = _replayed(rows, own[0], own[0].get("isSidechain") is True)
+        group["input_messages"] = [converted for message in sent for converted in _converted(message)]
+
+
 def _model_event(seed: dict, assistant: dict, *, prompt: str) -> dict:
     item = {
         "v": 1,
@@ -327,6 +533,9 @@ def _model_event(seed: dict, assistant: dict, *, prompt: str) -> dict:
         item["tool_results"] = assistant["tool_results"]
     if assistant.get("agent_id"):
         item["agent_id"] = assistant["agent_id"]
+    for key in ("input_messages", "output_message", "system_instructions", "tool_definitions", "finish_reason"):
+        if assistant.get(key):
+            item[key] = assistant[key]
     start_ms = assistant.get("start_ms")
     end_ms = assistant.get("end_ms")
     if start_ms is not None:
@@ -380,7 +589,7 @@ def enrich_claude_events(
         rows: list[dict] = []
         since = min((_as_int(event.get("ts")) or 0 for event in source), default=0) or None
         for attempt in range(max(attempts, 1)):
-            rows = _records(path, since)
+            rows = _records(path, since, _COMPACT)
             found = _assistant_after(rows, prompt, anchor_ms=_as_int(anchor), end_ms=_as_int(end_ms), turn_id=turn_id)
             if found and (not final or _contains(rows, final)):
                 break
@@ -393,6 +602,7 @@ def enrich_claude_events(
         ]
         results.update(_tool_results(rows))
         _attach_results(assistants, {**_agent_answers(assistants, source), **results})
+        _add_context(rows, assistants)
         first_main = True
         for assistant in assistants:
             text = prompt if first_main else ""
@@ -459,6 +669,7 @@ def enrich_claude_events(
         sub_results = _tool_results(sub_rows)
         results.update(sub_results)
         _attach_results(groups, sub_results)
+        _add_context(sub_rows, groups)
         for index, assistant in enumerate(groups):
             assistant["agent_id"] = assistant.get("agent_id") or agent_id
             added.append(_model_event(seed, assistant, prompt=task if index == 0 else ""))
@@ -610,6 +821,7 @@ def _assistant_after(
                 group["model"] = model
             if calls:
                 _extend_calls(group, calls)
+            group["rows"].append(row)
             for key in keys:
                 index_by_id[key] = found
             if stamp is not None:
@@ -628,6 +840,7 @@ def _assistant_after(
             "end_ms": stamp if stamp is not None else start_ms,
             "agent_id": agent,
             "tool_calls": calls,
+            "rows": [row],
         }
         groups.append(group)
         for key in keys:

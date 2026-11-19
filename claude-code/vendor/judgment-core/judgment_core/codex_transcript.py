@@ -25,10 +25,15 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from judgment_core.messages import assistant_message, media_part, text_message, tool_message
 from judgment_core.rows import records as _records
 
 ENCRYPTED = "[encrypted]"
+# Stands in for the encrypted compaction item at the start of the history after a compaction.
+COMPACTION_PLACEHOLDER = "[Earlier conversation compacted by Codex; summary is encrypted by OpenAI]"
 _CALLS = ("function_call", "custom_tool_call", "local_shell_call")
+# The model's history restarts at a compaction. Rollout rows are compact JSON.
+_COMPACTED = b'"type":"compacted"'
 _DELEGATED = re.compile(r"<codex_delegation>.*?<input>(.*?)</input>", re.S)
 
 
@@ -148,7 +153,155 @@ def _turn_rows(rows: list[dict], turn_id: str, prompt: str, root_turn_id: str = 
 
 
 def _new_step() -> dict:
-    return {"text": "", "tool_calls": [], "tool_results": [], "received": [], "usage": None, "start_ms": None, "end_ms": None, "call_ms": {}}
+    return {
+        "text": "",
+        "tool_calls": [],
+        "tool_results": [],
+        "received": [],
+        "usage": None,
+        "start_ms": None,
+        "end_ms": None,
+        "call_ms": {},
+        "input": None,
+        "output": None,
+        "tools": None,
+    }
+
+
+def _parts(content: object) -> list[dict]:
+    """Message content as GenAI parts: text, and the images the model was shown."""
+    if isinstance(content, str):
+        return [{"type": "text", "content": content}]
+    parts = []
+    for block in content if isinstance(content, list) else []:
+        if isinstance(block, str):
+            parts.append({"type": "text", "content": block})
+        elif not isinstance(block, dict):
+            continue
+        elif block.get("type") == "encrypted_content":
+            parts.append({"type": "text", "content": ENCRYPTED})
+        elif block.get("type") == "input_image" and block.get("image_url"):
+            parts.append(media_part("image", str(block["image_url"])))
+        elif block.get("text") is not None:
+            parts.append({"type": "text", "content": str(block["text"])})
+    return parts
+
+
+def _tool_output(output: object) -> object:
+    """A call's output as the model read it. Text joins into one string; output with images keeps its parts."""
+    if not isinstance(output, list):
+        return output if output is not None else ""
+    parts = _parts(output)
+    if all(part["type"] == "text" for part in parts):
+        return _content_text(output)
+    return parts
+
+
+def _call(payload: dict) -> dict:
+    kind = payload.get("type")
+    call_id = str(payload.get("call_id") or payload.get("id") or "")
+    if kind == "local_shell_call":
+        action = payload.get("action") if isinstance(payload.get("action"), dict) else {}
+        return {"id": call_id, "name": "local_shell", "arguments": action}
+    raw = payload.get("arguments") if kind == "function_call" else payload.get("input")
+    return {"id": call_id, "name": str(payload.get("name") or "tool"), "arguments": _arguments(raw)}
+
+
+def _tool_definitions(payload: dict) -> list[dict]:
+    """``additional_tools`` as AI SDK tool definitions. Namespaces are flattened; a freeform tool is a provider tool."""
+    found: list[dict] = []
+
+    def walk(tools: object) -> None:
+        for tool in tools if isinstance(tools, list) else []:
+            if not isinstance(tool, dict):
+                continue
+            kind = str(tool.get("type") or "")
+            if kind == "namespace":
+                walk(tool.get("tools"))
+            elif kind == "function":
+                item = {"type": "function", "name": str(tool.get("name") or "")}
+                if tool.get("description"):
+                    item["description"] = str(tool["description"])
+                item["inputSchema"] = tool.get("parameters") if isinstance(tool.get("parameters"), dict) else {"type": "object"}
+                if isinstance(tool.get("strict"), bool):
+                    item["strict"] = tool["strict"]
+                found.append(item)
+            elif kind:
+                args = {key: value for key, value in tool.items() if key not in ("type", "name")}
+                found.append({"type": "provider", "id": f"openai.{kind}", "name": str(tool.get("name") or kind), "args": args})
+
+    walk(payload.get("tools"))
+    return found
+
+
+class _History:
+    """The model's input as the rollout records it: every history item, in order, since the last compaction.
+
+    One request's reasoning, text, and calls become one assistant message, the
+    same message its llm span reports as output.
+    """
+
+    def __init__(self) -> None:
+        self.messages: list[dict] = []
+        self.tools: list[dict] | None = None
+        self.reasoning: list[str] = []
+        self.text: list[str] = []
+        self.calls: list[dict] = []
+
+    def flush(self) -> dict | None:
+        if not (self.reasoning or self.text or self.calls):
+            return None
+        message = assistant_message("\n".join(self.text), self.calls, self.reasoning)
+        self.messages.append(message)
+        self.reasoning, self.text, self.calls = [], [], []
+        return message
+
+    def output(self, payload: dict) -> None:
+        kind = payload.get("type")
+        if kind == "reasoning":
+            # Only the readable summary. encrypted_content is opaque and never sent.
+            summary = payload.get("summary") if isinstance(payload.get("summary"), list) else []
+            self.reasoning.extend(str(item["text"]) for item in summary if isinstance(item, dict) and item.get("text"))
+        elif kind == "message":
+            text = _content_text(payload.get("content"))
+            if text:
+                self.text.append(text)
+        else:
+            self.calls.append(_call(payload))
+
+    def item(self, payload: dict) -> None:
+        """One history item that is not model output."""
+        kind = payload.get("type")
+        if kind == "additional_tools":
+            self.tools = _tool_definitions(payload)
+            return
+        if kind in ("reasoning", *_CALLS) or (kind == "message" and payload.get("role") == "assistant"):
+            self.output(payload)
+            return
+        self.flush()
+        if kind == "message":
+            role = {"developer": "system", "system": "system"}.get(str(payload.get("role") or ""), "user")
+            self.messages.append({"role": role, "parts": _parts(payload.get("content"))})
+        elif kind == "agent_message":
+            self.messages.append(text_message("user", _content_text(payload.get("content"))))
+        elif kind in ("function_call_output", "custom_tool_call_output"):
+            self.messages.append(tool_message(str(payload.get("call_id") or ""), _tool_output(payload.get("output"))))
+        elif kind == "compaction":
+            self.messages.append(text_message("user", COMPACTION_PLACEHOLDER))
+        # Ghost snapshots never reach the model.
+
+    def compact(self, payload: dict) -> None:
+        self.reasoning, self.text, self.calls = [], [], []
+        self.messages = []
+        replacement = payload.get("replacement_history")
+        if isinstance(replacement, list):
+            for item in replacement:
+                if isinstance(item, dict):
+                    self.item(item)
+            self.flush()
+        elif payload.get("message"):
+            # Older Codex keeps only a summary. The messages around it are not recorded.
+            self.messages.append(text_message("user", str(payload["message"])))
 
 
 def read_thread(path: Path | None, *, turn_id: str = "", prompt: str = "", root_turn_id: str = "", since_ms: int | None = None) -> dict:
@@ -159,22 +312,65 @@ def read_thread(path: Path | None, *, turn_id: str = "", prompt: str = "", root_
     ``spawned`` maps a spawn call id to the child thread id. ``complete`` turns
     true at ``task_complete``.
     """
-    rows = _records(path, since_ms)
+    rows = _records(path, since_ms, _COMPACTED)
     meta = next((_payload(row) for row in rows if row.get("type") == "session_meta"), {})
     agent_path = str(meta.get("agent_path") or "")
+    base = meta.get("base_instructions") if isinstance(meta.get("base_instructions"), dict) else {}
+    instructions = str(base.get("text") or "")
     chunk = _turn_rows(rows, turn_id, prompt, root_turn_id)
+    mine = {id(row) for row in chunk}
     model = next((str(_payload(row)["model"]) for row in chunk if row.get("type") == "turn_context" and _payload(row).get("model")), "")
-    thread = {"task": "", "task_name": agent_path.rsplit("/", 1)[-1], "model": model, "steps": [], "spawned": {}, "complete": False}
+    thread = {
+        "task": "",
+        "task_name": agent_path.rsplit("/", 1)[-1],
+        "model": model,
+        "steps": [],
+        "spawned": {},
+        "complete": False,
+        "instructions": instructions,
+    }
     by_record = not any(_usage(row) is not None and row.get("type") != "token_usage_record" for row in chunk)
+    history = _History()
     step = _new_step()
     last_input = None
-    for row in chunk:
+    last_total = None
+    for row in rows:
         payload = _payload(row)
         kind = str(payload.get("type") or "")
-        stamp = _stamp(row)
         is_record = row.get("type") == "token_usage_record"
+        if row.get("type") == "compacted":
+            history.compact(payload)
+        elif is_record:
+            # The request finished here, so its output is complete.
+            output = history.flush()
+            if output is not None and id(row) in mine:
+                step["output"] = output
+        elif row.get("type") == "response_item":
+            if kind in ("reasoning", "message", *_CALLS) and id(row) in mine and step["input"] is None:
+                if kind != "message" or payload.get("role") == "assistant":
+                    history.flush()
+                    step["input"] = list(history.messages)
+                    step["tools"] = history.tools
+            history.item(payload)
+        if id(row) not in mine:
+            if kind == "token_count":
+                last_total = (payload.get("info") or {}).get("total_token_usage") if isinstance(payload.get("info"), dict) else last_total
+            continue
+        stamp = _stamp(row)
         usage = _usage(row)
+        if kind == "token_count" and usage is not None:
+            total = payload["info"].get("total_token_usage")
+            # After a compaction Codex repeats the running total with no new request behind it.
+            if total is not None and total == last_total and step["input"] is None:
+                continue
+            last_total = total
         if usage is not None and is_record == by_record:
+            output = history.flush()
+            if output is not None:
+                step["output"] = output
+            if step["input"] is None:
+                step["input"] = list(history.messages)
+                step["tools"] = history.tools
             step["usage"] = usage
             step["end_ms"] = step["end_ms"] or stamp
             step["start_ms"] = step["start_ms"] if step["start_ms"] is not None else last_input
@@ -182,8 +378,9 @@ def read_thread(path: Path | None, *, turn_id: str = "", prompt: str = "", root_
             step = _new_step()
             last_input = stamp
         elif is_record:
-            # The request finished here. Its token_count waits for the tool outputs.
-            step["end_ms"] = step["end_ms"] or stamp
+            # The request finished here. Its token_count waits for the tool outputs. A compaction request has no output.
+            if step["input"] is not None:
+                step["end_ms"] = step["end_ms"] or stamp
         elif kind == "task_complete":
             thread["complete"] = True
         elif kind == "task_started":
@@ -219,15 +416,9 @@ def read_thread(path: Path | None, *, turn_id: str = "", prompt: str = "", root_
                 if text:
                     step["text"] = f"{step['text']}\n{text}" if step["text"] else text
             elif kind in _CALLS:
-                call_id = str(payload.get("call_id") or payload.get("id") or "")
-                if kind == "local_shell_call":
-                    action = payload.get("action") if isinstance(payload.get("action"), dict) else {}
-                    call = {"id": call_id, "name": "local_shell", "arguments": action}
-                else:
-                    raw = payload.get("arguments") if kind == "function_call" else payload.get("input")
-                    call = {"id": call_id, "name": str(payload.get("name") or "tool"), "arguments": _arguments(raw)}
+                call = _call(payload)
                 step["tool_calls"].append(call)
-                step["call_ms"][call_id] = (stamp, stamp)
+                step["call_ms"][call["id"]] = (stamp, stamp)
     # Rows after the last token_count belong to a request still running. A later send picks it up.
     return thread
 
@@ -264,6 +455,15 @@ def _model_events(thread: dict, seed: dict, agent_id: str, model: str) -> list[d
         }
         if step["received"]:
             item["received"] = step["received"]
+        if step["input"] is not None:
+            item["input_messages"] = step["input"]
+            item["output_message"] = step["output"] or assistant_message(step["text"], step["tool_calls"])
+            if step["tools"]:
+                item["tool_definitions"] = step["tools"]
+            # Some models read the instructions as the first developer message instead.
+            instructions = thread["instructions"]
+            if instructions and not any(message["role"] == "system" and message["parts"] == [{"type": "text", "content": instructions}] for message in step["input"]):
+                item["system_instructions"] = instructions
         if agent_id:
             item["agent_id"] = agent_id
         end = step["end_ms"] if step["end_ms"] is not None else step["start_ms"]
