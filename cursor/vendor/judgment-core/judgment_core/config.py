@@ -9,7 +9,7 @@ from pathlib import Path
 from judgment_core.optin import config_dir
 
 DEFAULT_API_URL = "https://api.judgmentlabs.ai"
-_KEYS = ("JUDGMENT_API_KEY", "JUDGMENT_PROJECT_ID", "JUDGMENT_ORG_ID", "JUDGMENT_API_URL")
+_KEYS = ("JUDGMENT_API_KEY", "JUDGMENT_PROJECT_ID", "JUDGMENT_ORG_ID", "JUDGMENT_API_URL", "JUDGMENT_CUSTOMER_USER_ID")
 
 
 def parse_credentials(text: str) -> dict[str, str]:

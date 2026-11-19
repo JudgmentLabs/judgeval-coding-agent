@@ -752,6 +752,13 @@ def _prune(state: Path, index: dict) -> None:
         index.pop(key, None)
     if old:
         _private_write(state / "index.json", json.dumps(index))
+    # The person a hook saved for each session. A session back after this long is resolved again.
+    for path in (state / "users").glob("*"):
+        try:
+            if path.stat().st_mtime * 1000 < cutoff:
+                path.unlink()
+        except OSError:
+            pass
 
 
 def _detach() -> None:
