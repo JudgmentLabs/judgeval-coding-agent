@@ -307,6 +307,13 @@ class Truncation(Case):
         self.assertNotIn("a" * 1000, self.sb.state_text() + self.sink.text())
         self.assertIn("PRIVATE-NOTE", self.sink.text(), "the rest of the turn is sent")
 
+    def test_an_input_too_large_to_check_against_the_projects_files_hides_its_result(self):
+        spooler = module("spooler")
+        self.sb.set_tracing({"enabled": True, "redactPaths": ["secrets/*"]})
+        self.fire(self.tool_turn({"command": "echo " + "a" * spooler.FIELD_CAP}, "PRIVATE-NOTE-" + "x" * 40).events)
+        tool = next(event for event in self.sb.inbox() if event["event"] == "tool")
+        self.assertEqual((tool["tool_input"], tool["tool_output"]), (spooler.OMITTED, spooler.OMITTED))
+
 
 class Structured(Case):
     def test_non_string_keys_are_normalized_under_full_capture(self):

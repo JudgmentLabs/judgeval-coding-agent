@@ -850,9 +850,9 @@ def redact_events(events: list[dict], rs: Ruleset, secrets: list[tuple[str, str]
     (``blank_calls``) and each input message its requests repeat scrubbed once.
 
     Every request replays the messages before it, so redacting each event alone costs the square of the turn's length.
-    Here the redacted fields of every event, with each distinct input message once, are scrubbed together: a text found
-    anywhere in the turn is replaced everywhere in it. Each event's records count what was replaced in its own fields,
-    an input message as often as the event holds it. When the turn as a whole hits a limit, each event is redacted
+    Here the redacted fields of every event, with each distinct value once (an input message, a system prompt, a tool
+    list), are scrubbed together: a text found anywhere in the turn is replaced everywhere in it. Each event's records
+    count what was replaced in its own fields, an input message as often as the event holds it. When the turn as a whole hits a limit, each event is redacted
     alone, so one event's limit costs only its own text, as before.
     """
     if rs.error:
@@ -861,18 +861,20 @@ def redact_events(events: list[dict], rs: Ruleset, secrets: list[tuple[str, str]
     events = blank_calls(events, rs)
     if not any(isinstance(event.get("input_messages"), list) for event in events):
         return [redact_event(event, rs, secrets) for event in events]
+    # Each event's redacted fields as the pooled values they are made of: an input message, or a whole other field. A
+    # value two events share (a message every later request replays, the system prompt, the tool list) is scrubbed once.
     pool: dict[str, str] = {}
     fields: dict[str, Any] = {}
-    for number, event in enumerate(events):
-        for key, value in event.items():
-            if not field_class(key)["redact"]:
-                continue
-            if key == "input_messages" and isinstance(value, list):
-                for message in value:
-                    pool.setdefault(jq_json(message), f"input_messages.{len(pool)}")
-                    fields.setdefault(pool[jq_json(message)], message)
-            else:
-                fields[f"{number}.{key}"] = value
+    parts: list[dict[str, list[str] | str]] = []
+
+    def pooled(value: Any) -> str:
+        name = pool.setdefault(jq_json(value), f"v{len(pool)}")
+        fields.setdefault(name, value)
+        return name
+
+    for event in events:
+        parts.append({key: [pooled(message) for message in value] if key == "input_messages" and isinstance(value, list) else pooled(value)
+                      for key, value in event.items() if field_class(key)["redact"]})
     try:
         scrubbed, records = scrub_fields(fields, rs, secrets, sender_budget())
     except RedactionLimit:
@@ -881,19 +883,12 @@ def redact_events(events: list[dict], rs: Ruleset, secrets: list[tuple[str, str]
     for item in records:
         found.setdefault(item["field"], []).append(item)
     out = []
-    for number, event in enumerate(events):
+    for event, names in zip(events, parts):
         result = dict(event)
         own: list[dict] = []
-        for key, value in event.items():
-            if not field_class(key)["redact"]:
-                continue
-            if key == "input_messages" and isinstance(value, list):
-                names = [pool[jq_json(message)] for message in value]
-                result[key] = [scrubbed[name] for name in names]
-                own += [{**item, "field": key} for name in names for item in found.get(name, [])]
-            else:
-                result[key] = scrubbed[f"{number}.{key}"]
-                own += [{**item, "field": key} for item in found.get(f"{number}.{key}", [])]
+        for key, name in names.items():
+            result[key] = [scrubbed[item] for item in name] if isinstance(name, list) else scrubbed[name]
+            own += [{**item, "field": key} for one in (name if isinstance(name, list) else [name]) for item in found.get(one, [])]
         out.append(_with_env(_with_records(result, own), env_found(event, secrets)))
     return out
 
@@ -1003,7 +998,7 @@ def _call_sites(event: Mapping) -> Iterator[tuple[str, bool, Any, Any, dict, tup
     call_id = event.get("tool_call_id")
     if event.get("tool_input") is not None:
         yield "tool_input", False, call_id, event.get("tool_name"), event, ("tool_input",)
-    if event.get("tool_output") not in (None, "", False):
+    if _alt(event.get("tool_output"), "") != "":  # as jq: (.tool_output // "") != ""
         yield "tool_output", True, call_id, event.get("tool_name"), event, ("tool_output",)
     for field, is_result, keys in (("tool_calls", False, CALL_ARGUMENTS), ("tool_results", True, ("response",))):
         items = event.get(field)

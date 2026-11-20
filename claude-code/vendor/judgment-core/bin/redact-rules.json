@@ -297,6 +297,13 @@
     "keys": {
       "file_path": "path",
       "filePath": "path",
+      "filepath": "path",
+      "uri": "path",
+      "dir": "path",
+      "directory": "path",
+      "folder": "path",
+      "cwd": "path",
+      "workdir": "path",
       "path": "path",
       "paths": "path",
       "file": "path",

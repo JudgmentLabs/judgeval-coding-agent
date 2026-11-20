@@ -648,6 +648,8 @@ def _history(state: Path, index: dict, key: str, dest: str) -> list[list[dict]]:
             messages = json.loads(text)
         except (OSError, ValueError):
             continue
+        if not isinstance(messages, list):
+            continue
         size = len(text)
         if skipped or size > budget:
             skipped += 1

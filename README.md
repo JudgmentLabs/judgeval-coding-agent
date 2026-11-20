@@ -100,7 +100,20 @@ A regex runs in both Oniguruma (the hook's jq) and Python's `re` (the sender), s
 
 ### List what to hide
 
-Judgment redacts known token formats, values after secret names, and secret environment values without any setup. It doesn't know which of a project's files or commands hold secrets. So a secret with no known format and no secret name before it, such as `SESSION_COOKIE=...` in a `.env` file, is sent unless the project says where it lives.
+The defaults catch secrets that look like secrets. They don't know which of a project's files or commands hold one, so check this table against the project before the first traced session:
+
+| What holds the secret | Redacted without setup | What to add |
+| --- | --- | --- |
+| A known token format, such as an OpenAI, Anthropic, GitHub, AWS, Slack, or Stripe key, a JWT, a private key block, or a URL password | Yes | Nothing |
+| A value after a secret name, such as `password`, `token`, `secret`, `api_key`, or `ENCRYPTION_KEY=` | Yes | Nothing |
+| A secret-named environment variable's value, wherever it appears | Yes | Nothing |
+| A value under another name, such as `SESSION_COOKIE=...` or `SIGNING_SALT=...` | No | The name, in `redactNames` |
+| A token format of your own, such as an internal service key or a customer id | No | A regex, in `redactPatterns` |
+| A file whose contents are secret whatever they look like, such as `.env`, `.netrc`, or a kube config | No | A glob, in `redactPaths` |
+| A command that prints a secret bare, such as `aws configure get aws_secret_access_key` or `kubectl get secret` | No | A regex, in `redactCommands` |
+| A file attached to a prompt with `@`, or text the agent puts in every request, such as `CLAUDE.md` | No | Nothing covers it. Keep secrets out of both. |
+
+[Secrets are redacted by default](#secrets-are-redacted-by-default) has the exact rules, and [Known limits](#known-limits) lists what they miss.
 
 List those places when you create `.judgment/tracing.json`. A coding agent that sets tracing up does these steps too, and shows the person the list before it writes the file:
 
@@ -175,7 +188,7 @@ Each trace carries the following:
 
 - The agent's name and version, the model names, token counts, cost, timing, and session and turn ids.
 - The tool names, and the name of the folder the agent runs in. The full path stays on your machine, because it holds your account name. The name is left out when the agent runs in your home folder.
-- With `capture` set to `sanitized` or `full`, the text: prompts, answers, reasoning, every model call's messages, tool arguments and results, and subagent tasks.
+- With `capture` set to `sanitized` or `full`, the text: prompts, answers, reasoning, every model call's messages, system prompt, and tool list, tool arguments and results, and subagent tasks.
 
 ### Secrets are redacted by default
 

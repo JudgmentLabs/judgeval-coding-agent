@@ -430,6 +430,10 @@ def prepare(record: dict, gate: Gate) -> dict:
         rs = rules(gate)
         secrets = list(gate.secrets)
         try:
+            if (rs.paths or rs.commands) and "tool_input" in (record.get("omitted") or ()) and record.get("tool_output"):
+                # An input too large to redact cannot be checked against redactPaths and redactCommands either, so its
+                # result is not sent.
+                record = {**record, "tool_output": record["tool_input"]}
             out = redact.sanitize_event(record, rs, secrets, gate.capture)
             out = _cut_all(_meta(out, rs, secrets))
         except Exception:  # anything unexpected drops the record's text, never sends it raw

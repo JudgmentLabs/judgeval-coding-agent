@@ -420,6 +420,8 @@ def _exact_requests(rows: list[dict]) -> tuple[dict[str, dict], dict[tuple[str, 
         message = _message(row)
         if _role(row) == "user":
             content = message.get("content")
+            # ponytail: every user row re-hashes the run so far, the square of a run with no reply in it. Runs are short
+            # in real transcripts; cap the run if one ever is not.
             run = run + ([{"type": "text", "text": content}] if isinstance(content, str) else content if isinstance(content, list) else [])
             for form in (message, {"role": "user", "content": run}):
                 blobs.setdefault(_blob_hash(form), form)
