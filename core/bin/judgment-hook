@@ -102,6 +102,11 @@ if [ -f "$STATE/sessions/$sid" ]; then
   read -r mode < "$STATE/sessions/$sid" || true
 fi
 
+# Trimmed as judgment_core.config reads it, so a blank value falls through to the credentials file, then to git.
+JUDGMENT_CUSTOMER_USER_ID=${JUDGMENT_CUSTOMER_USER_ID:-}
+JUDGMENT_CUSTOMER_USER_ID=${JUDGMENT_CUSTOMER_USER_ID#"${JUDGMENT_CUSTOMER_USER_ID%%[![:space:]]*}"}
+JUDGMENT_CUSTOMER_USER_ID=${JUDGMENT_CUSTOMER_USER_ID%"${JUDGMENT_CUSTOMER_USER_ID##*[![:space:]]}"}
+
 STAMP=""
 # The env wins. A credentials file fills only what the env left empty, as the flusher reads it. The key is never written out.
 if [ -z "${JUDGMENT_API_KEY:-}" ] || [ -z "${JUDGMENT_PROJECT_ID:-}" ] || [ -z "${JUDGMENT_ORG_ID:-}" ] || [ -z "${JUDGMENT_API_URL:-}" ] || [ -z "${JUDGMENT_CUSTOMER_USER_ID:-}" ]; then
@@ -155,18 +160,32 @@ fi
 
 USER_STAMP=""
 user_done=0
-# The person running the agent. The session's first recorded event resolves it and saves it, so later
-# events don't run git and a config change never relabels a session already queued.
+# The person running the agent, redacted by the project's rules like any label. The session's first recorded event
+# resolves it and saves it redacted, so later events don't run git and a config change never relabels a session already
+# queued. Only an event that will be recorded with its labels resolves it: git never runs for a command, an untraced
+# session, or an event whose redaction failed.
 stamp_customer_user() {
   user_done=1
   userfile=$STATE/users/$sid
   # A file another hook is still writing has no newline yet: read fails, and this event resolves the person itself.
-  if ! { [ -f "$userfile" ] && read -r user < "$userfile"; } 2>/dev/null; then
-    user=${JUDGMENT_CUSTOMER_USER_ID:-}
-    [ -n "$user" ] || user=$(git config --global user.email 2>/dev/null) || user=
+  if ! { [ -f "$userfile" ] && IFS= read -r user < "$userfile"; } 2>/dev/null; then
+    user=$JUDGMENT_CUSTOMER_USER_ID
+    if [ -z "$user" ]; then
+      user=$(git config --global user.email 2>/dev/null) || user=
+      user=${user#"${user%%[![:space:]]*}"}
+      user=${user%"${user##*[![:space:]]}"}
+    fi
     case $user in
       *[[:cntrl:]]*) user= ;;
     esac
+    # Nothing raw reaches the disk: a value the rules fail on is dropped, not kept.
+    if [ -n "$user" ]; then
+      user=$(JUDGMENT_API_KEY=${JUDGMENT_API_KEY:-} jq -L "$HERE_HOOK" -nr --slurpfile cfg "$opt" --arg user "$user" \
+        'include "prepare"; include "redact-replace"; include "redact-structured";
+         judgment_label($cfg[0]; "customer_user_id"; $user)
+         | if type == "array" then .[0] | js_resume(jr_replace; jp_rescrub(jr_replace)) else . end
+         | if .redaction_error then empty else .customer_user_id // empty end' 2>/dev/null) || user=
+    fi
     # The first event of the session writes the file; set -C keeps a later one from rewriting it.
     if [ -d "$STATE/users" ] || mkdir -p "$STATE/users"; then
       set -C
@@ -213,6 +232,8 @@ record() {
   esac
   case $line in
     *'"export_fp":'*) ;;
+    # An event whose redaction failed keeps no label (redact.outcome), so it carries no person.
+    *'"redaction_error":true'*) line="${line%?}${STAMP}}" ;;
     *)
       [ "$user_done" -eq 1 ] || stamp_customer_user
       line="${line%?}${STAMP}${USER_STAMP}}"

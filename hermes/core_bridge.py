@@ -198,12 +198,14 @@ def _export(env: dict) -> list:
     return pairs
 
 
+_GIT_ENV = ("HOME", "XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL")
+
+
 @functools.lru_cache(maxsize=8)
-def _git_email(home: str, xdg: str) -> str:
-    """``git config --global user.email`` for this home, read once per process."""
-    env = {key: value for key, value in os.environ.items() if key not in ("HOME", "XDG_CONFIG_HOME")}
-    env.update({"HOME": home} if home else {})
-    env.update({"XDG_CONFIG_HOME": xdg} if xdg else {})
+def _git_email(home: str, xdg: str, global_config: str) -> str:
+    """``git config --global user.email`` for this home and global config file, read once per process."""
+    env = {key: value for key, value in os.environ.items() if key not in _GIT_ENV}
+    env.update((key, value) for key, value in zip(_GIT_ENV, (home, xdg, global_config)) if value)
     try:
         done = subprocess.run(["git", "config", "--global", "user.email"], capture_output=True, text=True, timeout=2, env=env)
     except (OSError, subprocess.SubprocessError):
@@ -213,7 +215,7 @@ def _git_email(home: str, xdg: str) -> str:
 
 def customer_user(env: dict) -> str:
     """The person running the agent: JUDGMENT_CUSTOMER_USER_ID from the env or the credentials file, else git's global email."""
-    user = load_credentials(env).get("JUDGMENT_CUSTOMER_USER_ID", "") or _git_email(env.get("HOME", ""), env.get("XDG_CONFIG_HOME", ""))
+    user = load_credentials(env).get("JUDGMENT_CUSTOMER_USER_ID", "") or _git_email(*(env.get(key, "") for key in _GIT_ENV))
     return "" if any(ord(char) < 32 or ord(char) == 127 for char in user) else user
 
 
@@ -448,7 +450,9 @@ def prepare(record: dict, gate: Gate) -> dict:
     out["capture"] = gate.capture
     if not isinstance(out.get("ts"), (int, float)):
         out["ts"] = int(time.time() * 1000)
-    out.update(gate.stamps)
+    # An event whose redaction failed keeps no label (redact.outcome): it carries no customer_user_id.
+    failed = bool(out.get("redaction_error"))
+    out.update((name, value) for name, value in gate.stamps if not (failed and redact.field_class(name)["redact"]))
     return out
 
 

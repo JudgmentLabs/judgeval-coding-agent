@@ -278,6 +278,11 @@ def jp_rescrub(finish): . as $a | $a.event | jp_scrub($a.policy; $a.rules; finis
 # here is flat and the program that needs two of them includes both.
 
 def judgment_redact($c; $capture): jp_redact($c; $capture; [.]);
+# A label the hook stamps on every event (customer_user_id), as it may be stored: redacted by the project's rules under
+# every capture, so its raw value never reaches the disk. A frame when it has finds to replace; a redaction_error event,
+# without the label, when a rule fails.
+def judgment_label($cfg; $name; $value):
+  {($name): $value} | jp_redact(if ($cfg | type) == "object" then $cfg else {} end; "sanitized"; [.]);
 def judgment_prepare($cfg; $mode; $root; $model):
   .bind_task as $task
   | (if .harness == "cursor" and .event == "turn_start" then (.prompt | strings | jp_trim) // "" else "" end) as $prompt

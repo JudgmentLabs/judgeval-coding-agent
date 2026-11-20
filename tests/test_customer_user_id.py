@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,8 +21,9 @@ os.environ["JUDGMENT_FLUSH_GRACE_MS"] = "0"
 sys.path.insert(0, str(ROOT / "core"))
 
 from fake_sink import attrs  # noqa: E402
-from hermes_support import Case, new_session_id  # noqa: E402
-from judgment_core import flush  # noqa: E402
+from hermes_support import Case, load_plugin, new_session_id  # noqa: E402
+from judgment_core import flush, redact  # noqa: E402
+from unittest import mock  # noqa: E402
 
 KEY = "judgment.customer_user_id"
 
@@ -57,6 +59,7 @@ class CustomerUserIdTest(unittest.TestCase):
     def setUp(self) -> None:
         Collector.statuses, Collector.bodies = [], []
         self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.home = self.tmp / "home"
         self.project = self.tmp / "project"
         self.config = self.tmp / "config"
@@ -189,6 +192,80 @@ class CustomerUserIdTest(unittest.TestCase):
         self.export()
         self.assert_person(self.spans()["s1"], "[REDACTED:custom]")
 
+    def inbox(self) -> list[dict]:
+        return [json.loads(path.read_text()) for path in sorted((self.tmp / "state" / "inbox").glob("*.json"))]
+
+    def state_text(self) -> str:
+        return "\n".join(path.read_text(errors="replace") for path in (self.tmp / "state").rglob("*") if path.is_file())
+
+    def test_an_event_whose_redaction_failed_carries_no_person(self) -> None:
+        self.optin({"enabled": True, "redactPatterns": ["("]})  # an invalid regex: every event fails closed
+        self.env["JUDGMENT_CUSTOMER_USER_ID"] = "alice@example.com"
+        self.pi_turn("s1", "t1", 1_000)
+        events = self.inbox()
+        self.assertTrue(events)
+        for event in events:
+            self.assertTrue(event["redaction_error"])
+            self.assertNotIn("customer_user_id", event)
+            self.assertEqual(redact.outcome(event), "error")
+        self.assertNotIn("alice@example.com", self.state_text())
+
+    def test_pi_without_jq_carries_no_person(self) -> None:
+        tools = self.tmp / "tools"
+        tools.mkdir()
+        for name in ("sh", "cat", "tr", "mkdir", "sha256sum", "python3", "rm", "git"):
+            found = shutil.which(name)
+            if found:
+                os.symlink(found, tools / name)
+        self.pi_turn("s1", "t1", 1_000, {**self.env, "PATH": str(tools), "JUDGMENT_CUSTOMER_USER_ID": "alice@example.com"})
+        events = self.inbox()
+        self.assertTrue(events)
+        for event in events:
+            self.assertTrue(event["redaction_error"])
+            self.assertNotIn("customer_user_id", event)
+            self.assertEqual(redact.outcome(event), "error")
+        self.assertNotIn("alice@example.com", self.state_text())
+
+    def test_a_redacted_person_never_reaches_the_disk(self) -> None:
+        self.env["JUDGMENT_CUSTOMER_USER_ID"] = "alice@example.com"
+        for capture in ("sanitized", "metadata", "full"):
+            with self.subTest(capture=capture):
+                self.optin({"enabled": True, "capture": capture, "redactPatterns": ["[a-z]+@example[.]com"]})
+                session = f"s-{capture}"
+                self.pi_turn(session, "t1", 1_000)
+                inbox = self.inbox()
+                self.assertTrue(inbox)
+                self.assertEqual({event.get("customer_user_id") for event in inbox}, {"[REDACTED:custom]"})
+                Collector.statuses = [503] * flush.ATTEMPTS
+                self.assertEqual(self.export(), -1)  # the send fails, so the turn stays on disk under turns/
+                self.assertTrue(list((self.tmp / "state" / "turns").rglob("*.jsonl")))
+                self.assertNotIn("alice@example.com", self.state_text())
+                Collector.statuses = []
+                self.assertEqual(self.export(), 1)
+                self.assert_person(self.spans()[session], "[REDACTED:custom]")
+
+    def test_whitespace_around_the_env_value_is_trimmed_on_every_event(self) -> None:
+        self.env["JUDGMENT_CUSTOMER_USER_ID"] = "  alice@example.com \t"
+        self.pi_turn("s1", "t1", 1_000)
+        self.assertEqual({event["customer_user_id"] for event in self.inbox()}, {"alice@example.com"})
+        self.export()
+        self.assert_person(self.spans()["s1"], "alice@example.com")
+
+    def test_a_blank_env_value_falls_back_on_every_event(self) -> None:
+        subprocess.run(["git", "config", "--global", "user.email", "carol@example.com"], env=self.env, check=True)
+        self.env["JUDGMENT_CUSTOMER_USER_ID"] = "   "
+        self.pi_turn("s1", "t1", 1_000)
+        self.assertEqual({event["customer_user_id"] for event in self.inbox()}, {"carol@example.com"})
+        self.export()
+        self.assert_person(self.spans()["s1"], "carol@example.com")
+
+    def test_a_blank_env_value_falls_back_to_the_credentials_file(self) -> None:
+        (self.config / "credentials").write_text("JUDGMENT_CUSTOMER_USER_ID=from-file\n")
+        self.env["JUDGMENT_CUSTOMER_USER_ID"] = "  "
+        self.pi_turn("s1", "t1", 1_000)
+        self.export()
+        self.assert_person(self.spans()["s1"], "from-file")
+
     def test_no_person_sends_no_attribute(self) -> None:
         self.pi_turn("s1", "t1", 1_000)
         self.export()
@@ -211,6 +288,32 @@ class HermesTest(Case):
         (self.sb.home / ".gitconfig").write_text("[user]\n\temail = carol@example.com\n")
         self.fire(self.simple(new_session_id()).events)
         self.assert_person("carol@example.com")
+
+    def test_git_config_global_comes_from_the_profile_env(self) -> None:
+        core = load_plugin().core
+        core._git_email.cache_clear()
+        self.addCleanup(core._git_email.cache_clear)
+        config = self.sb.home / "profile.gitconfig"
+        config.write_text("[user]\n\temail = dave@example.com\n")
+        (self.sb.home / ".gitconfig").write_text("[user]\n\temail = carol@example.com\n")
+        env = {"HOME": str(self.sb.home), "JUDGMENT_CONFIG_DIR": str(self.sb.home / "no-config")}
+        self.assertEqual(core.customer_user({**env, "GIT_CONFIG_GLOBAL": str(config)}), "dave@example.com")
+        # A GIT_CONFIG_GLOBAL inherited by the process is not the profile's: it is not used.
+        with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(config)}):
+            self.assertEqual(core.customer_user(env), "carol@example.com")
+
+    def test_a_record_whose_redaction_failed_carries_no_person(self) -> None:
+        core = load_plugin().core
+        stamps = (("environment", "production"), ("project_root", "/p"), ("customer_user_id", "alice@example.com"))
+        gate = core.Gate("sanitized", core.settings({}), (), "/nonexistent", stamps)
+        record = {"v": 1, "harness": "hermes", "event": "turn_start", "session_id": "s", "turn_id": "t", "ts": 1, "prompt": "hi"}
+        self.assertEqual(core.prepare(record, gate)["customer_user_id"], "alice@example.com")
+        with mock.patch.object(core.redact, "sanitize_event", side_effect=RuntimeError("boom")):
+            out = core.prepare(record, gate)
+        self.assertTrue(out["redaction_error"])
+        self.assertNotIn("customer_user_id", out)
+        self.assertEqual(out["environment"], "production")
+        self.assertEqual(core.redact.outcome(out), "error")
 
 
 if __name__ == "__main__":
