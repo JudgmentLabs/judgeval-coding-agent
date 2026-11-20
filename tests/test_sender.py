@@ -348,6 +348,25 @@ class HistoryAuditTests(unittest.TestCase):
                      for scope in resource["scopeSpans"] for span in scope["spans"]]
             self.assertNotIn("agent.workspace_name", attrs(roots(spans)[0]))
 
+    def test_metadata_capture_keeps_the_project_path_local(self):
+        """The queue needs the path to find the project's rules. Nothing sent may hold it."""
+        with Sink() as sink:
+            sb = Sandbox(sink_url=sink.url)
+            self.addCleanup(sb.cleanup)
+            sb.set_tracing({"enabled": True, "capture": "metadata"})
+            start = int(time.time() * 1000) - 60_000
+            for _, payload in pi_turn(str(sb.project), "metadata-path", "t1", start,
+                                      prompt="hello", answer="done", command="ls", output="ordinary"):
+                self.assertEqual(sb.hook("pi", "", payload).returncode, 0)
+            queued = sb.inbox()
+            self.assertEqual({event["capture"] for event in queued}, {"metadata"})
+            self.assertEqual({event["project_root"] for event in queued}, {str(sb.project)})
+            self.assertEqual(sb.flush().returncode, 0)
+            self.assertTrue(sink.requests)
+            body = "".join(request["body"] for request in sink.requests)
+            self.assertNotIn(str(sb.project), body)
+            self.assertNotIn("agent.workspace_name", attrs(roots(sink.spans())[0]))
+
     def test_history_redactions_are_on_the_root(self):
         token = SECRETS["github_token"]["core"]
         with Sink() as sink:
