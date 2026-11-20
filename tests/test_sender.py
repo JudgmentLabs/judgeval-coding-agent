@@ -1,8 +1,8 @@
 """The sender and the hook as a system: what the regression table's rows cannot say.
 
-Rows in tests/regressions.json cover what each rule replaces or blanks. These cover what happens around the rules: a
-turn made sensitive after it was sent, the sender surviving the agent, earlier turns' text as history, text read back
-from a transcript when the hook and the sender hold different environments, and labels as span names.
+Rows in tests/regressions.json cover what each rule replaces. These cover what happens around the rules: the sender
+surviving the agent, earlier turns' text as history, text read back from a transcript when the hook and the sender hold
+different environments, and labels as span names.
 
 Every fake secret is built at runtime from parts, so no file holds one.
 """
@@ -52,57 +52,22 @@ class LabelTests(unittest.TestCase):
 
     def test_label_never_becomes_a_span_name(self):
         secret = SECRETS["github_token"]["core"]
-        for blanked in (False, True):
-            with self.subTest(blanked=blanked), Sink() as sink:
-                sb = Sandbox(sink_url=sink.url)
-                self.addCleanup(sb.cleanup)
-                t0 = int(time.time() * 1000) - 5000
-                base = {"v": 1, "harness": "pi", "session_id": "lb-1", "turn_id": "lb-1:1", "cwd": str(sb.project), **stamp(sb, sink.url)}
-                tool_input = {"file_path": str(sb.project / ".env")} if blanked else {"command": "make"}
-                inject(sb, [
-                    {**base, "event": "turn_start", "prompt": "split the work", "ts": t0},
-                    {**base, "event": "subagent_start", "agent_id": "a1", "agent_type": "worker", "agent_name": "Rotate " + secret, "ts": t0 + 10},
-                    {**base, "event": "tool", "tool_name": "read", "tool_call_id": "c1", "tool_input": tool_input, "tool_output": "A=1", "ts": t0 + 20},
-                    {**base, "event": "subagent_end", "agent_id": "a1", "agent_type": "worker", "agent_name": "Rotate " + secret, "output": "done", "ts": t0 + 30},
-                    {**base, "event": "turn_end", "output": "ok", "ts": t0 + 40},
-                ])
-                self.assertEqual(sb.flush().returncode, 0)
-                self.assertTrue(sink.requests)
-                self.assertEqual(whole_leaks(sink.text() + sb.state_text()), [])
-                names = [span["name"] for span in sink.spans()]
-                if blanked:
-                    self.assertFalse([name for name in names if "Rotate" in name], names)
-                else:
-                    self.assertIn("Rotate [REDACTED:github_token]", names)
-
-
-class DetectBeforeRedactTests(unittest.TestCase):
-    """The sender redacted first, so .env.<token> became .env.[REDACTED:...] and was not seen as sensitive."""
-
-    def test_transcript_only_read_blanks_the_turn(self):
         with Sink() as sink:
             sb = Sandbox(sink_url=sink.url)
             self.addCleanup(sb.cleanup)
-            token = SECRETS["github_token"]["core"]
-            leftover = "Lv" + _rand(18)  # matches no rule: only blanking keeps it out
-            transcript = sb.home / "t.jsonl"
-            start = int(time.time() * 1000) - 60_000
-            claude_transcript(transcript, "dr-1", "p1", "show me the file", start, "p1-tool", "cat .env." + token, "VALUE=" + leftover, "It holds VALUE.")
-            base = {"session_id": "dr-1", "cwd": str(sb.project), "transcript_path": str(transcript), "prompt_id": "p1"}
-            for event, payload in (("UserPromptSubmit", {**base, "prompt": "show me the file"}), ("Stop", {**base, "last_assistant_message": "It holds VALUE."})):
-                self.assertEqual(sb.hook("claude", event, payload).returncode, 0)
+            t0 = int(time.time() * 1000) - 5000
+            base = {"v": 1, "harness": "pi", "session_id": "lb-1", "turn_id": "lb-1:1", "cwd": str(sb.project), **stamp(sb, sink.url)}
+            inject(sb, [
+                {**base, "event": "turn_start", "prompt": "split the work", "ts": t0},
+                {**base, "event": "subagent_start", "agent_id": "a1", "agent_type": "worker", "agent_name": "Rotate " + secret, "ts": t0 + 10},
+                {**base, "event": "tool", "tool_name": "read", "tool_call_id": "c1", "tool_input": {"command": "make"}, "tool_output": "A=1", "ts": t0 + 20},
+                {**base, "event": "subagent_end", "agent_id": "a1", "agent_type": "worker", "agent_name": "Rotate " + secret, "output": "done", "ts": t0 + 30},
+                {**base, "event": "turn_end", "output": "ok", "ts": t0 + 40},
+            ])
             self.assertEqual(sb.flush().returncode, 0)
             self.assertTrue(sink.requests)
-            text = sink.text()
-            self.assertNotIn(leftover, text)
-            self.assertNotIn(token, text)
-            root = attrs(next(span for span in sink.spans() if not span.get("parentSpanId")))
-            self.assertEqual((root["judgment.redacted_reason"], root["judgment.redacted_rule"]), ("sensitive_path", "dotenv"))
-            self.assertEqual(root["judgment.redacted_trigger"], ".env.[REDACTED:github_token]")
-
-    def test_placeholder_in_a_dotenv_name_is_still_sensitive(self):
-        hit = redact.sensitive(tool({"command": "cat .env.[REDACTED:github_token]"}), redact.ruleset())
-        self.assertEqual(hit and hit["rule"], "dotenv")
+            self.assertEqual(whole_leaks(sink.text() + sb.state_text()), [])
+            self.assertIn("Rotate [REDACTED:github_token]", [span["name"] for span in sink.spans()])
 
 
 class RuleErrorHistoryTests(unittest.TestCase):
@@ -133,85 +98,6 @@ class RuleErrorHistoryTests(unittest.TestCase):
         broken = redact.ruleset({"redactPatterns": ["(unclosed"]})
         self.assertTrue(broken.error)
         self.assertEqual(redact.redact_text("plain words", broken, []), ("", []))
-
-
-class LateSensitivityTests(unittest.TestCase):
-    """A sent turn that a late child made sensitive was blanked only when resent, after waiting for the child.
-
-    Meanwhile the next turn carried its old summary as context, and a failed resend left that summary in index.json.
-    """
-
-    def run_turns(self, sink_status: int = 200):
-        sink = Sink(status=200)
-        sink.__enter__()
-        self.addCleanup(sink.__exit__, None, None, None)
-        sb = Sandbox(sink_url=sink.url)
-        self.addCleanup(sb.cleanup)
-        marker = "Codeword" + _rand(12)
-        t0 = int(time.time() * 1000) - 60_000
-        for _, payload in pi_turn(str(sb.project), "lc-1", "lc-1:1", t0, prompt="remember " + marker, answer="noted " + marker):
-            self.assertEqual(sb.hook("pi", "", payload).returncode, 0)
-        self.assertEqual(sb.flush().returncode, 0)
-        self.assertIn(marker, sink.text())  # sent once, with its summary
-        base = {"v": 1, "harness": "pi", "session_id": "lc-1", "turn_id": "lc-1:1", "cwd": str(sb.project)}
-        # A child of the first turn starts late, and reads .env. It is still running.
-        for payload in ({**base, "event": "subagent_start", "agent_id": "a1", "agent_type": "worker", "ts": t0 + 5000},
-                        {**base, "event": "tool", "agent_id": "a1", "tool_name": "read", "tool_call_id": "c9",
-                         "tool_input": {"file_path": str(sb.project / ".env")}, "tool_output": "A=1", "ts": t0 + 5100}):
-            self.assertEqual(sb.hook("pi", "", payload).returncode, 0)
-        return sink, sb, marker, t0
-
-    def test_next_turn_never_carries_the_old_messages(self):
-        sink, sb, marker, t0 = self.run_turns()
-        sent = len(sink.requests)
-        for _, payload in pi_turn(str(sb.project), "lc-1", "lc-1:2", t0 + 20_000, prompt="next step", answer="done"):
-            self.assertEqual(sb.hook("pi", "", payload).returncode, 0)
-        self.assertEqual(sb.flush().returncode, 0)
-        later = "".join(request["body"] for request in sink.requests[sent:])
-        self.assertIn("next step", later)  # the second turn went out while the child still runs
-        self.assertNotIn(marker, later)
-        index = json.loads((sb.state / "index.json").read_text())
-        first = index["pi\tlc-1\tlc-1:1"]
-        self.assertEqual((first["blanked"]["rule"], first["messages"]), ("dotenv", False))
-        from judgment_core.flush import _turn_file
-
-        self.assertNotIn(marker, _turn_file(sb.state, "pi\tlc-1\tlc-1:1").read_text())
-
-    def test_failed_resend_leaves_no_old_messages(self):
-        sink, sb, marker, _ = self.run_turns()
-        sink.status = 500
-        base = {"v": 1, "harness": "pi", "session_id": "lc-1", "turn_id": "lc-1:1", "cwd": str(sb.project)}
-        self.assertEqual(sb.hook("pi", "", {**base, "event": "subagent_end", "agent_id": "a1", "output": "ok", "ts": int(time.time() * 1000)}).returncode, 0)
-        sb.flush()
-        index_text = (sb.state / "index.json").read_text()
-        self.assertNotIn(marker, index_text)
-        first = json.loads(index_text)["pi\tlc-1\tlc-1:1"]
-        self.assertTrue(first["blanked"])
-        self.assertFalse(first["messages"])
-        self.assertNotIn(marker, sb.state_text())
-
-    def test_blank_found_only_in_the_transcript_is_settled_before_the_post(self):
-        """The sender finds the .env read in the transcript at resend. The post fails: its messages are gone anyway."""
-        with Sink() as sink:
-            sb = Sandbox(sink_url=sink.url)
-            self.addCleanup(sb.cleanup)
-            marker = "Codeword" + _rand(12)
-            transcript = sb.home / "t.jsonl"
-            start = int(time.time() * 1000) - 120_000
-            claude_transcript(transcript, "tr-1", "p1", "remember " + marker, start, "p1-tool", "make test", "ok", "noted " + marker)
-            base = {"session_id": "tr-1", "cwd": str(sb.project), "transcript_path": str(transcript), "prompt_id": "p1"}
-            for event, payload in (("UserPromptSubmit", {**base, "prompt": "remember " + marker}), ("Stop", {**base, "last_assistant_message": "noted " + marker})):
-                self.assertEqual(sb.hook("claude", event, payload).returncode, 0)
-            self.assertEqual(sb.flush().returncode, 0)
-            self.assertIn(marker, sink.text())
-            # The same turn reads .env later, seen only in its transcript; a late hook event sends it again.
-            claude_transcript(transcript, "tr-1", "p1", "remember " + marker, start + 5000, "p1-env", "cat .env", "A=1", "noted " + marker)
-            sink.status = 500
-            late = {**base, "tool_name": "Bash", "tool_use_id": "p1-late", "tool_input": {"command": "true"}, "tool_response": {"stdout": ""}}
-            self.assertEqual(sb.hook("claude", "PostToolUse", late).returncode, 0)
-            sb.flush()
-            item = json.loads((sb.state / "index.json").read_text())["claude-code\ttr-1\tp1"]
-            self.assertEqual((item["blanked"]["rule"], item["messages"]), ("dotenv", False))
 
 
 class DetachTests(unittest.TestCase):

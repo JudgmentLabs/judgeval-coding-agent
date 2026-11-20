@@ -20,17 +20,12 @@ With `capture` set to `sanitized`, the default, the root span records what was r
 
 | Attribute | Type | Value |
 | --- | --- | --- |
-| `judgment.redacted` | bool | `true` when anything in the turn was redacted or the turn was blanked. |
+| `judgment.redacted` | bool | `true` when anything in the turn was redacted. |
 | `judgment.redaction_count` | int | How many redactions the turn's text holds. |
-| `judgment.redactions` | string | JSON list of `{"rule", "field", "count"}`, such as `{"rule":"github_token","field":"tool_output","count":2}`. `rule` is a format rule's id (such as `github_token` or `bearer_token`), `secret_assignment` for a value after a secret name in text, `secret_field` for a string under a secret name in structured input or output, `env:<NAME>` for an environment variable's value, or `custom` for a `redactPatterns` rule. `field` is the event field the text was in: `prompt`, `output`, `tool_input`, `tool_output`, `tool_results`, `tool_calls`, and so on, `input_messages` for the messages a request replays from a transcript, or `history` for kept earlier-turn messages redacted again while this request was built. Each layer records what it replaces as it replaces it; nothing is read back from placeholders. Left out when the count is 0. |
-| `judgment.redacted_reason` | string | `sensitive_path` when the turn was blanked. |
-| `judgment.redacted_rule` | string | The rule that blanked it: a path rule (`dotenv`, `ssh_private_key`, `key_file`, `credentials_file`, `secret_file`, `auth_file`, `proc_environ`, or `custom_path`) or a command rule (`env_dump`, `printenv`, `secret_cli`, or `custom_command`). Command rules are checked first. `redaction_limit` when the turn held more to check than the limits allow. |
-| `judgment.redacted_trigger` | string | The path token that blanked it, such as `.env` or `~/.aws/credentials`, with the home folder as `~` and any secret in it redacted. For a command, `cmd:<rule>`, such as `cmd:env_dump`. |
+| `judgment.redactions` | string | JSON list of `{"rule", "field", "count"}`, such as `{"rule":"github_token","field":"tool_output","count":2}`. `rule` is a format rule's id (such as `github_token` or `bearer_token`), `secret_assignment` for a value after a secret name in text, `key_assignment` for a value after an uppercase `KEY` name and `=` (`ENCRYPTION_KEY=...`), `secret_field` for a string under a secret name in structured input or output, `env:<NAME>` for an environment variable's value, or `custom` for a `redactPatterns` rule. `field` is the event field the text was in: `prompt`, `output`, `tool_input`, `tool_output`, `tool_results`, `tool_calls`, and so on, `input_messages` for the messages a request replays from a transcript, or `history` for kept earlier-turn messages redacted again while this request was built. Each layer records what it replaces as it replaces it; nothing is read back from placeholders. Left out when the count is 0. |
 | `judgment.redaction_error` | bool | A rule failed, such as an invalid `redactPatterns` regex, or an event needed more redaction than the limits allow, so the affected events were sent without text. A failed rule also drops the earlier turns' text that would ride along as context. |
 
 A child span whose input or output holds placeholders carries its own `judgment.redaction_count`, the number of `[REDACTED:` placeholders in that span's text.
-
-A blanked turn has the same spans, span ids, token counts, cost, and timing as it would unblanked, and every `judgment.input` and `judgment.output` is empty. A model span's `judgment.llm.tool_calls` keeps only each call's id and name. A blanked turn is never sent as context in a later turn's model input, and the next turn is not blanked.
 
 With `capture` set to `full` the root has none of these attributes. With `metadata` it has `judgment.redacted` and `judgment.redaction_count`.
 
@@ -57,11 +52,11 @@ A model span's input is the messages array the model was sent, whole and in orde
 
 - **Claude Code and Codex** read it from the agent's transcript: every earlier message since the session started or was last compacted, including earlier turns' answers, reasoning, tool calls, and results. After a compaction the input restarts from the compacted history. Codex encrypts its compaction summary, so the start of that history holds the user message `[Earlier conversation compacted by Codex; summary is encrypted by OpenAI]` in its place.
 - **Claude Code** requests logged in the transcript are replayed exactly, with the system prompt in `gen_ai.system_instructions` and the tool list in `gen_ai.tool.definitions`. **Codex** sets `gen_ai.system_instructions` from the session's base instructions, and `gen_ai.tool.definitions` when the rollout lists its tools.
-- **Cursor, Pi, Hermes Agent**, and any turn without a usable transcript: every message the session's earlier turns added, then the user prompt, then each tool call and result that came before the request. Those messages are kept next to the turn's file (`<turn>.messages.json`) after it is sent, already redacted under `sanitized`, and are never kept under `metadata` or for a blanked turn.
+- **Cursor, Pi, Hermes Agent**, and any turn without a usable transcript: every message the session's earlier turns added, then the user prompt, then each tool call and result that came before the request. Those messages are kept next to the turn's file (`<turn>.messages.json`) after it is sent, already redacted under `sanitized`, and are never kept under `metadata`.
 
 A tool result is the text the model read, not the agent's raw tool response. The output is the assistant message, including reasoning and tool calls, and, for Claude Code, the stop reason as `finish_reason`. Reasoning is the readable text only. Encrypted reasoning, redacted thinking, and signatures are never sent.
 
-The system prompt, the tool definitions, and the earlier messages are redacted like any other text under `sanitized`, and dropped under `metadata`. A blanked turn sends none of them. After a turn of the session is blanked, later turns no longer replay the transcript, which would hold the blanked turn's text: their input is built from their own events and the messages kept for unblanked turns.
+The system prompt, the tool definitions, and the earlier messages are redacted like any other text under `sanitized`, and dropped under `metadata`.
 
 A span larger than the server accepts is dropped alone, and the rest of the turn is still sent.
 
@@ -87,7 +82,7 @@ A turn recorded under a different key stays queued until a sender with that key 
 
 A turn waits for its subagents to finish, for up to 10 minutes. A turn that never ends, because the agent was killed mid-turn, is sent as it stands after a day with no new events.
 
-Secrets are redacted twice: by the hook, before an event reaches the queue, and by the sender, after it reads transcript text. Both use the rules in `core/bin/redact-rules.json`, joined with the project's own from `.judgment/tracing.json` the same way. The sender checks for a sensitive file before it redacts, so a placeholder in a file name cannot hide it. A turn that touched a sensitive file is saved blank before it is sent, so its text does not stay on disk. The turn is blanked as soon as the sender stores the event that shows it, even a late subagent's event for a turn already sent: its kept messages are deleted and its saved text stripped before anything waits or is sent, and later events of that turn are stored without text. A turn with events not yet sent is not used as a later turn's history, since those events could still blank it.
+Secrets are redacted twice: by the hook, before an event reaches the queue, and by the sender, after it reads transcript text. Both use the rules in `core/bin/redact-rules.json`, joined with the project's own from `.judgment/tracing.json` the same way.
 
 The hook starts the sender in the background and waits, at most about 40 ms, until `/proc` shows it outside the hook's process group, so an agent that kills that group the moment the hook returns does not kill the sender. With job control (bash, zsh, and macOS's `/bin/sh`) that holds before `&` returns. Under dash it is `setsid(1)`, usually within a millisecond; without `setsid(1)` the sender calls `setsid()` as Python starts. When no acknowledgement comes in time, a second sender is started by bash with job control. Without bash, a sender killed with the agent leaves its turns on disk for the next one to send.
 

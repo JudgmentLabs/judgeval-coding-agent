@@ -55,31 +55,9 @@ class HookTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 [stored] = self.sb.inbox()[before:]
                 self.assertEqual(stored["capture"], "sanitized")
-                for field in ("tool_output", "redactions", "redaction_error", "sensitive", "ts"):
+                for field in ("tool_output", "redactions", "redaction_error", "ts"):
                     self.assertEqual({field: stored[field]} if field in stored else {},
                                      {field: expected[field]} if field in expected else {})
-
-    def test_search_selectors_blank_results_per_tool(self):
-        for adapter, event, name, args, sensitive in (
-                ("claude", "PostToolUse", "Grep", {"glob": ".env*", "path": ".", "pattern": "KEY"}, True),
-                ("cursor", "postToolUse", "Grep", {"glob": ".env*", "file_path": ".", "pattern": "KEY"}, True),
-                ("pi", "", "grep", {"glob": ".env*", "path": ".", "pattern": "KEY"}, True),
-                ("claude", "PostToolUse", "Glob", {"pattern": "**/.env*", "path": "."}, True),
-                ("pi", "", "find", {"pattern": ".env", "path": "."}, True),
-                ("claude", "PostToolUse", "Grep", {"pattern": ".env", "glob": "*.py", "path": "."}, False),
-                ("claude", "PostToolUse", "Glob", {"pattern": "**/*", "path": "."}, False)):
-            with self.subTest(adapter=adapter, name=name, args=args):
-                payload = {"v": 1, "harness": "pi", "event": "tool", "session_id": "search", "conversation_id": "search",
-                           "turn_id": "t", "cwd": str(self.sb.project), "tool_name": name, "tool_use_id": "c", "tool_call_id": "c",
-                           "tool_input": args, "tool_response": "private unformatted value", "tool_output": "private unformatted value"}
-                if adapter == "claude":
-                    payload.pop("conversation_id")
-                before = len(self.sb.inbox())
-                result = self.sb.hook(adapter, event, payload)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                [stored] = self.sb.inbox()[before:]
-                self.assertEqual(bool(stored.get("sensitive")), sensitive)
-                self.assertEqual("tool_output" not in stored, sensitive)
 
     def test_non_string_secret_members_are_masked_by_every_hook(self):
         marker = "[REDACTED:secret_field]"
@@ -168,18 +146,8 @@ class HookTests(unittest.TestCase):
         self.assertTrue(all(event.get("redaction_error") for event in events))
         self.assertEqual(whole_leaks(self.sb.state_text()), [])
 
-    def test_sensitive_tool_call_is_marked_in_the_inbox(self):
-        steps = adapter_turns(str(self.sb.project))["claude"]
-        event, payload = steps[1]
-        payload = {**payload, "tool_name": "Read", "tool_input": {"file_path": str(self.sb.project / ".env")}, "tool_response": {"file": {"content": "A=1"}}}
-        self.assertEqual(self.sb.hook("claude", event, payload).returncode, 0)
-        [stored] = self.sb.inbox()
-        # The sender shows the home folder as ~ when it builds the audit.
-        self.assertEqual((stored["sensitive"], stored["sensitive_rule"], stored["sensitive_trigger"]), (True, "dotenv", str(self.sb.project / ".env")))
-        self.assertNotIn("tool_output", stored)
-
     def test_invalid_custom_rules_fail_closed_without_a_command(self):
-        for field in ("redactPatterns", "redactCommands", "redactNames"):
+        for field in ("redactPatterns", "redactNames"):
             for prompt in ("private prompt marker", ""):
                 with self.subTest(field=field, prompt=prompt):
                     self.sb.set_tracing({"enabled": True, field: ["("]})

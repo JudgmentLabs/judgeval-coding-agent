@@ -180,6 +180,19 @@
         "Bearer"
       ],
       "re": "(?<p>(?:(?<![A-Za-z0-9_-])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))(?:bearer|BEARER|Bearer)\\s+)(?!\\$|<|\\{\\{|%)(?=[A-Za-z._~+/=-]{0,255}[0-9])[A-Za-z0-9._~+/=-]{16,}"
+    },
+    {
+      "_comment": [
+        "KEY as an UPPER_SNAKE name, or the last part of one, assigned the way .env files and shells write it: = with no blank before",
+        "it (ENCRYPTION_KEY=..., export JWT_SIGNING_KEY=\"...\", docker run -e KEY=...). secretNames leaves key out (sort_key: ...,",
+        "cache_key = ...); written this way it names an environment variable. The value is read as secret_assignment reads one.",
+        "The find starts at KEY, so a name secret_assignment also matches (API_KEY=...) is recorded as secret_assignment: the longer find wins."
+      ],
+      "id": "key_assignment",
+      "needs": [
+        "KEY="
+      ],
+      "re": "(?<p>(?:(?<=[A-Z0-9]_)|(?<![A-Za-z0-9_])|(?<=\\\\[nrtbf])|(?<=\\\\u[0-9A-Fa-f]{4})|(?<=[\\[;][0-9]m)|(?<=[\\[;][0-9][0-9]m))KEY=\\\\{0,31}[\\\"'`]?)(?!\\[REDACTED:)(?:(?<=\")[^\"\\s,\\\\+);\\]}][^\"\\n,\\\\]*|(?<=')[^'\\s,\\\\+);\\]}][^'\\n,\\\\]*|(?<=`)[^`\\s,\\\\+);\\]}][^`\\n,\\\\]*|(?<![\"'`])[^\\s\"'`,;\\\\)\\]}=\\[{(:][^\\s\"'`,;\\\\)\\]}]*)"
     }
   ],
   "secretNames": {

@@ -1,16 +1,13 @@
-"""The test matrix, generated from the rules table (core/bin/redact-rules.json): every row of the three rule families
-crossed with the forms it must be found in and the forms it must not, in both layers (jq and its Python mirror, which
-must agree). A row added to the table adds its cases here; nothing below names a rule.
+"""The test matrix, generated from the rules table (core/bin/redact-rules.json): every secret name crossed with the
+forms it must be found in and the forms it must not, in both layers (jq and its Python mirror, which must agree). A name
+added to the table adds its cases here; nothing below names a rule.
 
-    (a) sensitive paths     sensitive.paths[].examples / not  x  PATH_SOURCES (tool args, shell, patch headers, transcript)
-    (b) secret names        secretNames.names  x  ASSIGNMENTS (line, quoted key, escaped key, flag, code) and LOCATIONS,
-                            and x code that mentions them (MENTIONS, byte for byte)
-    (c) sensitive commands  sensitive.commands[].examples / not  x  WRAPS (command positions) and QUOTED
-    (d) key and auth        not secret names: only a format rule takes a value under them
+    secret names        secretNames.names  x  ASSIGNMENTS (line, quoted key, escaped key, flag, code) and LOCATIONS,
+                        and x code that mentions them (MENTIONS, byte for byte)
+    key and auth        not secret names: only a format rule takes a value under them
 
-Known limits (docs/trace-format.md) are asserted as such: PATH_MENTIONS blank the turn (mention-blanks), LIMIT_WRAPS
-hide a command (wrapped-command), OVER_REDACTED mentions lose text after the name (code-after-name), and an unformatted
-value under key or auth stays (key-auth-unformatted).
+Known limits (docs/trace-format.md) are asserted as such: OVER_REDACTED mentions lose text after the name
+(code-after-name), and an unformatted value under key or auth stays (key-auth-unformatted).
 
 Every fake value is built at runtime (_rand).
 """
@@ -42,74 +39,7 @@ def run(test: unittest.TestCase, events: list[dict]) -> list[dict]:
     return py
 
 
-# ---------------------------------------------------------------- (a) sensitive paths, from every source
-
-
-def codex_patch(*ops: tuple[str, str], body: str = "@@\n-a = 1\n+a = 2") -> str:
-    """A Codex apply_patch text: each op is (header, path)."""
-    return "*** Begin Patch\n" + "".join(f"*** {head}: {path}\n{body}\n" for head, path in ops) + "*** End Patch"
-
-
-def unified(path: str) -> str:
-    return f"--- a/{path}\t2026-01-01 00:00:00\n+++ b/{path}\n@@ -1 +1 @@\n-a\n+b\n"
-
-
-def model_call(arguments) -> dict:
-    """A model event as transcript enrichment writes it: the call's arguments, as codex_transcript wraps free-form input."""
-    return {"v": 1, "harness": "codex", "event": "model", "session_id": "s", "turn_id": "t", "output": "ok",
-            "tool_calls": [{"id": "c1", "name": "apply_patch", "arguments": arguments}]}
-
-
-PATH_SOURCES = {
-    "file_path": lambda p: tool({"file_path": p}),
-    "command": lambda p: tool({"command": "cat " + p}),
-    "update": lambda p: tool({"input": codex_patch(("Update File", p))}),
-    "add": lambda p: tool({"input": codex_patch(("Add File", p))}),
-    "delete": lambda p: tool({"input": codex_patch(("Delete File", p))}),
-    "move": lambda p: tool({"input": codex_patch(("Update File", "src/app.py"), ("Move to", p))}),
-    "multi_file": lambda p: tool({"input": codex_patch(("Update File", "src/app.py"), ("Update File", p), ("Add File", "README.md"))}),
-    "unified": lambda p: tool({"input": unified(p)}),
-    "diff_git": lambda p: tool({"patch": f"diff --git a/{p} b/{p}\nindex 1..2 100644\n"}),
-    "quoted_name": lambda p: tool({"diff": f'--- "a/{p}"\n+++ "b/{p}"\n'}),
-    "string_input": lambda p: tool(codex_patch(("Update File", p))),
-    "shell_heredoc": lambda p: tool({"command": "apply_patch <<'EOF'\n" + codex_patch(("Update File", p)) + "\nEOF"}),
-    "transcript": lambda p: model_call({"input": codex_patch(("Update File", p))}),
-    "transcript_diff": lambda p: model_call({"input": unified(p)}),
-}
-# A sensitive name that a patch only mentions, or that sits in a value no header names. Known limit (mention-blanks): each
-# blanks the turn, since a mention is not told apart from a read or a write.
-PATH_MENTIONS = {
-    "patch_body": lambda p: tool({"input": codex_patch(("Update File", "src/app.py"), body=f"@@\n-load('{p}')\n+load(path)")}),
-    "unified_body": lambda p: tool({"input": f"--- a/src/app.py\n+++ b/src/app.py\n@@\n+# reads {p}\n-x\n"}),
-    "plain_input": lambda p: tool({"input": f"explain what {p} is for"}),
-    "transcript_body": lambda p: model_call({"input": codex_patch(("Add File", "docs/setup.md"), body=f"+Copy {p} from the vault.")}),
-}
-
-
-class PathMatrix(unittest.TestCase):
-    maxDiff = None
-    rows = TABLE["sensitive"]["paths"]
-
-    def test_every_row_has_examples(self):
-        self.assertEqual([row["id"] for row in self.rows if not row.get("examples") or not row.get("not")], [])
-
-    def test_examples_blank_from_every_source(self):
-        cases = [(row["id"], path, form) for row in self.rows for path in row["examples"] for form in PATH_SOURCES]
-        out = run(self, [PATH_SOURCES[form](path) for _, path, form in cases])
-        self.assertEqual([(rule, path, form, got.get("sensitive_rule")) for (rule, path, form), got in zip(cases, out) if got.get("sensitive_rule") != rule], [])
-
-    def test_lookalikes_from_every_source_keep_the_turn(self):
-        cases = [(path, form) for row in self.rows for path in row["not"] for form in PATH_SOURCES]
-        out = run(self, [PATH_SOURCES[form](path) for path, form in cases])
-        self.assertEqual([(path, form, got.get("sensitive_rule")) for (path, form), got in zip(cases, out) if got.get("sensitive")], [])
-
-    def test_known_limit_mentions_blank_the_turn(self):
-        cases = [(row["id"], path, form) for row in self.rows for path in row["examples"] for form in PATH_MENTIONS]
-        out = run(self, [PATH_MENTIONS[form](path) for _, path, form in cases])
-        self.assertEqual([(rule, path, form, got.get("sensitive_rule")) for (rule, path, form), got in zip(cases, out) if got.get("sensitive_rule") != rule], [])
-
-
-# ---------------------------------------------------------------- (b) secret names: forms x names, and mentions
+# ---------------------------------------------------------------- secret names: forms x names, and mentions
 
 
 def names() -> list[str]:
@@ -190,64 +120,7 @@ class AssignmentMatrix(unittest.TestCase):
             self.assertEqual({item["rule"] for item in got["redactions"]}, {"secret_assignment"}, text)
 
 
-# ---------------------------------------------------------------- (c) sensitive commands
-
-
-# Command positions: the start, after ; & | ( ` or a newline, behind sudo.
-WRAPS = ["{}", "sudo {}", "cd repo && {}", "x=$({})", "{} | cat", 'echo "$({})"', "ls; {}", "cat <<'EOF'\nx\nEOF\n{}", "a || {}", "x=`{}`",
-         "FOO=1 {}", "bash -c '{}'", "command {}", "nohup {}", "sudo -u root {}", "if x; then {}; fi", "{{ {}; }}"]
-# Known limit (wrapped-command): behind any other wrapper the command is not seen. Secret-named environment values in the
-# output are still redacted (env_value).
-LIMIT_WRAPS = ["timeout 5 {}", "env -u X {}", 'FOO="a b" {}', "sudo --user=root {}"]
-# Not a command position: quoted text, a pattern, a commit message.
-QUOTED = ["echo '{}'", 'git commit -m "{}"', "rg '{}' .", "grep -e '{}' x", "git log --grep='{}'"]
-
-
-def command_rows() -> list[dict]:
-    return TABLE["sensitive"]["commands"]
-
-
-COMMAND_IDS = {row["id"] for row in command_rows()}
-
-
-def _fits(form: str, command: str) -> bool:
-    """A form that quotes its command with ' or " cannot hold that quote."""
-    return not any(q in command and q in form.replace("{}", "") for q in "'\"")
-
-
-def _examples(wraps: list[str], key: str = "examples") -> list[tuple[str, str]]:
-    return [(row["id"], wrap.format(cmd)) for row in command_rows() for cmd in row[key] for wrap in wraps if _fits(wrap, cmd)]
-
-
-class CommandMatrix(unittest.TestCase):
-    maxDiff = None
-
-    def test_every_row_has_examples(self):
-        self.assertEqual([row["id"] for row in command_rows() if not row.get("examples") or not row.get("not")], [])
-
-    def test_examples_at_every_command_position(self):
-        cases = _examples(WRAPS)
-        out = run(self, [tool({"command": cmd}) for _, cmd in cases])
-        self.assertEqual([(rule, cmd, got.get("sensitive_rule")) for (rule, cmd), got in zip(cases, out) if got.get("sensitive_rule") != rule], [])
-
-    def test_harmless_invocations_keep_the_turn(self):
-        cases = _examples(WRAPS, "not")
-        out = run(self, [tool({"command": cmd}, "ordinary output") for _, cmd in cases])
-        self.assertEqual([(cmd, got.get("sensitive_rule")) for (_, cmd), got in zip(cases, out) if got.get("sensitive") or got["tool_output"] != "ordinary output"], [])
-
-    def test_quoted_mentions_are_no_command(self):
-        """No command rule fires. A path rule still may: kubectl get secret names a token secret (mention-blanks)."""
-        cases = _examples(QUOTED)
-        out = run(self, [tool({"command": cmd}) for _, cmd in cases])
-        self.assertEqual([(cmd, got.get("sensitive_rule")) for (_, cmd), got in zip(cases, out) if got.get("sensitive_rule") in COMMAND_IDS], [])
-
-    def test_known_limit_wrapped_commands_are_not_seen(self):
-        cases = _examples(LIMIT_WRAPS)
-        out = run(self, [tool({"command": cmd}) for _, cmd in cases])
-        self.assertEqual([(cmd, got.get("sensitive_rule")) for (_, cmd), got in zip(cases, out) if got.get("sensitive_rule") in COMMAND_IDS], [])
-
-
-# ---------------------------------------------------------------- (d) key and auth: not secret names
+# ---------------------------------------------------------------- key and auth: not secret names
 
 
 def plain_words() -> list[str]:
@@ -287,13 +160,10 @@ class KeyAuthMatrix(unittest.TestCase):
 
 def matrix_size() -> dict[str, int]:
     """How many cases the matrix generates, by family (each runs in both layers)."""
-    paths = TABLE["sensitive"]["paths"]
-    a = sum(len(r["examples"]) + len(r["not"]) for r in paths) * len(PATH_SOURCES) + sum(len(r["examples"]) for r in paths) * len(PATH_MENTIONS)
     b = (len(names()) * sum(len(forms) for forms in ASSIGNMENTS.values()) + len(LOCATIONS) * len(names()) * len(ASSIGNMENTS["line"])
          + len(names()) * (3 * len(MENTIONS) + len(OVER_REDACTED)))
-    c = len(_examples(WRAPS)) + len(_examples(WRAPS, "not")) + len(_examples(QUOTED)) + len(_examples(LIMIT_WRAPS))
     d = len(plain_words()) * (len(PLAIN_TEXT) * (len(PLAIN_NAMES) + 2) + 3 * len(PLAIN_NAMES) + 2)
-    return {"paths": a, "names": b, "commands": c, "key_auth": d}
+    return {"names": b, "key_auth": d}
 
 
 if __name__ == "__main__":
