@@ -61,32 +61,21 @@ class Redaction(Case):
         self.assertEqual(sorted(attrs(s)["judgment.span_kind"] for s in spans), ["agent", "llm", "llm", "llm", "tool"])
         self.assertEqual(sum(int(attrs(s).get("judgment.usage.output_tokens", 0)) for s in kinds(spans, "llm")), 21 + 21)
 
-    def test_dotenv_read_blanks_the_turn_and_not_the_next(self):
+    def test_dotenv_read_is_sent_redacted(self):
         sid = new_session_id()
         env_path = str(self.sb.project / ".env")
         one = simple_turn(sid, "what is in the env file", path=env_path, result=json.dumps({"content": ENV_FILE}), answer="It sets DATABASE_URL.")
         two = simple_turn(sid, "now run the tests", path="tests.log", result="42 passed", answer="All 42 tests pass.", first=False,
                           tool_name="terminal", args={"command": "make test"}, start=later(one.events, 2))
         _errors, spans = self.run_events(one.events + two.events)
-        rs = {s["traceId"]: s for s in roots(spans)}
-        blanked = next(s for s in rs.values() if attrs(s).get("judgment.redacted_reason"))
-        ba = attrs(blanked)
-        self.assertEqual(ba["judgment.redacted_reason"], "sensitive_path")
-        self.assertEqual(ba["judgment.redacted_rule"], "dotenv")
-        self.assertEqual(ba["judgment.redacted_trigger"], "~/proj/.env")
-        same = [s for s in spans if s["traceId"] == blanked["traceId"]]
-        self.assertEqual(len(same), 4)
-        for span in same:
-            self.assertEqual(attrs(span).get("judgment.input", ""), "")
-            self.assertEqual(attrs(span).get("judgment.output", ""), "")
-        self.assertEqual(sum(int(attrs(s).get("judgment.usage.output_tokens", 0)) for s in kinds(same, "llm")), 43)
-        other = next(s for s in rs.values() if s is not blanked)
-        self.assertEqual(attrs(other)["judgment.input"], "now run the tests")
-        self.assertEqual(attrs(other)["judgment.output"], "All 42 tests pass.")
-        self.assertNotIn("judgment.redacted_reason", attrs(other))
+        rs = {attrs(s)["judgment.input"]: s for s in roots(spans)}
+        first = attrs(rs["what is in the env file"])
+        self.assertEqual(first["judgment.output"], "It sets DATABASE_URL.")
+        self.assertIn("url_password", first["judgment.redactions"])
+        self.assertEqual(attrs(rs["now run the tests"])["judgment.output"], "All 42 tests pass.")
         everything = self.sink.text() + self.sb.state_text()
         self.assertNotIn("Lq9xT", everything)
-        self.assertNotIn("FEATURE_FLAG", everything)
+        self.assertIn("FEATURE_FLAG=on", self.sink.text())
 
 
 class MetadataSecrets(Case):
@@ -193,10 +182,10 @@ class Settings(Case):
         project = self.sb.home / "settings"
         (project / ".judgment").mkdir(parents=True)
         (project / ".judgment" / "tracing.json").write_text(json.dumps({
-            "enabled": True, "redactCommands": ["mycli[^\\S\\n]+show-secret"], "redactNames": ["vault_pin"],
+            "enabled": True, "redactNames": ["vault_pin"],
             "redactAllow": ["changeme"], "redactDisable": ["github_token"]}))
         turn = Turn(new_session_id(), "go")
-        calls = [("mycli show-secret db", "x"), ("ls", "vault_pin = " + pin), ("ls", "password = changeme"), ("ls", "gh " + token)]
+        calls = [("ls", "vault_pin = " + pin), ("ls", "password = changeme"), ("ls", "gh " + token)]
         for command, result in calls:
             call = turn.api(tool=("terminal", {"command": command}))
             turn.tool(call, "terminal", {"command": command}, result)
@@ -204,14 +193,12 @@ class Settings(Case):
         turn.end("ok")
         self.fire(turn.events, TERMINAL_CWD=str(project))
         tools = [event for event in self.sb.inbox() if event.get("event") == "tool"]
-        self.assertEqual([event.get("sensitive_rule") for event in tools], ["custom_command", None, None, None])
-        self.assertEqual([event["tool_output"] for event in tools[1:]],
+        self.assertEqual([event["tool_output"] for event in tools],
                          ["vault_pin = [REDACTED:secret_assignment]", "password = changeme", "gh " + token])
 
 
 class Malformed(Case):
-    BAD = ({"redactNames": "pin"}, {"redactPatterns": {"INTERNAL-[0-9]+": 1}}, {"redactCommands": "vaultctl"}, {"redactPaths": ""},
-           {"redactPatterns": 5}, {"redactNames": True}, {"redactPaths": [["x"]]}, {"redactCommands": {}})
+    BAD = ({"redactNames": "pin"}, {"redactPatterns": {"INTERNAL-[0-9]+": 1}}, {"redactPatterns": 5}, {"redactNames": True})
 
     def test_a_rule_setting_that_is_not_a_list_of_strings_drops_the_text(self):
         for number, bad in enumerate(self.BAD):
@@ -310,28 +297,15 @@ class Truncation(Case):
                     self.assertEqual(no_piece(out, GH[4:]) + no_piece(out, ENV_VALUE), [])
                     self.assertNotIn("bravo", out)
 
-    def test_an_input_too_large_to_check_blanks_its_turn(self):
+    def test_an_input_too_large_to_redact_is_omitted(self):
         spooler = module("spooler")
         command = "echo " + "a" * spooler.FIELD_CAP + "; cat .env"
         self.fire(self.tool_turn({"command": command}, "PRIVATE-NOTE-" + "x" * 40).events)
         tool = next(event for event in self.sb.inbox() if event["event"] == "tool")
-        self.assertTrue(tool["sensitive"])
-        self.assertEqual(tool["sensitive_rule"], self.core.OVERSIZE_RULE)
-        spans = self.flushed()
-        self.assertEqual(attrs(roots(spans)[0])["judgment.redacted_rule"], self.core.OVERSIZE_RULE)
-        self.assertNotIn("PRIVATE-NOTE", self.sb.state_text() + self.sink.text())
-
-    def test_sensitive_file_at_the_end_of_a_long_command_blanks_the_turn(self):
-        """A ~72 KB command ending in `; cat .env` lost its suffix to fitting before classification."""
-        command = "echo " + "word " * (72 * 1024 // 5) + "; cat .env"
-        self.fire(self.tool_turn({"command": command}, "PRIVATE-NOTE-" + "x" * 40).events)
-        tool = next(event for event in self.sb.inbox() if event["event"] == "tool")
-        self.assertTrue(tool["sensitive"])
-        self.assertEqual(tool["sensitive_rule"], "dotenv")
-        self.assertNotIn("PRIVATE-NOTE", self.sb.state_text())
-        root = attrs(roots(self.flushed())[0])
-        self.assertEqual((root["judgment.redacted_reason"], root["judgment.redacted_rule"]), ("sensitive_path", "dotenv"))
-        self.assertNotIn("PRIVATE-NOTE", self.sink.text())
+        self.assertEqual((tool["tool_input"], tool["omitted"]), (spooler.OMITTED, ["tool_input"]))
+        self.flushed()
+        self.assertNotIn("a" * 1000, self.sb.state_text() + self.sink.text())
+        self.assertIn("PRIVATE-NOTE", self.sink.text(), "the rest of the turn is sent")
 
 
 class Structured(Case):
@@ -353,33 +327,24 @@ class Structured(Case):
         turn.end("done")
         return turn
 
-    def test_oversized_structured_arguments_blank_the_turn(self):
+    def test_oversized_structured_arguments_are_omitted(self):
         big = rows(10_000)
         self.fire(self.tool_turn(big, "PRIVATE-NOTE-" + "x" * 40).events)
-        events = self.sb.inbox()
-        tool = next(event for event in events if event["event"] == "tool")
-        self.assertTrue(tool["sensitive"])
-        self.assertEqual(tool["sensitive_rule"], load_plugin().core.OVERSIZE_RULE)
-        self.assertNotIn("tool_input", tool, "a record blanked as too large to check keeps no input text")
-        spans = self.flushed()
-        self.assertEqual(attrs(roots(spans)[0])["judgment.redacted_rule"], load_plugin().core.OVERSIZE_RULE)
-        self.assertNotIn("PRIVATE-NOTE", self.sink.text())
-        self.assertNotIn("r0000001", self.sink.text(), "the blanked turn sends none of its arguments")
+        tool = next(event for event in self.sb.inbox() if event["event"] == "tool")
+        self.assertEqual(tool["tool_input"], module("spooler").OMITTED)
+        tool_span = attrs(next(span for span in kinds(self.flushed(), "tool")))
+        self.assertEqual(tool_span["judgment.input"], module("spooler").OMITTED)
+        self.assertIn("PRIVATE-NOTE", tool_span["judgment.output"], "the rest of the turn is sent")
 
-    def test_deeply_nested_sensitive_path_blanks_the_turn(self):
-        """Depth past the budget used to become "…", dropping the .env path that made the read
-        sensitive while keeping its private output. Now it is an omission: the turn is blanked, with a reason."""
+    def test_deeply_nested_arguments_are_omitted_not_cut(self):
+        """Depth past the budget used to become "…" inside the value. Now the value is omitted whole."""
         args: dict = {"path": ".env"}
         for _ in range(20):
             args = {"nested": args}
         self.fire(self.tool_turn(args, "PRIVATE-NOTE-" + "x" * 40).events)
         tool = next(event for event in self.sb.inbox() if event["event"] == "tool")
-        self.assertTrue(tool["sensitive"])
-        self.assertEqual(tool["sensitive_rule"], load_plugin().core.OVERSIZE_RULE)
-        self.assertNotIn("tool_input", tool)
-        # The model's JSON-text copy of the arguments is parsed whole in the helper, so the turn names .env itself.
-        self.assertIn(attrs(roots(self.flushed())[0])["judgment.redacted_rule"], {"dotenv", load_plugin().core.OVERSIZE_RULE})
-        self.assertNotIn("PRIVATE-NOTE", self.sink.text())
+        self.assertEqual(tool["tool_input"], module("spooler").OMITTED)
+        self.assertNotIn("…", json.dumps(tool, ensure_ascii=False))
 
     def test_structured_arguments_within_budget_arrive_whole(self):
         args = rows(1_000)

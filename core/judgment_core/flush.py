@@ -450,9 +450,10 @@ def _sanitize(state: Path, key: str, events: list[dict], prepared: list[dict], r
     """
     rs = redactor.rules(events)
     checked = redactor.checked_environment(events)
-    if not checked:
-        prepared = [redact._unredactable(event) for event in prepared]
     prepared = redact.redact_events(carry_records(events, prepared, redactor.names), rs, redactor.secrets)
+    if not checked:
+        # Last, so carry_records cannot put the hook's text back.
+        prepared = [redact._unredactable(event) for event in prepared]
     stored = [redact.redact_event(event, rs, redactor.secrets) for event in events]
     if stored != events:
         _private_write(_turn_file(state, key), "".join(json.dumps(event, ensure_ascii=False, default=str) + "\n" for event in stored))
@@ -729,9 +730,9 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
             prepared = _replayable(index, key, dest, prepared)
             if capture == "metadata":
                 # Transcript enrichment has already run, so this is what gets sent and kept.
+                prepared = [redact.metadata_event(event, rs, redactor.secrets) for event in carry_records(events, prepared, redactor.names)]
                 if not redactor.checked_environment(events):
                     prepared = [redact._unredactable(event) for event in prepared]
-                prepared = [redact.metadata_event(event, rs, redactor.secrets) for event in carry_records(events, prepared, redactor.names)]
             elif capture == "sanitized":
                 prepared, checked = _sanitize(state, key, events, prepared, redactor)
             # A metadata turn is no later turn's context. Nor is one whose rules failed or whose environment did not check.

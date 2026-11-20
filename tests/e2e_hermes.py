@@ -98,7 +98,6 @@ class Home:
         assert result.returncode == 0, result.stdout[-500:] + result.stderr[-500:]
 
     def ask(self, prompt: str) -> tuple[subprocess.CompletedProcess, float]:
-        start = time.time()
         result = self.hermes("chat", "-q", prompt, "-Q", "--yolo")
         return result, time.time()
 
@@ -182,7 +181,7 @@ class RealHermes(unittest.TestCase):
             finally:
                 home.cleanup()
 
-    def test_2_dotenv_turn_is_blanked(self):
+    def test_2_dotenv_turn_is_redacted(self):
         with Sink() as sink, MockLLM(lambda body, n: {"text": "It sets DATABASE_URL and STRIPE."} if has_tool_result(body) else {"tool": "read_file", "args": {"path": ".env"}}) as llm:
             home = Home(llm.url, sink.url)
             try:
@@ -192,13 +191,12 @@ class RealHermes(unittest.TestCase):
                 self.assertTrue(self.wait_spans(sink, 1))
                 spans = sink.spans()
                 ra = attrs(roots(spans)[0])
-                self.assertEqual(ra.get("judgment.redacted_reason"), "sensitive_path")
-                self.assertEqual(ra.get("judgment.redacted_rule"), "dotenv")
-                self.assertTrue(all(attrs(s).get("judgment.input", "") == "" and attrs(s).get("judgment.output", "") == "" for s in spans))
+                self.assertEqual(ra.get("judgment.output"), "It sets DATABASE_URL and STRIPE.")
+                self.assertTrue(ra.get("judgment.redacted"))
                 self.assertEqual(leaks(sink.text(), hashes=False), [])
                 self.assertEqual(leaks(home.state_text(), hashes=False), [])
                 self.assertNotIn("Lq9xT", sink.text() + home.state_text())
-                REPORT["run2"] = {"spans": len(spans), "blanked": True, "trigger": ra.get("judgment.redacted_trigger")}
+                REPORT["run2"] = {"spans": len(spans), "redactions": ra.get("judgment.redactions")}
             finally:
                 home.cleanup()
 

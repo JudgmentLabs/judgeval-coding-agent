@@ -187,7 +187,7 @@ Removed although not secret:
 
 With `capture` set to `metadata`, the plugin keeps names, models, token counts, cost, timing, and ids. It drops the text and the folder name from the local queue, the spans, and the saved session history. That includes text read back from the agent's transcript.
 
-Your API key is never sent anywhere but Judgment, and never saved with a turn. Each turn records a fingerprint of the key, so it goes only to the project it was recorded for. The local queue lives in `~/.local/state/judgment` (`$XDG_STATE_HOME/judgment` when that is set), readable only by your user. It holds the text as redacted, and a blank turn is saved blank.
+Your API key is never sent anywhere but Judgment, and never saved with a turn. Each turn records a fingerprint of the key, so it goes only to the project it was recorded for. The local queue lives in `~/.local/state/judgment` (`$XDG_STATE_HOME/judgment` when that is set), readable only by your user. It holds the text as redacted.
 
 [Trace format](docs/trace-format.md) lists every span and attribute, and how turns are queued and sent.
 

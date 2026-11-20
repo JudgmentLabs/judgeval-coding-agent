@@ -132,13 +132,19 @@ PLAIN_TEXT = ['{{"{k}":"{v}"}}', '{{"{k}": "{v}"}}', '{k} = {v}', '{k}: {v}', '{
 # Values that are names, not credentials: S3 object keys, uuids, hashes.
 PLAIN_NAMES = ["name", "oauth2", "user_id_2024_v1", "reports/2026/summary.csv", "3f2b8c1e-9a4d-4e7b-8c2a-1d5e6f7a8b9c",
                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"]
+# The environment form, KEY=value, is a variable assignment: key_assignment takes whatever the value is.
+ENV_FORMS = {'{k}={v}', 'cli --{k}={v} -q'}
+
+
+def plain_forms(k: str) -> list[str]:
+    return [form for form in PLAIN_TEXT if not (k == "KEY" and form in ENV_FORMS)]
 
 
 class KeyAuthMatrix(unittest.TestCase):
     maxDiff = None
 
     def test_names_stay(self):
-        texts = [form.format(k=k, v=v) for k in plain_words() for form in PLAIN_TEXT for v in PLAIN_NAMES]
+        texts = [form.format(k=k, v=v) for k in plain_words() for form in plain_forms(k) for v in PLAIN_NAMES]
         members = [{k: v, "Bucket": "b"} for k in plain_words() for v in PLAIN_NAMES]
         out = run(self, [tool({"command": "x"}, item) for item in texts + members] + [tool(item) for item in members])
         items = texts + members
@@ -153,9 +159,16 @@ class KeyAuthMatrix(unittest.TestCase):
 
     def test_known_limit_unformatted_values_stay(self):
         cred = "Ck" + _rand(14) + "7" + _rand(5)
-        cases = [form.format(k=k, v=cred) for k in plain_words() for form in PLAIN_TEXT] + [{k: cred} for k in plain_words()]
+        cases = [form.format(k=k, v=cred) for k in plain_words() for form in plain_forms(k)] + [{k: cred} for k in plain_words()]
         out = run(self, [tool({"command": "x"}, item) for item in cases])
         self.assertEqual([(item, got["tool_output"]) for item, got in zip(cases, out) if got["tool_output"] != item], [])
+
+    def test_env_form_takes_any_value(self):
+        cred = "Ck" + _rand(14) + "7" + _rand(5)
+        cases = [(form.format(k="KEY", v=v), v) for form in sorted(ENV_FORMS) for v in PLAIN_NAMES + [cred]]
+        out = run(self, [tool({"command": "x"}, text) for text, _ in cases])
+        self.assertEqual([text for (text, value), got in zip(cases, out)
+                          if value in got["tool_output"] or {item["rule"] for item in got["redactions"]} != {"key_assignment"}], [])
 
 
 def matrix_size() -> dict[str, int]:
