@@ -411,16 +411,27 @@ def _exact_requests(rows: list[dict]) -> tuple[dict[str, dict], dict[tuple[str, 
     blobs = {str(row.get("hash")): row.get("message") for row in rows if row.get("type") == "api-request-blob" and isinstance(row.get("message"), dict)}
     sent_replies = {_call_ids(message.get("content")): message for message in blobs.values() if message.get("role") == "assistant" and _call_ids(message.get("content"))}
     logged = {str(row.get("id")): row for row in rows if row.get("type") == "api-request" and row.get("id")}
-    # A response is not logged as a blob. Its hash is that of the assistant message the transcript rows add up to.
-    replies: dict[str, list[dict]] = {}
+    # A message the transcript already holds is not logged as a blob: a request names it by its hash. That is a user
+    # row's message as written, or with the user rows since the last reply joined into one list of blocks, and an
+    # assistant message as one row wrote it or as the rows of one reply add up to.
+    merged: dict[tuple[str, str], list[dict]] = {}
+    run: list = []
     for row in rows:
-        if _role(row) == "assistant" and row.get("requestRef") and isinstance(_message(row).get("content"), list):
-            replies.setdefault(str(row["requestRef"]), []).extend(_message(row)["content"])
-    for content in replies.values():
-        message = {"role": "assistant", "content": content}
-        for ascii_only in (False, True):
-            text = json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=ascii_only)
-            blobs.setdefault(hashlib.sha256(text.encode("utf-8")).hexdigest(), message)
+        message = _message(row)
+        if _role(row) == "user":
+            content = message.get("content")
+            run = run + ([{"type": "text", "text": content}] if isinstance(content, str) else content if isinstance(content, list) else [])
+            for form in (message, {"role": "user", "content": run}):
+                blobs.setdefault(_blob_hash(form), form)
+        elif _role(row) == "assistant":
+            run = []
+        if _role(row) == "assistant" and isinstance(message.get("content"), list):
+            blobs.setdefault(_blob_hash({"role": "assistant", "content": message["content"]}), {"role": "assistant", "content": message["content"]})
+            for key in (("request", str(row.get("requestRef") or "")), ("message", _message_id(row))):
+                if key[1]:
+                    merged.setdefault(key, []).extend(message["content"])
+    for content in merged.values():
+        blobs.setdefault(_blob_hash({"role": "assistant", "content": content}), {"role": "assistant", "content": content})
     built: dict[str, list[dict] | None] = {}
 
     def own(row: dict, base: list[dict]) -> list[dict] | None:
@@ -457,19 +468,22 @@ def _exact_requests(rows: list[dict]) -> tuple[dict[str, dict], dict[tuple[str, 
             base = found
         return built[request_id]
 
+    # The system prompt and tools are known whenever the shape is, whether or not every message was found: ``messages``
+    # is None when one was not, and the caller rebuilds them from the transcript.
     found = {}
     for request_id, row in logged.items():
-        sent = messages(request_id)
-        shape = shapes.get(str(row.get("shapeHash")))
-        if sent is None or shape is None:
-            continue
-        system = _system_text(shape.get("system"))
+        shape = shapes.get(str(row.get("shapeHash"))) or {}
         found[request_id] = {
-            "messages": sent,
-            "system": system,
+            "messages": messages(request_id),
+            "system": _system_text(shape.get("system")),
             "tools": [_tool_definition(tool) for tool in shape.get("tools") or [] if isinstance(tool, dict)],
         }
     return found, sent_replies
+
+
+def _blob_hash(message: dict) -> str:
+    """The hash Claude Code names a request message by."""
+    return hashlib.sha256(json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 def _system_text(system: object) -> str:
@@ -586,14 +600,13 @@ def _add_context(rows: list[dict], groups: list[dict], turn_id: str, *, main: bo
         stop = next((_message(row).get("stop_reason") for row in reversed(own) if _message(row).get("stop_reason")), None)
         if stop:
             group["finish_reason"] = str(stop)
-        logged = exact.get(str(own[0].get("requestRef") or ""))
-        if logged is not None:
-            sent = logged["messages"]
-            if logged["system"]:
-                group["system_instructions"] = logged["system"]
-            if logged["tools"]:
-                group["tool_definitions"] = logged["tools"]
-        else:
+        logged = exact.get(str(own[0].get("requestRef") or "")) or {}
+        if logged.get("system"):
+            group["system_instructions"] = logged["system"]
+        if logged.get("tools"):
+            group["tool_definitions"] = logged["tools"]
+        sent = logged.get("messages")
+        if sent is None:
             sent = _replayed(rows, own[0], own[0].get("isSidechain") is True, str(own[0].get("agentId") or ""))
         group["input_messages"] = [converted for message in sent for converted in _converted(message)]
         group["replay_turns"] = _earlier_turns(rows, position.get(id(own[0]), len(rows)), turn_id, main=main)

@@ -94,10 +94,6 @@ class RuleErrorHistoryTests(unittest.TestCase):
             self.assertNotIn(marker, later)
             self.assertIn("judgment.redaction_error", later)
 
-    def test_redact_text_is_empty_on_error(self):
-        broken = redact.ruleset({"redactPatterns": ["(unclosed"]})
-        self.assertTrue(broken.error)
-        self.assertEqual(redact.redact_text("plain words", broken, []), ("", []))
 
 
 class DetachTests(unittest.TestCase):

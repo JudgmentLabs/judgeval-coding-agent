@@ -833,16 +833,6 @@ def scrub_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]], bud
     return _with_records({**event, **scrubbed}, records)
 
 
-def redact_text(text: str, rs: Ruleset, secrets: list[tuple[str, str]], field: str = "text") -> tuple[str, list[dict]]:
-    """One text, such as a history summary, and the records of what was replaced in it as ``field``.
-    Nothing when the rules failed or hit a limit."""
-    try:
-        scrubbed, records = scrub_fields({field: text}, rs, secrets, sender_budget())
-    except RedactionLimit:
-        return "", []
-    return scrubbed[field], records
-
-
 def redact_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]]) -> dict:
     """The sender's step: scrubbed, with what it replaced added to the records the event already carries, and the env
     values its text held added to its provenance. Its budget is the sender's: its matching is linear."""

@@ -399,7 +399,7 @@ def _sha(message: dict) -> str:
 
 
 class ClaudeTest(Shared):
-    def transcript(self, *, logged: bool, answered: bool = True) -> Path:
+    def transcript(self, *, logged: bool, answered: bool = True, lost: bool = False) -> Path:
         """One turn: a Read, then the answer. Without ``answered``, the answer's text row is not written yet."""
         prompt = {"role": "user", "content": "add a test"}
         sent_prompt = {"role": "user", "content": [{"type": "text", "text": "<system-reminder>env</system-reminder>"}, {"type": "text", "text": "add a test"}]}
@@ -424,8 +424,9 @@ class ClaudeTest(Shared):
                 {"type": "api-request-blob", "hash": _sha(sent_prompt), "message": sent_prompt},
                 {"type": "api-request", "id": "r1", "shapeHash": "h", "keep": 0, "tail": [_sha(sent_prompt)]},
                 {"type": "api-request-blob", "hash": _sha(reply), "message": reply},
-                {"type": "api-request-blob", "hash": _sha(result), "message": result},
-                {"type": "api-request", "id": "r2", "shapeHash": "h", "base": "r1", "keep": 1, "tail": [_sha(reply), _sha(result)]},
+                # The tool result is a transcript row, so Claude Code logs no blob for it: the request names the row's hash.
+                # With ``lost``, the request names a message nothing holds.
+                {"type": "api-request", "id": "r2", "shapeHash": "h", "base": "r1", "keep": 1, "tail": [_sha(reply), "gone" if lost else _sha(result)]},
             ]
         return _jsonl(self.tmpdir() / "session.jsonl", rows)
 
@@ -461,6 +462,14 @@ class ClaudeTest(Shared):
         self.assertNotIn("gen_ai.system_instructions", spans[0])
         self.assertEqual(io(spans[1])[0][-1]["parts"][0]["response"], BIG)
 
+    def test_a_logged_request_missing_a_message_keeps_its_system_prompt_and_tools(self) -> None:
+        spans = self.spans(self.transcript(logged=True, lost=True))
+        # Its messages are rebuilt from the transcript rows, which hold the prompt as typed, not as sent.
+        self.assertEqual(io(spans[1])[0][0]["parts"][0]["content"], "add a test")
+        self.assertEqual(io(spans[1])[0][-1]["parts"][0]["response"], BIG)
+        self.assertIn("You are Claude Code.", spans[1]["gen_ai.system_instructions"])
+        self.assertIn("gen_ai.tool.definitions", spans[1])
+
     def test_the_answer_the_turn_reported_completes_a_request_the_transcript_cut_short(self) -> None:
         spans = self.spans(self.transcript(logged=True, answered=False))
         self.assertEqual(io(spans[1])[1], {"role": "assistant", "parts": [{"type": "text", "content": "added"}], "finish_reason": "end_turn"})
@@ -493,7 +502,7 @@ class ClaudeTest(Shared):
         self.assertEqual([message["content"] for message in found[f"r{count - 1}"]["messages"]], [f"m{n}" for n in range(count)])
         self.assertEqual(found["r0"]["system"], "You are Claude Code.")
         for broken in ("negative", "x", "y"):  # a negative keep, a cycle
-            self.assertNotIn(broken, found)
+            self.assertIsNone(found[broken]["messages"])
 
     def test_a_subagent_replays_no_earlier_turn_of_the_main_thread(self) -> None:
         """Requests name the earlier turns they replay. A subagent's file holds only the task this turn gave it."""

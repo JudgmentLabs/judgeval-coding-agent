@@ -411,7 +411,7 @@ class GateTests(unittest.TestCase):
         open_rs = redact.Ruleset(tuple(replace(rule, needs=(), pre=None) for rule in rs.patterns),
                                  tuple(replace(rule, needs=(), pre=None) for rule in rs.members), allow=rs.allow)
         for text in self.corpus():
-            self.assertEqual(redact.redact_text(text, rs, []), redact.redact_text(text, open_rs, []))
+            self.assertEqual(redact.scrub_fields({"text": text}, rs, []), redact.scrub_fields({"text": text}, open_rs, []))
 
     def test_member_rule_needs_cover_its_keys(self):
         """Every secret key the member rules take holds a need of the rule that took it, in the JSON the rule sees."""
