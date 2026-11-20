@@ -544,10 +544,13 @@ def _contain(spans: list[dict]) -> None:
             walk(span)
 
 
-def _stamp_session(spans: list[dict], session_id: str, update_id: int | None) -> None:
+def _stamp_session(spans: list[dict], session_id: str, customer_user_id: str, update_id: int | None) -> None:
     for span in spans:
         attrs = span.setdefault("attributes", [])
         keys = {item["key"] for item in attrs}
+        # The person running the agent, as judgeval's set_customer_user_id puts it on every span.
+        if customer_user_id and "judgment.customer_user_id" not in keys:
+            attrs.append(_attr("judgment.customer_user_id", customer_user_id))
         if "judgment.session_id" not in keys:
             extra = _attr("judgment.session_id", session_id)
             if extra:
@@ -694,6 +697,8 @@ def build_request(
     # Only the folder's name leaves the machine. The full path, and the home folder's name, hold the user's account name.
     folder = Path(str(first.get("cwd") or first.get("project_root") or ""))
     workspace = "" if any(event.get("capture") == "metadata" for event in usable) or folder == Path.home() else folder.name
+    # Events the flusher reads back from a transcript carry no hook stamp, so take the first event that has one.
+    customer_user_id = next((str(event["customer_user_id"]) for event in usable if event.get("customer_user_id")), "")
     harness_version = ""
     for event in usable:
         if event.get("harness_version"):
@@ -1104,7 +1109,7 @@ def build_request(
     if redaction is not None:
         _apply_redaction(spans, spans[-1], redaction)
     _contain(spans)
-    _stamp_session(spans, session_id, update_id)
+    _stamp_session(spans, session_id, customer_user_id, update_id)
 
     resource_pairs = [
         ("service.name", harness),

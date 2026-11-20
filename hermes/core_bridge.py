@@ -85,7 +85,7 @@ class Gate:
     secrets: tuple  # ((name, value), ...) secret env values, longest first. Crosses only the pipe.
     state: str
     stamps: tuple  # ((field, value), ...) environment, project_root, export_*: each checked by redaction
-    withheld: tuple = ()  # stamps redaction changed (environment, project_root: kept redacted; export: dropped), for the helper's log
+    withheld: tuple = ()  # stamps redaction changed (environment, project_root, customer_user_id: kept redacted; export: dropped), for the helper's log
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -198,23 +198,45 @@ def _export(env: dict) -> list:
     return pairs
 
 
-def stamps(environment: str, root: str, export: list, rs: redact.Ruleset, secrets: list) -> tuple[tuple, tuple]:
+_GIT_ENV = ("HOME", "XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL")
+
+
+@functools.lru_cache(maxsize=8)
+def _git_email(home: str, xdg: str, global_config: str) -> str:
+    """``git config --global user.email`` for this home and global config file, read once per process."""
+    env = {key: value for key, value in os.environ.items() if key not in _GIT_ENV}
+    env.update((key, value) for key, value in zip(_GIT_ENV, (home, xdg, global_config)) if value)
+    try:
+        done = subprocess.run(["git", "config", "--global", "user.email"], capture_output=True, text=True, timeout=2, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return done.stdout.strip() if done.returncode == 0 else ""
+
+
+def customer_user(env: dict) -> str:
+    """The person running the agent: JUDGMENT_CUSTOMER_USER_ID from the env or the credentials file, else git's global email."""
+    user = load_credentials(env).get("JUDGMENT_CUSTOMER_USER_ID", "") or _git_email(*(env.get(key, "") for key in _GIT_ENV))
+    return "" if any(ord(char) < 32 or ord(char) == 127 for char in user) else user
+
+
+def stamps(environment: str, root: str, export: list, rs: redact.Ruleset, secrets: list, user: str = "") -> tuple[tuple, tuple]:
     """The stamps every record carries, as they may be stored: (kept, withheld names).
 
-    environment and project_root are labels once stored: redacted like text. The flusher reads
+    environment, project_root, and customer_user_id are labels once stored: redacted like text. The flusher reads
     project_root to load the project's own rules for its second pass; a redacted root makes it use the
     built-in rules, and the project's rules already ran here. The export stamp routes the turn, so it
     is never redacted: a stamp redaction would change is withheld whole and the turn is not sent.
     """
-    wanted = {"environment": environment, "project_root": root, **dict(export)}
+    labels = ("environment", "project_root", *(("customer_user_id",) if user else ()))
+    wanted = {"environment": environment, "project_root": root, **({"customer_user_id": user} if user else {}), **dict(export)}
     try:
         if rs.error:
             raise redact.RedactionLimit(rs.error)
         clean = {name: _scrub(value, rs, secrets) for name, value in wanted.items()}
     except redact.RedactionLimit:
         return (), tuple(wanted)
-    kept = [(name, clean[name]) for name in ("environment", "project_root")]
-    withheld = [name for name in ("environment", "project_root") if clean[name] != wanted[name]]
+    kept = [(name, clean[name]) for name in labels]
+    withheld = [name for name in labels if clean[name] != wanted[name]]
     if any(clean[name] != value for name, value in export):
         withheld.append("export")
     else:
@@ -257,7 +279,7 @@ def _base(workspace: str, env: dict) -> dict | None:
     api_key = load_credentials(env).get("JUDGMENT_API_KEY", "")
     secrets = tuple(redact.env_secrets(env, api_key))
     rs = _rules(settings(project))
-    kept, withheld = stamps(project["environment"], str(root), _export(env), rs, list(secrets))
+    kept, withheld = stamps(project["environment"], str(root), _export(env), rs, list(secrets), customer_user(env))
     return {"root": root, "file": file, "version": version, "project": project, "secrets": secrets, "stamps": kept, "withheld": withheld,
             "state": optin.state_dir(env)}
 
@@ -428,7 +450,9 @@ def prepare(record: dict, gate: Gate) -> dict:
     out["capture"] = gate.capture
     if not isinstance(out.get("ts"), (int, float)):
         out["ts"] = int(time.time() * 1000)
-    out.update(gate.stamps)
+    # An event whose redaction failed keeps no label (redact.outcome): it carries no customer_user_id.
+    failed = bool(out.get("redaction_error"))
+    out.update((name, value) for name, value in gate.stamps if not (failed and redact.field_class(name)["redact"]))
     return out
 
 

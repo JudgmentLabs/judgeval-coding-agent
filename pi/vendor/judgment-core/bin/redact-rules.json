@@ -734,6 +734,7 @@
       "project_root": "keep",
       "environment": "keep",
       "capture": "keep",
+      "customer_user_id": "label",
       "model": "keep",
       "provider": "keep",
       "usage": "keep",

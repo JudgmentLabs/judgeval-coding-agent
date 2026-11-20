@@ -125,6 +125,7 @@ Judgment reads the API key from the environment, or from `~/.config/judgment/cre
 | `JUDGMENT_PROJECT_ID` | Yes | Project ID. A project name is not accepted. |
 | `JUDGMENT_ORG_ID` | Personal keys | Organization ID. An ingest key does not need it. |
 | `JUDGMENT_API_URL` | No | API base URL. The default is `https://api.judgmentlabs.ai`. |
+| `JUDGMENT_CUSTOMER_USER_ID` | No | The person running the agent, sent as `judgment.customer_user_id`. The default is `git config --global user.email`. Use one value on every agent. If you set `user.email` per repository or with `includeIf "gitdir:..."`, set this variable, because the default reads only the global value. |
 | `JUDGMENT_TRACING` | No | Set to `0` to turn tracing off in every project. |
 
 Copy the project ID from the project URL in Judgment, or press Ctrl-K and search for the project ID. See [Send OTLP directly](https://docs.judgmentlabs.ai/documentation/connect/integrations/send-otlp-directly).
