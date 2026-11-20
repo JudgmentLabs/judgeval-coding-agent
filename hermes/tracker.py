@@ -61,12 +61,12 @@ State machines. Impossible states are listed so the code can refuse them.
       Impossible: two raw ids with one replacement; a raw id redaction would change, in a record.
 
   Text: kept whole here. A string is immutable, so a record holds the reference, not a copy. The
-      spooler drops a value too large to redact whole; the helper detects sensitivity and redacts on
-      complete values, and only then cuts what it keeps.
+      spooler drops a value too large to redact whole; the helper redacts complete values, and only
+      then cuts what it keeps.
 
   Structured value (tool arguments, provider tool calls; snapshot.py): one bounded pass per field.
-      within budget --> marshal bytes of a copy | over budget --> Omitted, dropped whole by the spooler
-      (an omitted input blanks its turn). pre_tool_call keeps only a reference to Hermes's arguments:
+      within budget --> marshal bytes of a copy | over budget --> Omitted, dropped whole by the spooler.
+      pre_tool_call keeps only a reference to Hermes's arguments:
       post_tool_call snapshots the same object, and only a call abandoned at turn end is snapshotted
       from that reference. The plugin snapshots post_tool_call's arguments and result and post_api_request's
       reply before it takes its lock (``_args``, ``_result``, ``_reply``); the tracker does it only when they are

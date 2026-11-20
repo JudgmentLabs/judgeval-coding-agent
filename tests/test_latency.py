@@ -1,12 +1,11 @@
 """No input makes redaction slow. Every built-in rule does linear work in both layers.
 
 Pathological text for each rule (its needed literal before = and before : , repeated) and a string of quote pairs after a value,
-as tool output for a text rule and as a command for a path or command rule, at two size pairs: 2K to 8K (one window) and
-64K to 256K (many). Four times the text must take at most RATIO times as long, plus a little slack for timer noise: about
+as tool output, at two size pairs: 2K to 8K (one window) and 64K to 256K (many). Four times the text must take at most RATIO times as long, plus a little slack for timer noise: about
 4 for linear work (jq's string handling makes some cases about 6), 16 for quadratic. Each layer is timed inside one
 process per size, so process start and jq's compile are not counted, and that process has a timeout, so an exponential
-case fails instead of hanging. A size pair with a slow case is measured again, and each case keeps its faster time. Project regexes (redactPatterns, redactCommands, redactPaths globs) are the user's: a slow
-one is a known limit.
+case fails instead of hanging. A size pair with a slow case is measured again, and each case keeps its faster time. Project
+regexes (redactPatterns) are the user's: a slow one is a known limit.
 """
 
 from __future__ import annotations
@@ -32,26 +31,19 @@ def fill(unit: str, size: int) -> str:
     return (unit * (size // max(len(unit), 1) + 1))[:size]
 
 
-def event(kind: str, text: str) -> dict:
-    if kind == "output":
-        return {**BASE, "tool_input": {"command": "make"}, "tool_output": text}
-    return {**BASE, "tool_input": {"command": text}, "tool_output": "ok"}
+def event(text: str) -> dict:
+    return {**BASE, "tool_input": {"command": "make"}, "tool_output": text}
 
 
 def cases(size: int) -> list[tuple[str, dict]]:
-    """(name, event): one per distinct text and kind."""
+    """(name, event): one per distinct text."""
     done = redact.compiled()
-    rules = [("output", rule) for rule in done["patterns"] + [done["names"]["assignment"], done["names"]["field"]]]
-    rules += [("command", rule) for rule in done["sensitive"]["paths"] + done["sensitive"]["commands"]]
-    out = {("output", 'f(password="pw") ' + "''" * (size // 2) + ' "'): "quote pairs after a value"}
-    # A command start that does not stop the help check, and one inside a prefix token.
-    out[("command", fill("$(gh auth token ", size) + " --help")] = "command starts before --help"
-    out[("command", fill("{", size) + "gh auth status")] = "braces before a command"
-    for kind, rule in rules:
+    out = {'f(password="pw") ' + "''" * (size // 2) + ' "': "quote pairs after a value"}
+    for rule in done["patterns"] + [done["names"]["assignment"], done["names"]["field"]]:
         need = (rule.get("needs") or ["key"])[0]
         for sep in ("=", ": "):
-            out.setdefault((kind, fill(need + sep, size)), f"{rule['id']}: {need + sep!r}")
-    return [(name, event(kind, text)) for (kind, text), name in out.items()]
+            out.setdefault(fill(need + sep, size), f"{rule['id']}: {need + sep!r}")
+    return [(name, event(text)) for text, name in out.items()]
 
 
 # One Python process per size: each case through the hook's mirror and the sender's pass, best of `runs`.
@@ -129,7 +121,7 @@ class LinearGrowthTests(unittest.TestCase):
         pem = "-----BEGIN RSA PRIV" + "ATE KEY-----\nMIIabc\n-----END RSA PRIV" + "ATE KEY-----\n"
         tokens = " ".join("gh" + "p_" + format(n, "036d") for n in range(200))
         for text in (pem * 40, tokens):
-            item = event("output", text)
+            item = event(text)
             py = redact.sanitize_event(item, redact.ruleset(), [])
             out = subprocess.run(["jq", "-L", str(CORE / "bin"), "-c", JQ_PREPARE + 'judgment_prepare({enabled: true}; "on"; "/r"; "")'],
                                  input=json.dumps(item), capture_output=True, text=True, env=clean_env(), timeout=30)

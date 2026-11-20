@@ -6,8 +6,8 @@ one row each, run
         (claude, codex, cursor, pi) into the inbox, and then through the sender's own pass (redact_event) over what the
         hook wrote.
 
-Each run is held to the row's expected outcome (unchanged, redacted, blanked, error, or leaks for a row a documented known
-limit lets through; known_gap rows only to layer agreement). A row whose limit is set names one of TABLE["limits"].
+Each run is held to the row's expected outcome (unchanged, redacted, error, or leaks for a row a documented known limit
+lets through; known_gap rows only to layer agreement). A row whose limit is set names one of TABLE["limits"].
 Rule tables are data: a change to one that breaks any row's case fails here, by row id.
 
 Every fake secret is generated at run time from the row's placeholders (<<name>>); the table holds none.
@@ -27,14 +27,13 @@ import unittest
 from pathlib import Path
 
 from support import Sandbox, assert_parity, clean_env, tool
-from test_matrix import model_call
 
 from judgment_core import redact
 
 TABLE = json.loads((Path(__file__).resolve().parent / "regressions.json").read_text(encoding="utf-8"))
 ROWS = TABLE["rows"]
 LIMITS = TABLE["limits"]
-EXPECTS = ("unchanged", "redacted", "blanked", "error", "leaks", "known_gap")
+EXPECTS = ("unchanged", "redacted", "error", "leaks", "known_gap")
 TOOL_ROUTES = ("output", "structured", "command", "input")
 ADAPTERS = ("claude", "codex", "cursor", "pi")
 PLACEHOLDER = re.compile(r"<<([a-z0-9]+)(?::([0-9]+))?>>")
@@ -62,6 +61,12 @@ SECRETS = {
 }
 
 
+def model_call(arguments) -> dict:
+    """A model event as transcript enrichment writes it: the call's arguments, as codex_transcript wraps free-form input."""
+    return {"v": 1, "harness": "codex", "event": "model", "session_id": "s", "turn_id": "t", "output": "ok",
+            "tool_calls": [{"id": "c1", "name": "apply_patch", "arguments": arguments}]}
+
+
 def filler(n: int) -> str:
     return ("hello world " * (n // 12 + 1))[:n]
 
@@ -87,7 +92,7 @@ class Case:
         if row.get("wrap"):
             self.input = row["wrap"].replace("{}", self.input)
         self.env = {key: self._fill(value) for key, value in row.get("env", {}).items()}
-        default = "<<opaque>>" if row["route"] in ("command", "input") and row["expect"] in ("blanked", "leaks") else "ok"
+        default = "<<opaque>>" if row["route"] in ("command", "input") and row["expect"] == "leaks" else "ok"
         self.output = self._fill(row.get("output", default))
 
     def _fill(self, value):
@@ -153,32 +158,25 @@ class Case:
         expect, row = self.row["expect"], self.row
         text = json.dumps(out, ensure_ascii=False)
         found = []
-        if expect in ("redacted", "blanked", "error"):
+        if expect in ("redacted", "error"):
             leaked = [core[:6] + "..." for core in self.cores if _leaks(core, out, row.get("strings_only", False))]
             leaked += [item for item in (self._fill(a) for a in row.get("absent", [])) if item in text]
             if leaked:
                 found.append(f"{where}: leaks {leaked}")
         if expect == "unchanged":
-            if out.get("sensitive") or out.get("redaction_error") or out.get("redactions"):
-                found.append(f"{where}: not unchanged: sensitive={out.get('sensitive_rule')} error={out.get('redaction_error')} records={out.get('redactions')}")
+            if out.get("redaction_error") or out.get("redactions"):
+                found.append(f"{where}: not unchanged: error={out.get('redaction_error')} records={out.get('redactions')}")
             elif row["route"] in TOOL_ROUTES and (out.get("tool_input") != self.tool_input() or out.get("tool_output") != self.tool_output()):
                 found.append(f"{where}: changed: {json.dumps(out.get('tool_output'))[:160]}")
-        if expect == "redacted" and (out.get("sensitive") or out.get("redaction_error")):
-            found.append(f"{where}: lost its text: sensitive={out.get('sensitive_rule')} error={out.get('redaction_error')}")
-        if expect == "blanked":
-            if not out.get("sensitive"):
-                found.append(f"{where}: not blanked")
-            elif row.get("rule") and out.get("sensitive_rule") != row["rule"]:
-                found.append(f"{where}: blanked by {out.get('sensitive_rule')}, not {row['rule']}")
+        if expect in ("redacted", "leaks") and out.get("redaction_error"):
+            found.append(f"{where}: lost its text: {out.get('redaction_error')}")
         if expect == "leaks":
             if not any(_leaks(core, out, row.get("strings_only", False)) for core in self.cores):
                 found.append(f"{where}: no longer leaks: the known limit {row.get('limit')} is fixed, so the row moves to redacted")
-            if out.get("sensitive") or out.get("redaction_error"):
-                found.append(f"{where}: lost its text: sensitive={out.get('sensitive_rule')} error={out.get('redaction_error')}")
         if expect == "error" and not out.get("redaction_error"):
             found.append(f"{where}: no redaction_error")
         for keep in row.get("keep", []):
-            if expect != "blanked" and keep not in text:
+            if keep not in text:
                 found.append(f"{where}: lost {keep!r}")
         return found
 

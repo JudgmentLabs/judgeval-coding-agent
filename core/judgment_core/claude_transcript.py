@@ -6,11 +6,15 @@ and it is read here, after the turn has been spooled, not inside the hook.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
+from judgment_core.messages import assistant_message, media_part, tool_message
+from judgment_core.rows import parse_line
 from judgment_core.rows import records as _records
 
 
@@ -304,6 +308,312 @@ def _subagent_transcript(main: Path | None, agent_id: str, explicit: str) -> Pat
     return None
 
 
+def _media(block: dict) -> dict | None:
+    source = block.get("source") if isinstance(block.get("source"), dict) else {}
+    modality = "image" if block.get("type") == "image" else "file"
+    media_type = str(source.get("media_type") or "") or None
+    if source.get("type") == "base64" and source.get("data"):
+        return media_part(modality, f"data:{media_type or ''};base64,{source['data']}", media_type)
+    if source.get("url"):
+        return media_part(modality, str(source["url"]), media_type)
+    if source.get("type") == "text" and source.get("data") is not None:
+        return {"type": "text", "content": str(source["data"])}
+    return None
+
+
+def _result_value(content: object) -> object:
+    """A tool_result as the model read it: text, or its parts when it holds an image or file."""
+    if not isinstance(content, list) or all(not isinstance(block, dict) or block.get("type") == "text" for block in content):
+        return _result_text(content)
+    parts = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append({"type": "text", "content": block})
+        elif isinstance(block, dict) and block.get("type") == "text":
+            parts.append({"type": "text", "content": str(block.get("text") or "")})
+        elif isinstance(block, dict):
+            media = _media(block)
+            if media:
+                parts.append(media)
+    return parts
+
+
+def _assistant_of(content: object) -> dict:
+    """An Anthropic assistant message as one GenAI message. Thinking keeps its text only; empty or redacted thinking and signatures are dropped."""
+    if isinstance(content, str):
+        return assistant_message(content, [])
+    blocks = [block for block in content if isinstance(block, dict)] if isinstance(content, list) else []
+    reasoning = [str(block["thinking"]) for block in blocks if block.get("type") == "thinking" and block.get("thinking")]
+    text = "\n".join(str(block["text"]) for block in blocks if block.get("type") == "text" and block.get("text"))
+    calls = [
+        {"id": str(block.get("id") or ""), "name": str(block.get("name") or "tool"), "arguments": block.get("input") if block.get("input") is not None else {}}
+        for block in blocks
+        if block.get("type") in ("tool_use", "server_tool_use")
+    ]
+    return assistant_message(text, calls, reasoning)
+
+
+def _converted(message: dict) -> list[dict]:
+    """One Anthropic message as GenAI messages. A user message's tool results become tool messages, in place."""
+    content = message.get("content")
+    if message.get("role") == "assistant":
+        return [_assistant_of(content)]
+    if isinstance(content, str):
+        return [{"role": "user", "parts": [{"type": "text", "content": content}]}]
+    out: list[dict] = []
+    parts: list[dict] = []
+    for block in content if isinstance(content, list) else []:
+        if isinstance(block, str):
+            parts.append({"type": "text", "content": block})
+            continue
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_result":
+            if parts:
+                out.append({"role": "user", "parts": parts})
+                parts = []
+            out.append(tool_message(str(block.get("tool_use_id") or ""), _result_value(block.get("content"))))
+        elif block.get("type") == "text":
+            parts.append({"type": "text", "content": str(block.get("text") or "")})
+        else:
+            media = _media(block)
+            if media:
+                parts.append(media)
+    if parts:
+        out.append({"role": "user", "parts": parts})
+    return out
+
+
+def _tool_definition(tool: dict) -> dict:
+    if "input_schema" not in tool:
+        # A server tool such as web search: Anthropic names its type.
+        return {"type": "provider", "id": f"anthropic.{tool.get('type') or tool.get('name')}", "name": str(tool.get("name") or ""), "args": {key: value for key, value in tool.items() if key not in ("name", "type")}}
+    item = {"type": "function", "name": str(tool.get("name") or "")}
+    if tool.get("description"):
+        item["description"] = str(tool["description"])
+    item["inputSchema"] = tool["input_schema"]
+    return item
+
+
+def _call_ids(content: object) -> tuple[str, ...]:
+    return tuple(str(block.get("id")) for block in content if isinstance(block, dict) and block.get("type") == "tool_use") if isinstance(content, list) else ()
+
+
+def _exact_requests(rows: list[dict]) -> tuple[dict[str, dict], dict[tuple[str, ...], dict]]:
+    """Each logged API request by id (its system prompt, tools, and messages), and each logged reply by its tool call ids.
+
+    A transcript row fills in a call's default arguments. The logged reply is what the model wrote.
+
+    Claude Code logs a request as a shape (system and tools), the messages it
+    kept from a base request, and new messages by content hash.
+    """
+    shapes = {str(row.get("shapeHash")): row.get("shape") for row in rows if row.get("type") == "api-request-shape" and isinstance(row.get("shape"), dict)}
+    blobs = {str(row.get("hash")): row.get("message") for row in rows if row.get("type") == "api-request-blob" and isinstance(row.get("message"), dict)}
+    sent_replies = {_call_ids(message.get("content")): message for message in blobs.values() if message.get("role") == "assistant" and _call_ids(message.get("content"))}
+    logged = {str(row.get("id")): row for row in rows if row.get("type") == "api-request" and row.get("id")}
+    # A message the transcript already holds is not logged as a blob: a request names it by its hash. That is a user
+    # row's message as written, or with the user rows since the last reply joined into one list of blocks, and an
+    # assistant message as one row wrote it or as the rows of one reply add up to.
+    merged: dict[tuple[str, str], list[dict]] = {}
+    run: list = []
+    for row in rows:
+        message = _message(row)
+        if _role(row) == "user":
+            content = message.get("content")
+            # ponytail: every user row re-hashes the run so far, the square of a run with no reply in it. Runs are short
+            # in real transcripts; cap the run if one ever is not.
+            run = run + ([{"type": "text", "text": content}] if isinstance(content, str) else content if isinstance(content, list) else [])
+            for form in (message, {"role": "user", "content": run}):
+                blobs.setdefault(_blob_hash(form), form)
+        elif _role(row) == "assistant":
+            run = []
+        if _role(row) == "assistant" and isinstance(message.get("content"), list):
+            blobs.setdefault(_blob_hash({"role": "assistant", "content": message["content"]}), {"role": "assistant", "content": message["content"]})
+            for key in (("request", str(row.get("requestRef") or "")), ("message", _message_id(row))):
+                if key[1]:
+                    merged.setdefault(key, []).extend(message["content"])
+    for content in merged.values():
+        blobs.setdefault(_blob_hash({"role": "assistant", "content": content}), {"role": "assistant", "content": content})
+    built: dict[str, list[dict] | None] = {}
+
+    def own(row: dict, base: list[dict]) -> list[dict] | None:
+        """The request's messages from its base's: the first ``keep`` of them, then its new ones."""
+        try:
+            keep = int(row.get("keep") or 0)
+        except (TypeError, ValueError):
+            return None
+        tail = [blobs.get(str(key)) for key in row.get("tail") or []]
+        if keep < 0 or keep > len(base) or any(blob is None for blob in tail):
+            return None
+        return base[:keep] + tail
+
+    def messages(request_id: str) -> list[dict] | None:
+        """Walk the chain of bases down to a built or base-less request, then build back up. A long session chains
+        thousands of requests, so this is a loop, not recursion. A missing base, or a cycle, leaves the chain missing."""
+        chain: list[str] = []
+        seen: set[str] = set()
+        current = request_id
+        while current not in built:
+            row = logged.get(current)
+            if row is None or current in seen:
+                built.update(dict.fromkeys(chain))
+                return None
+            seen.add(current)
+            chain.append(current)
+            if not row.get("base"):
+                break
+            current = str(row["base"])
+        base = built[current] if current in built else []
+        for ident in reversed(chain):
+            found = own(logged[ident], base) if base is not None else None
+            built[ident] = found
+            base = found
+        return built[request_id]
+
+    # The system prompt and tools are known whenever the shape is, whether or not every message was found: ``messages``
+    # is None when one was not, and the caller rebuilds them from the transcript.
+    found = {}
+    for request_id, row in logged.items():
+        shape = shapes.get(str(row.get("shapeHash"))) or {}
+        found[request_id] = {
+            "messages": messages(request_id),
+            "system": _system_text(shape.get("system")),
+            "tools": [_tool_definition(tool) for tool in shape.get("tools") or [] if isinstance(tool, dict)],
+        }
+    return found, sent_replies
+
+
+def _blob_hash(message: dict) -> str:
+    """The hash Claude Code names a request message by."""
+    return hashlib.sha256(json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _system_text(system: object) -> str:
+    """A request's system prompt: a string, or a list of text blocks."""
+    if isinstance(system, str):
+        return system
+    return "\n".join(str(block.get("text") or "") for block in system or [] if isinstance(block, dict) and block.get("type") == "text") if isinstance(system, list) else ""
+
+
+def _is_compaction(row: dict) -> bool:
+    """Where the model's history restarts. Rows before the last one are not in a request."""
+    return row.get("type") == "system" and row.get("subtype") == "compact_boundary"
+
+
+def _pins(kept: list[dict]) -> Callable[[bytes], dict | None]:
+    """Rows from before the compaction a large transcript is read back to that a reader still needs: the shapes, blobs,
+    and base requests the kept logged requests point to, and every earlier prompt (the compaction summary holds its turn)."""
+    shapes: set[str] = set()
+    blobs: set[str] = set()
+    requests: set[str] = set()
+
+    def want(row: dict) -> None:
+        shapes.add(str(row.get("shapeHash")))
+        blobs.update(str(key) for key in row.get("tail") or [])
+        if row.get("base"):
+            requests.add(str(row["base"]))
+
+    for row in kept:
+        if row.get("type") == "api-request":
+            want(row)
+
+    def test(line: bytes) -> dict | None:
+        if b'"api-request' in line:
+            row = parse_line(line)
+            kind = row.get("type") if row else None
+            if kind == "api-request" and str(row.get("id")) in requests:
+                want(row)
+                return row
+            if (kind == "api-request-shape" and str(row.get("shapeHash")) in shapes) or (kind == "api-request-blob" and str(row.get("hash")) in blobs):
+                return row
+            return None
+        # Every earlier prompt, with a promptId or not: one without names a turn nothing can vouch for, and the reader
+        # must see it to say so. A tool result is a user row too. An escaped quote inside a string never reads as "user".
+        if b'"user"' in line and b'"type":"tool_result"' not in line and b'"type": "tool_result"' not in line:
+            row = parse_line(line)
+            return row if row is not None and _is_prompt(row) else None
+        return None
+
+    return test
+
+
+def _earlier_turns(rows: list[dict], before: int, turn_id: str, *, main: bool) -> list[str]:
+    """The turns whose prompts come before ``rows[before]``: what the request replays, its compaction summary included.
+
+    Each is named by its prompt id, which is the hook's turn id. A main-thread prompt with no id names a turn nothing can
+    find, as "?". A subagent's file holds only the tasks its parent gave it, each stamped with that turn's prompt id.
+    """
+    found: set[str] = set()
+    for row in rows[:before]:
+        if not _is_prompt(row):
+            continue
+        prompt_id = str(row.get("promptId") or "")
+        if prompt_id:
+            if prompt_id != turn_id:
+                found.add(prompt_id)
+        elif main and not row.get("isMeta"):
+            found.add("?")
+    return sorted(found)
+
+
+def _replayed(rows: list[dict], before: dict, side: bool, agent: str) -> list[dict]:
+    """Without a logged request, the transcript's messages before ``before`` since the last compaction, as the request
+    replayed them. A sidechain sees only its own agent's rows."""
+    messages: list[dict] = []
+    current = ""
+    for row in rows:
+        if row is before:
+            break
+        if _is_compaction(row):
+            messages, current = [], ""
+            continue
+        if _role(row) not in ("user", "assistant") or (row.get("isSidechain") is True) != side:
+            continue
+        if side and str(row.get("agentId") or "") != agent:
+            continue
+        message = _message(row)
+        if _role(row) == "assistant":
+            content = message.get("content")
+            content = [{"type": "text", "text": content}] if isinstance(content, str) else content if isinstance(content, list) else []
+            mid = _message_id(row)
+            if mid and mid == current and messages and messages[-1].get("content") is not None:
+                messages[-1]["content"].extend(content)
+            else:
+                messages.append({"role": "assistant", "content": list(content)})
+            current = mid
+        else:
+            messages.append({"role": "user", "content": message.get("content")})
+            current = ""
+    return messages
+
+
+def _add_context(rows: list[dict], groups: list[dict], turn_id: str, *, main: bool) -> None:
+    """Set each request's exact input messages, output message, system prompt, tools, and stop reason, and the earlier
+    turns those input messages hold (``replay_turns``): the sender checks each was traced before it sends them."""
+    exact, sent_replies = _exact_requests(rows) if any(row.get("type") == "api-request" for row in rows) else ({}, {})
+    position = {id(row): index for index, row in enumerate(rows)}
+    for group in groups:
+        own = group.get("rows") or []
+        if not own:
+            continue
+        blocks = [block for row in own for block in (_message(row).get("content") or []) if isinstance(block, dict)]
+        reply = sent_replies.get(_call_ids(blocks)) if _call_ids(blocks) else None
+        group["output_message"] = _assistant_of(reply["content"] if reply else blocks)
+        stop = next((_message(row).get("stop_reason") for row in reversed(own) if _message(row).get("stop_reason")), None)
+        if stop:
+            group["finish_reason"] = str(stop)
+        logged = exact.get(str(own[0].get("requestRef") or "")) or {}
+        if logged.get("system"):
+            group["system_instructions"] = logged["system"]
+        if logged.get("tools"):
+            group["tool_definitions"] = logged["tools"]
+        sent = logged.get("messages")
+        if sent is None:
+            sent = _replayed(rows, own[0], own[0].get("isSidechain") is True, str(own[0].get("agentId") or ""))
+        group["input_messages"] = [converted for message in sent for converted in _converted(message)]
+        group["replay_turns"] = _earlier_turns(rows, position.get(id(own[0]), len(rows)), turn_id, main=main)
+
+
 def _model_event(seed: dict, assistant: dict, *, prompt: str) -> dict:
     item = {
         "v": 1,
@@ -327,6 +637,11 @@ def _model_event(seed: dict, assistant: dict, *, prompt: str) -> dict:
         item["tool_results"] = assistant["tool_results"]
     if assistant.get("agent_id"):
         item["agent_id"] = assistant["agent_id"]
+    for key in ("input_messages", "output_message", "system_instructions", "tool_definitions", "finish_reason"):
+        if assistant.get(key):
+            item[key] = assistant[key]
+    if "input_messages" in item:
+        item["replay_turns"] = list(assistant.get("replay_turns") or [])
     start_ms = assistant.get("start_ms")
     end_ms = assistant.get("end_ms")
     if start_ms is not None:
@@ -380,7 +695,7 @@ def enrich_claude_events(
         rows: list[dict] = []
         since = min((_as_int(event.get("ts")) or 0 for event in source), default=0) or None
         for attempt in range(max(attempts, 1)):
-            rows = _records(path, since)
+            rows = _records(path, since, _is_compaction, _pins)
             found = _assistant_after(rows, prompt, anchor_ms=_as_int(anchor), end_ms=_as_int(end_ms), turn_id=turn_id)
             if found and (not final or _contains(rows, final)):
                 break
@@ -393,6 +708,7 @@ def enrich_claude_events(
         ]
         results.update(_tool_results(rows))
         _attach_results(assistants, {**_agent_answers(assistants, source), **results})
+        _add_context(rows, assistants, turn_id, main=True)
         first_main = True
         for assistant in assistants:
             text = prompt if first_main else ""
@@ -459,6 +775,7 @@ def enrich_claude_events(
         sub_results = _tool_results(sub_rows)
         results.update(sub_results)
         _attach_results(groups, sub_results)
+        _add_context(sub_rows, groups, turn_id, main=False)
         for index, assistant in enumerate(groups):
             assistant["agent_id"] = assistant.get("agent_id") or agent_id
             added.append(_model_event(seed, assistant, prompt=task if index == 0 else ""))
@@ -610,6 +927,7 @@ def _assistant_after(
                 group["model"] = model
             if calls:
                 _extend_calls(group, calls)
+            group["rows"].append(row)
             for key in keys:
                 index_by_id[key] = found
             if stamp is not None:
@@ -628,6 +946,7 @@ def _assistant_after(
             "end_ms": stamp if stamp is not None else start_ms,
             "agent_id": agent,
             "tool_calls": calls,
+            "rows": [row],
         }
         groups.append(group)
         for key in keys:

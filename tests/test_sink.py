@@ -17,8 +17,7 @@ from support import HOOK, SECRETS, Sandbox, claude_transcript, leaks, secret_blo
 
 ENV_FILE = "DATABASE_URL=postgres://app:" + "Lq" + "9xT" * 4 + "@db/app\nFEATURE_FLAG=on\n"
 TIME_KEYS = ("startTimeUnixNano", "endTimeUnixNano")
-REDACTION_KEYS = ("judgment.redacted", "judgment.redaction_count", "judgment.redactions", "judgment.redacted_reason",
-                  "judgment.redacted_rule", "judgment.redacted_trigger", "judgment.redaction_error")
+REDACTION_KEYS = ("judgment.redacted", "judgment.redaction_count", "judgment.redactions", "judgment.redaction_error")
 TOKEN_KEYS = ("judgment.usage.non_cached_input_tokens", "judgment.usage.output_tokens", "judgment.usage.cache_read_input_tokens",
               "judgment.usage.total_cost_usd", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens")
 
@@ -103,33 +102,21 @@ class SinkTests(unittest.TestCase):
         self.assertEqual(leaks(json.dumps(audit)), [])
         self.assertTrue(any("judgment.redaction_count" in attrs(span) for span in a if span.get("parentSpanId")))
 
-        blanked = [group for group in turns.values() if attrs(roots(group)[0]).get("judgment.redacted_reason")]
-        self.assertEqual(len(blanked), 1)
-        root_b = attrs(roots(blanked[0])[0])
-        self.assertEqual((root_b["judgment.redacted_reason"], root_b["judgment.redacted_rule"], root_b["judgment.redacted_trigger"]), ("sensitive_path", "dotenv", "~/proj/.env"))
-        self.assertTrue(root_b["judgment.redacted"])
-        for span in blanked[0]:
-            a_ = attrs(span)
-            self.assertEqual((a_.get("judgment.input", ""), a_.get("judgment.output", "")), ("", ""), span["name"])
-        self.assertTrue(any(attrs(span).get("judgment.usage.output_tokens") for span in blanked[0]))
+        # Reading .env sends the turn: its URL password is redacted, the rest of the file is not secret.
+        b = turns["what is in the env file"]
+        root_b = attrs(roots(b)[0])
+        self.assertIn(("url_password", "tool_output"), {(item["rule"], item["field"]) for item in json.loads(root_b["judgment.redactions"])})
+        tool_b = next(attrs(span) for span in b if attrs(span).get("judgment.span_kind") == "tool")
+        self.assertIn("postgres://app:[REDACTED:url_password]@db/app", tool_b["judgment.output"])
+        self.assertIn("FEATURE_FLAG=on", tool_b["judgment.output"])
 
         c = turns["now run the tests"]
         root_c = attrs(roots(c)[0])
-        self.assertNotIn("judgment.redacted_reason", root_c)
-        self.assertEqual((root_c["judgment.redacted"], root_c["judgment.redaction_count"]), (False, "0"))
         self.assertEqual(root_c["judgment.output"], "All 42 tests pass.")
         history = next(attrs(span)["judgment.input"] for span in c if attrs(span).get("judgment.span_kind") == "llm")
-        self.assertIn("[REDACTED:openai_key]", history)  # turn A rides along, redacted
-        self.assertNotIn("what is in the env file", history)  # the blanked turn does not
-        self.assertNotIn("DATABASE_URL", history)
-
-        index = json.loads((sb.state / "index.json").read_text())
-        flagged = [item for item in index.values() if item.get("blanked")]
-        self.assertEqual(len(flagged), 1)
-        self.assertIsNone(flagged[0]["summary"])
-        stored = (sb.state / "turns" / "claude-code" / "cc-1" / "pb.jsonl").read_text()
-        self.assertNotIn("what is in the env file", stored)
-        self.assertNotIn("DATABASE_URL", stored)
+        self.assertIn("now run the tests", history)
+        self.assertIn("what is in the env file", history)  # the transcript replays every earlier turn, redacted
+        self.assertIn("[REDACTED:url_password]", history)
 
     def test_structure_matches_raw(self):
         _, sanitized, _ = self.run_session({"enabled": True})

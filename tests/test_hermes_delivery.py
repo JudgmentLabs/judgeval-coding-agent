@@ -230,38 +230,6 @@ class Helper(Case):
 
 
 class Backpressure(Case):
-    def test_spawn_exhaustion_strips_later_text_for_the_dropped_turn(self):
-        spooler, core = module("spooler"), load_plugin().core
-        gate = core.Gate("sanitized", core.settings({}), (), str(self.sb.state), ())
-        spool = spooler.Outbox()
-        record = {"harness": "hermes", "session_id": "s", "turn_id": "t", "event": "model", "tool_calls": []}
-        spool.unsent.append(spooler.Entry(1, "rec", gate, record, 64))
-        spool.bytes = 64
-        spool.deaths = spooler.HELPER_TRIES
-        spool._drop_dead_end()
-        following = {**record, "event": "turn_end", "output": "unformatted-private-value"}
-        encoded = spool._encode(spooler.Entry(2, "rec", gate, following, 64), {})
-        self.assertNotIn(b"unformatted-private-value", encoded)
-        self.assertIn(b"queue_loss", encoded)
-
-    def test_dropped_sensitive_evidence_blanks_later_output(self):
-        spooler = module("spooler")
-        turn = Turn(new_session_id(), "read the settings")
-        call = turn.api(tool=("terminal", {"command": "cat .env"}))
-        turn.tool(call, "terminal", {"command": "cat .env"}, "unformatted-private-value")
-        cutoff = len(turn.events)
-        turn.api(text="unformatted-private-value")
-        turn.end("unformatted-private-value")
-        with plugin_env(self.sb) as (plugin, ctx):
-            fire_all(ctx, turn.events[:2], plugin)
-            self.assertTrue(wait_until(lambda: plugin.spool.handed_over()))
-            with mock.patch.object(spooler, "QUEUE_BYTES", 0):
-                fire_all(ctx, turn.events[2:cutoff], plugin)
-            fire_all(ctx, turn.events[cutoff:], plugin)
-        spans = self.flushed()
-        self.assertEqual(attrs(roots(spans)[0])["judgment.output"], "")
-        self.assertNotIn("unformatted-private-value", self.sb.state_text() + self.sink.text())
-
     def dense_turns(self, count: int) -> list:
         text = ("line " + "z" * 60 + "\n") * 800  # ~52 KB
         events = []
@@ -494,10 +462,7 @@ class Replay(Case):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(b"shutdown-helper-complete", result.stdout, result.stderr)
                 root = roots(self.sink.spans())[0]
-                self.assertEqual(attrs(root)["judgment.output"], value if failures == 1 else "")
-                if failures == -1:
-                    self.assertEqual(attrs(root)["judgment.redacted_rule"], "queue_loss")
-                    self.assertNotIn(value, self.sb.state_text() + self.sink.text())
+                self.assertEqual(attrs(root)["judgment.output"], value)
 
     def test_surrogate_answer_keeps_the_closing_record(self):
         turn = simple_turn(new_session_id(), "hello", path="notes.txt", result="hello", answer="answer\ud800")

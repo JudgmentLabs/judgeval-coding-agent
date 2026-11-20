@@ -9,16 +9,15 @@
     "  route    how the input reaches the layers:",
     "             output      tool output text (command x)",
     "             structured  tool output as a JSON value",
-    "             command     the tool input's command; the tool output is <<opaque>> unless output is given",
+    "             command     the tool input's command; the tool output is output, or <<opaque>> in a leaks row and ok otherwise",
     "             input       the tool input as a JSON value (file_path, a Codex patch as input, ...)",
     "             transcript  a model event's tool call arguments, as transcript enrichment writes them (no hook sees it)",
     "             label       extra event fields (agent_name)",
-    "  expect   unchanged   byte for byte, no record, not sensitive",
-    "           redacted    every generated secret gone (and every absent string), the event neither sensitive nor dropped",
-    "           blanked     sensitive: the text is gone, every generated secret with it (rule: the rule that blanked it)",
+    "  expect   unchanged   byte for byte, no record",
+    "           redacted    every generated secret gone (and every absent string), its text not dropped",
     "           error       the rules failed (an invalid user regex): the text is dropped, every generated secret with it",
-    "           leaks       the row's limit lets a generated secret through: at least one is still there, the event neither",
-    "                       sensitive nor dropped (an explicit known limit, not a defect)",
+    "           leaks       the row's limit lets a generated secret through: at least one is still there, its text not",
+    "                       dropped (an explicit known limit, not a defect)",
     "  limit    the id of a known limit (limits below, each described in README.md, Known limits) the row's expect follows",
     "  env, cfg, output, keep (strings that must stay), absent (literal secrets that must go), numbers (members made numbers),",
     "  layers (the input serialized into a member of each name in turn: JSON nested in a string), encode (the text",
@@ -98,42 +97,6 @@
         "agent_name": "task <<github>>"
       },
       "expect": "redacted"
-    },
-    {
-      "id": "string-tool-input-env",
-      "route": "input",
-      "input": "env",
-      "expect": "blanked",
-      "rule": "env_dump"
-    },
-    {
-      "id": "cat-credentials",
-      "route": "command",
-      "input": "cat credentials",
-      "expect": "blanked",
-      "rule": "credentials_file"
-    },
-    {
-      "id": "usr-bin-env",
-      "route": "command",
-      "input": "/usr/bin/env",
-      "expect": "blanked",
-      "rule": "env_dump",
-      "source": "command.prefix reads this wrapper"
-    },
-    {
-      "id": "env-0",
-      "route": "command",
-      "input": "env -0",
-      "expect": "leaks",
-      "limit": "wrapped-command"
-    },
-    {
-      "id": "dotenv-with-token-suffix",
-      "route": "command",
-      "input": "cat .env.<<github>>",
-      "expect": "blanked",
-      "rule": "dotenv"
     },
     {
       "id": "member-expression",
@@ -283,20 +246,6 @@
       ]
     },
     {
-      "id": "git-show-dotenv",
-      "route": "command",
-      "input": "git show HEAD:.env",
-      "expect": "blanked",
-      "rule": "dotenv"
-    },
-    {
-      "id": "rg-credentials",
-      "route": "command",
-      "input": "rg . credentials",
-      "expect": "blanked",
-      "rule": "credentials_file"
-    },
-    {
       "id": "command-v-printenv",
       "route": "command",
       "input": "command -v printenv",
@@ -381,30 +330,6 @@
       "source": "fails closed"
     },
     {
-      "id": "bash-c-env",
-      "route": "command",
-      "input": "bash -c \"env\"",
-      "expect": "blanked",
-      "rule": "env_dump",
-      "source": "command.prefix reads this wrapper"
-    },
-    {
-      "id": "command-env",
-      "route": "command",
-      "input": "command env",
-      "expect": "blanked",
-      "rule": "env_dump",
-      "source": "command.prefix reads this wrapper"
-    },
-    {
-      "id": "assignment-printenv",
-      "route": "command",
-      "input": "FOO=1 printenv",
-      "expect": "blanked",
-      "rule": "env_dump",
-      "source": "command.prefix reads this wrapper"
-    },
-    {
       "id": "env-help",
       "route": "command",
       "input": "env --help",
@@ -417,15 +342,6 @@
       "input": "env --version",
       "output": "env (GNU coreutils) 9.4",
       "expect": "unchanged"
-    },
-    {
-      "id": "quoted-semicolon",
-      "route": "command",
-      "input": "echo \"foo; printenv\"",
-      "output": "foo; printenv",
-      "expect": "blanked",
-      "limit": "mention-blanks",
-      "rule": "env_dump"
     },
     {
       "id": "multiline-quoted-password",
@@ -448,66 +364,10 @@
       "expect": "redacted"
     },
     {
-      "id": "dotenv-backup",
-      "route": "command",
-      "input": "cat .env.local~",
-      "expect": "blanked",
-      "rule": "dotenv"
-    },
-    {
-      "id": "cat-secrets",
-      "route": "command",
-      "input": "cat secrets",
-      "expect": "blanked",
-      "rule": "secret_file"
-    },
-    {
       "id": "console-log-then-code",
       "route": "output",
       "input": "console.log(\"password: \"+password);\nrunTests();\nconsole.log(\"all tests passed\");",
       "expect": "unchanged"
-    },
-    {
-      "id": "env-unset",
-      "route": "command",
-      "input": "env --unset DEBUG",
-      "expect": "leaks",
-      "limit": "wrapped-command"
-    },
-    {
-      "id": "env-chdir",
-      "route": "command",
-      "input": "env --chdir /tmp",
-      "expect": "leaks",
-      "limit": "wrapped-command"
-    },
-    {
-      "id": "env-unset-printenv",
-      "route": "command",
-      "input": "env --unset DEBUG printenv",
-      "expect": "leaks",
-      "limit": "wrapped-command"
-    },
-    {
-      "id": "timeout-env",
-      "route": "command",
-      "input": "timeout 5 env",
-      "expect": "leaks",
-      "limit": "wrapped-command"
-    },
-    {
-      "id": "quoted-assignment-env",
-      "route": "command",
-      "input": "FOO=\"a b\" env",
-      "expect": "leaks",
-      "limit": "wrapped-command"
-    },
-    {
-      "id": "sudo-long-option-env",
-      "route": "command",
-      "input": "sudo --user=root env",
-      "expect": "leaks",
-      "limit": "wrapped-command"
     },
     {
       "id": "commit-message-mention",
@@ -552,34 +412,32 @@
       "id": "codex-patch-dotenv-hook",
       "route": "input",
       "input": {
-        "input": "*** Begin Patch\n*** Update File: .env\n@@\n-SESSION_COOKIE=<<opaque>>\n+SESSION_COOKIE=\n*** End Patch"
+        "input": "*** Begin Patch\n*** Update File: .env\n@@\n-SESSION_SECRET=<<opaque>>\n-JWT_SIGNING_KEY=<<opaque2>>\n+SESSION_SECRET=\n*** End Patch"
       },
-      "expect": "blanked",
-      "rule": "dotenv"
+      "expect": "redacted",
+      "keep": [
+        "SESSION_SECRET=",
+        "JWT_SIGNING_KEY="
+      ],
+      "output": "Success"
     },
     {
       "id": "codex-patch-dotenv-transcript",
       "route": "transcript",
       "input": {
-        "input": "*** Begin Patch\n*** Update File: .env\n@@\n-SESSION_COOKIE=<<opaque>>\n+SESSION_COOKIE=\n*** End Patch"
+        "input": "*** Begin Patch\n*** Update File: .env\n@@\n-SESSION_SECRET=<<opaque>>\n-JWT_SIGNING_KEY=<<opaque2>>\n+SESSION_SECRET=\n*** End Patch"
       },
-      "expect": "blanked",
-      "rule": "dotenv"
+      "expect": "redacted",
+      "keep": [
+        "SESSION_SECRET=",
+        "JWT_SIGNING_KEY="
+      ]
     },
     {
       "id": "print-password-args",
       "route": "output",
       "input": "print(\"password:\", password, \"done\")",
       "expect": "unchanged"
-    },
-    {
-      "id": "aws-configure-get-region",
-      "route": "command",
-      "input": "aws configure get region",
-      "output": "us-east-1",
-      "expect": "blanked",
-      "limit": "cli-any-args",
-      "rule": "secret_cli"
     },
     {
       "id": "gh-auth-token-help",
@@ -592,47 +450,9 @@
       "id": "aws-configure-get-secret",
       "route": "command",
       "input": "aws configure get aws_secret_access_key",
-      "expect": "blanked",
-      "rule": "secret_cli"
-    },
-    {
-      "id": "gh-auth-token",
-      "route": "command",
-      "input": "gh auth token",
-      "expect": "blanked",
-      "rule": "secret_cli"
-    },
-    {
-      "id": "lc-all-printenv",
-      "route": "command",
-      "input": "LC_ALL=C printenv",
-      "expect": "blanked",
-      "source": "command.prefix reads this wrapper",
-      "rule": "env_dump"
-    },
-    {
-      "id": "sudo-u-printenv",
-      "route": "command",
-      "input": "sudo -u root printenv",
-      "expect": "blanked",
-      "source": "command.prefix reads this wrapper",
-      "rule": "env_dump"
-    },
-    {
-      "id": "lc-all-env",
-      "route": "command",
-      "input": "LC_ALL=C env",
-      "expect": "blanked",
-      "source": "command.prefix reads this wrapper",
-      "rule": "env_dump"
-    },
-    {
-      "id": "sudo-e-u-printenv",
-      "route": "command",
-      "input": "sudo -E -u root printenv",
-      "expect": "blanked",
-      "source": "command.prefix reads this wrapper",
-      "rule": "env_dump"
+      "expect": "leaks",
+      "limit": "unnamed-value",
+      "source": "a CLI prints the secret bare"
     },
     {
       "id": "rg-n-single-file",
@@ -689,36 +509,6 @@
       "expect": "unchanged"
     },
     {
-      "id": "kubectl-output-before-operand",
-      "route": "command",
-      "input": "kubectl get -o jsonpath=\"{.data.cookie}\" secret session | base64 -d",
-      "expect": "blanked",
-      "rule": "secret_file",
-      "limit": "command-word-order"
-    },
-    {
-      "id": "kubectl-output-before-get",
-      "route": "command",
-      "input": "kubectl -n prod -o yaml get secret db",
-      "expect": "blanked",
-      "rule": "secret_file",
-      "limit": "command-word-order"
-    },
-    {
-      "id": "gh-show-token-before-status",
-      "route": "command",
-      "input": "gh auth -t status",
-      "expect": "leaks",
-      "limit": "command-word-order"
-    },
-    {
-      "id": "security-w-before-s",
-      "route": "command",
-      "input": "security find-generic-password -w -s x",
-      "expect": "blanked",
-      "rule": "secret_cli"
-    },
-    {
       "id": "help-before-subcommand",
       "route": "command",
       "input": "gh --help auth token",
@@ -726,76 +516,11 @@
       "expect": "unchanged"
     },
     {
-      "id": "kubectl-help-before-operand",
-      "route": "command",
-      "input": "kubectl get --help secret db -o yaml",
-      "output": "Display one or many resources",
-      "expect": "blanked",
-      "limit": "mention-blanks",
-      "rule": "secret_file"
-    },
-    {
       "id": "kubectl-pods-output-before",
       "route": "command",
       "input": "kubectl get -o yaml pods",
       "output": "apiVersion: v1",
       "expect": "unchanged"
-    },
-    {
-      "id": "patch-bare-credentials",
-      "route": "input",
-      "input": {
-        "input": "*** Begin Patch\n*** Update File: credentials\n@@\n-SESSION_COOKIE=<<opaque>>\n+SESSION_COOKIE=\n*** End Patch"
-      },
-      "expect": "blanked",
-      "rule": "credentials_file"
-    },
-    {
-      "id": "patch-bare-secrets",
-      "route": "input",
-      "input": {
-        "input": "*** Begin Patch\n*** Update File: secrets\n@@\n-SESSION_COOKIE=<<opaque>>\n*** End Patch"
-      },
-      "expect": "blanked",
-      "rule": "secret_file"
-    },
-    {
-      "id": "transcript-bare-credentials",
-      "route": "transcript",
-      "input": {
-        "input": "*** Begin Patch\n*** Delete File: credentials\n*** End Patch\n-SESSION_COOKIE=<<opaque>>"
-      },
-      "expect": "blanked",
-      "rule": "credentials_file"
-    },
-    {
-      "id": "unified-bare-secrets",
-      "route": "input",
-      "input": {
-        "patch": "--- a/secrets\n+++ b/secrets\n@@ -1 +1 @@\n-SESSION_COOKIE=<<opaque>>\n+x\n"
-      },
-      "expect": "blanked",
-      "rule": "secret_file"
-    },
-    {
-      "id": "read-bare-credentials",
-      "route": "input",
-      "input": {
-        "file_path": "credentials"
-      },
-      "expect": "blanked",
-      "rule": "credentials_file"
-    },
-    {
-      "id": "patch-mentions-credentials",
-      "route": "input",
-      "input": {
-        "input": "*** Begin Patch\n*** Update File: src/app.py\n@@\n-load('credentials')\n+load(path)\n*** End Patch"
-      },
-      "output": "Success",
-      "expect": "blanked",
-      "limit": "mention-blanks",
-      "rule": "credentials_file"
     },
     {
       "id": "print-comma-in-string",
@@ -1020,14 +745,6 @@
       "source": "a known limit of the name rule"
     },
     {
-      "id": "gh-auth-status-show-token",
-      "route": "command",
-      "input": "gh auth status --show-token",
-      "expect": "leaks",
-      "limit": "unlisted-cli",
-      "source": "the command list covers gh auth token only"
-    },
-    {
       "id": "secret-after-unicode-escape",
       "route": "output",
       "input": "{\"log\": \"a\\u0000<<github>>\"}",
@@ -1061,32 +778,11 @@
       "layers_only": "the row needs its own tracing.json, which the adapters' shared sandbox does not have"
     },
     {
-      "id": "env-with-fd-redirect",
-      "route": "command",
-      "input": "env 2>&1 | grep -i key",
-      "expect": "blanked",
-      "rule": "env_dump"
-    },
-    {
-      "id": "env-with-input-redirect",
-      "route": "command",
-      "input": "env </dev/null",
-      "expect": "blanked",
-      "rule": "env_dump"
-    },
-    {
       "id": "typed-default",
       "route": "output",
       "input": "password: str = \"<<alpha>>\"",
       "expect": "leaks",
       "limit": "value-stops"
-    },
-    {
-      "id": "shell-by-path",
-      "route": "command",
-      "input": "/bin/sh -c 'env'",
-      "expect": "blanked",
-      "rule": "env_dump"
     },
     {
       "id": "markdown-bold-name",
@@ -1101,13 +797,6 @@
       "expect": "redacted"
     },
     {
-      "id": "dash-h-is-read-as-help",
-      "route": "command",
-      "input": "gh auth token -h github.com",
-      "expect": "leaks",
-      "limit": "command-word-order"
-    },
-    {
       "id": "stars-are-part-of-a-value",
       "route": "output",
       "input": "password=**None and token=**<<alpha>>",
@@ -1117,29 +806,97 @@
       ]
     },
     {
-      "id": "env-with-two-digit-fd",
-      "route": "command",
-      "input": "env 10>/dev/null",
-      "expect": "blanked",
-      "rule": "env_dump"
-    },
-    {
       "id": "m-after-a-digit-is-no-boundary",
       "route": "output",
       "input": "model1mpassword_hint and 30mtoken_count",
       "expect": "unchanged"
+    },
+    {
+      "id": "dotenv-contents",
+      "route": "output",
+      "input": "DATABASE_URL=postgres://app:<<opaque>>@db.internal:5432/app\nSTRIPE_SECRET=<<opaque2>>\nGITHUB_TOKEN=<<alpha>>\nDB_PASSWORD=\"<<phrase>>\"\nNODE_ENV=production",
+      "expect": "redacted",
+      "keep": [
+        "DATABASE_URL=postgres://app:",
+        "@db.internal:5432/app",
+        "STRIPE_SECRET=",
+        "GITHUB_TOKEN=",
+        "DB_PASSWORD=",
+        "NODE_ENV=production"
+      ],
+      "source": "a .env file read: its values go by name and format"
+    },
+    {
+      "id": "dotenv-key-names",
+      "route": "output",
+      "input": "ENCRYPTION_KEY=<<opaque>>\nexport JWT_SIGNING_KEY='<<opaque2>>'\nKEY=<<alpha>>",
+      "expect": "redacted",
+      "keep": [
+        "ENCRYPTION_KEY=",
+        "export JWT_SIGNING_KEY='",
+        "KEY="
+      ]
+    },
+    {
+      "id": "env-flag-key-name",
+      "route": "command",
+      "input": "docker run -e MASTER_KEY=<<opaque>> app",
+      "output": "ok",
+      "expect": "redacted",
+      "keep": [
+        "MASTER_KEY="
+      ]
+    },
+    {
+      "id": "key-names-not-env-form",
+      "route": "output",
+      "input": "sort_key=name\nPRIMARY_KEY = 1\nSSH_KEY_PATH=~/.ssh/id_ed25519\nMONKEY=banana",
+      "expect": "unchanged"
+    },
+    {
+      "id": "dotenv-cookie",
+      "route": "output",
+      "input": "SESSION_COOKIE=<<opaque>>",
+      "expect": "leaks",
+      "limit": "unnamed-value"
+    },
+    {
+      "id": "redact-paths-hides-the-call",
+      "route": "input",
+      "input": {
+        "file_path": "/app/.env"
+      },
+      "output": "SESSION_COOKIE=<<opaque>>",
+      "cfg": {
+        "redactPaths": [
+          ".env*"
+        ]
+      },
+      "layers_only": true,
+      "expect": "redacted",
+      "source": "the dotenv-cookie leak, closed by the project naming the file"
+    },
+    {
+      "id": "redact-commands-hides-the-call",
+      "route": "command",
+      "input": "aws configure get aws_secret_access_key",
+      "output": "<<opaque>>",
+      "cfg": {
+        "redactCommands": [
+          "aws[^\\S\\n]+configure[^\\S\\n]+get"
+        ]
+      },
+      "layers_only": true,
+      "expect": "redacted",
+      "source": "the aws-configure-get-secret leak, closed by the project naming the command"
     }
   ],
   "limits": [
-    "cli-any-args",
     "code-after-name",
-    "command-word-order",
     "key-auth-unformatted",
-    "mention-blanks",
     "reference-value",
     "space-separated",
-    "unlisted-cli",
-    "value-stops",
-    "wrapped-command"
+    "unnamed-value",
+    "value-stops"
   ]
 }

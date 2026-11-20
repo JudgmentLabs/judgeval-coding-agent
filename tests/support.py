@@ -285,7 +285,7 @@ def py_sanitize(events: list[dict], cfg: dict | None = None, env: dict | None = 
 
 
 def _checked(event: dict) -> dict:
-    """The event, once redact.outcome accepts its state: no layer may leave text in a sensitive or failed event."""
+    """The event, once redact.outcome accepts its state: no layer may leave text in a failed event."""
     from judgment_core import redact
 
     redact.outcome(event)

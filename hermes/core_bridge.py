@@ -29,10 +29,8 @@ The functions, in the order a record meets them:
 PREPARE, one record, plain stages. The record arrives with every value whole: the spooler dropped a
 value too large to redact whole and listed it in ``omitted``, and never cut one.
 
-    sanitized:  sense    an omitted input (prompt, tool input, tool calls) makes the record sensitive:
-                         its sensitivity can't be checked, so its turn is blanked, as for a .env read
-                core     redact.sanitize_event on the complete values: sensitive tool calls lose their
-                         text, every string and key is redacted, secret-named members go whole
+    sanitized:  core     redact.sanitize_event on the complete values: every string and key is redacted,
+                         secret-named members go whole
                 meta     the metadata the core keeps as is (model, provider, cwd, ...), which in Hermes a
                          model or provider chose, redacted with the same rules
                 cut      only now, each text longer than TEXT_CAP cut before its last partial word
@@ -62,14 +60,11 @@ from judgment_core import optin, redact  # noqa: E402
 from judgment_core.config import DEFAULT_API_URL, load_credentials  # noqa: E402
 
 __all__ = ["CORE", "Gate", "warm", "resolve", "needs_alias", "prepare", "stage", "publish", "launch_sender", "command",
-           "copy_session_mode", "state_dir", "TEXT_CAP", "CUT_MARK", "OVERSIZE_RULE"]
+           "copy_session_mode", "state_dir", "TEXT_CAP", "CUT_MARK"]
 
-# The most text one field keeps, cut only after redaction. Spans cut at 64 KB anyway.
+# The most text one field keeps, cut only after redaction.
 TEXT_CAP = 64 * 1024
 CUT_MARK = "… [truncated]"
-# The fields sensitivity is read from (redact.tool_texts and the prompt's @mentions).
-INPUTS = ("prompt", "tool_input", "tool_calls")
-OVERSIZE_RULE = "too_large_to_check"
 # Fields the core keeps as is, because other harnesses set them. In Hermes a provider, a model, or
 # Hermes's config chose them. tool_call_id is replaced in Hermes when redaction would change it
 # (tracker "Tool call id"); it is checked again here.
@@ -408,13 +403,6 @@ def _cut_all(value):
     return value
 
 
-def _sense(record: dict) -> dict:
-    """An input too large to check makes the record sensitive, in the core's own terms (sanitize_event)."""
-    if not any(name in INPUTS for name in record.get("omitted") or ()):
-        return record
-    return {**redact.strip_text(record), "sensitive": True, "sensitive_rule": OVERSIZE_RULE, "sensitive_trigger": ""}
-
-
 def _unredacted(record: dict) -> dict:
     """What a record keeps when redaction failed: only the fields the core never redacts (its redaction_error shape)."""
     return {key: value for key, value in redact.strip_text(record).items() if not redact.field_class(key)["redact"]}
@@ -442,8 +430,11 @@ def prepare(record: dict, gate: Gate) -> dict:
         rs = rules(gate)
         secrets = list(gate.secrets)
         try:
-            event = _sense(record) if gate.capture == "sanitized" else record
-            out = redact.sanitize_event(event, rs, secrets, gate.capture)
+            if (rs.paths or rs.commands) and "tool_input" in (record.get("omitted") or ()) and record.get("tool_output"):
+                # An input too large to redact cannot be checked against redactPaths and redactCommands either, so its
+                # result is not sent.
+                record = {**record, "tool_output": record["tool_input"]}
+            out = redact.sanitize_event(record, rs, secrets, gate.capture)
             out = _cut_all(_meta(out, rs, secrets))
         except Exception:  # anything unexpected drops the record's text, never sends it raw
             out = {**_meta(_unredacted(record), rs, secrets), "redaction_error": True}

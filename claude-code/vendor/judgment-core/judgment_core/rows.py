@@ -6,6 +6,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 # Smaller files are parsed whole. A long session's transcript can be hundreds of MB.
 TAIL_MIN_BYTES = 4 * 1024 * 1024
@@ -40,8 +41,29 @@ def _parse(lines: list[bytes]) -> list[dict]:
     return rows
 
 
-def records(path: Path | None, since_ms: int | None = None) -> list[dict]:
-    """Rows of a JSONL transcript. With ``since_ms``, only the first row and rows from about then on."""
+def parse_line(line: bytes) -> dict | None:
+    """One JSONL line as a row, or None when it is blank, cut off, or not an object."""
+    parsed = _parse([line])
+    return parsed[0] if parsed else None
+
+
+def records(
+    path: Path | None,
+    since_ms: int | None = None,
+    stop: Callable[[dict], bool] | None = None,
+    pin: Callable[[list[dict]], Callable[[bytes], dict | None]] | None = None,
+) -> list[dict]:
+    """Rows of a JSONL transcript. With ``since_ms``, a large file is read from the end: the first row and rows from about then on.
+
+    ``stop`` names a row where the model's history restarts (a compaction). With it, a large file is read back past the
+    turn's start to the last such row before the turn, or to the start of the file when there is none, so a reader can
+    rebuild what each of the turn's requests saw. A compaction during the turn does not stop the read: the turn's
+    earlier requests saw the rows before it.
+
+    ``pin``, given whenever ``stop`` is, keeps rows from before that compaction that a reader still needs, such as the session's tool definitions.
+    It is called with the rows kept so far (oldest last) and returns a test for each older raw line, newest first: the
+    row to keep, or None. Only a test that matches pays for parsing the line.
+    """
     if path is None:
         return []
     try:
@@ -56,6 +78,9 @@ def records(path: Path | None, since_ms: int | None = None) -> list[dict]:
         start = handle.tell()
         kept: list[dict] = []
         old: list[dict] = []
+        pinned: list[dict] = []
+        wanted: Callable[[bytes], dict | None] | None = None
+        passed = False
         pos = size
         carry = b""
         cutoff = since_ms - MARGIN_MS
@@ -65,8 +90,22 @@ def records(path: Path | None, since_ms: int | None = None) -> list[dict]:
             handle.seek(pos)
             lines = (handle.read(step) + carry).split(b"\n")
             carry = lines.pop(0) if pos > start else b""
-            for row in reversed(_parse(lines)):
+            for line in reversed(lines):
+                if wanted is not None:
+                    row = wanted(line)
+                    if row is not None:
+                        pinned.append(row)
+                    continue
+                row = parse_line(line)
+                if row is None:
+                    continue
                 stamp = _ms(row)
+                if stop is not None:
+                    kept.append(row)
+                    passed = passed or (stamp is not None and stamp < since_ms)
+                    if passed and stop(row):
+                        wanted = pin(kept)
+                    continue
                 if stamp is not None and stamp < cutoff:
                     old.append(row)
                     if len(old) >= _OLD_RUN:
@@ -76,4 +115,4 @@ def records(path: Path | None, since_ms: int | None = None) -> list[dict]:
                 old = []
                 kept.append(row)
         kept.extend(old)
-        return first + list(reversed(kept + _parse([carry])))
+        return first + list(reversed(pinned)) + list(reversed(kept))

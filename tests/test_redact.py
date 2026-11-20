@@ -1,4 +1,4 @@
-"""Redaction rules: every pattern, env values, sensitive paths, user rules, and capture modes. jq and Python must agree."""
+"""Redaction rules: every pattern, env values, user rules, and capture modes. jq and Python must agree."""
 
 from __future__ import annotations
 
@@ -38,29 +38,6 @@ PATTERN_CASES = {
 def tool_event(text: str, **extra) -> dict:
     return {"v": 1, "harness": "claude-code", "event": "tool", "session_id": "s", "turn_id": "t", "tool_name": "Bash",
             "tool_call_id": "c1", "tool_input": {"command": "make deploy"}, "tool_output": text, **extra}
-
-
-class SearchSelectorTests(unittest.TestCase):
-    def test_file_selectors_are_classified_per_tool(self):
-        for name, args, sensitive in (("Grep", {"glob": ".env*", "path": ".", "pattern": "KEY"}, True),
-                                       ("grep", {"path": ".env", "pattern": "KEY"}, True),
-                                       ("Glob", {"pattern": "**/.env*", "path": "."}, True),
-                                       ("find", {"pattern": ".env", "path": "."}, True),
-                                       ("Grep", {"pattern": ".env", "glob": "*.py", "path": "."}, False),
-                                       ("Glob", {"pattern": "**/*", "path": "."}, False),
-                                       ("Other", {"pattern": ".env", "glob": ".env"}, False),
-                                       ("Grep", {"glob": "", "pattern": ""}, False)):
-            with self.subTest(name=name, args=args):
-                event = tool_event("unformatted private value", tool_name=name, tool_input=args)
-                py, _ = assert_parity(self, [event])
-                self.assertEqual(bool(py[0].get("sensitive")), sensitive)
-                self.assertEqual("tool_output" not in py[0], sensitive)
-
-    def test_model_calls_use_their_own_search_tool_names(self):
-        event = tool_event("private value", tool_input={}, tool_calls=[
-            {"name": "Grep", "arguments": json.dumps({"pattern": "KEY", "glob": ".env"})}])
-        py, _ = assert_parity(self, [event])
-        self.assertEqual(py[0]["sensitive_rule"], "dotenv")
 
 
 class StructuredSecretTests(unittest.TestCase):
@@ -106,12 +83,6 @@ class StructuredSecretTests(unittest.TestCase):
     def test_placeholder_is_restored_after_custom_matching(self):
         py, _ = assert_parity(self, [tool_event({"password": 123, "note": "secret"})], cfg={"redactPatterns": ["secret"]})
         self.assertEqual(py[0]["tool_output"], {"password": "[REDACTED:secret_field]", "note": "[REDACTED:custom]"})
-
-    def test_sensitive_path_is_checked_before_masking_a_container(self):
-        py, _ = assert_parity(self, [tool_event("private", tool_input={"credentials": {"path": ".env"}})])
-        self.assertEqual(py[0]["sensitive_rule"], "dotenv")
-        self.assertNotIn("tool_output", py[0])
-
 
 class PatternTests(unittest.TestCase):
     def test_every_pattern_type_in_both_layers(self):
@@ -223,130 +194,13 @@ class EnvTests(unittest.TestCase):
         self.assertEqual(names, ["JUDGMENT_API_KEY"])
 
 
-SENSITIVE = [
-    ({"command": "cat .env"}, "dotenv", ".env"),
-    ({"command": "source ./config/.env.local && npm start"}, "dotenv", "./config/.env.local"),
-    ({"file_path": "/home/tester/proj/.env.production"}, "dotenv", "~/proj/.env.production"),
-    ({"path": ".envrc"}, "dotenv", ".envrc"),
-    ({"command": ["bash", "-lc", "cat ~/.aws/credentials"]}, "credentials_file", "~/.aws/credentials"),
-    ({"file_path": "/home/tester/.config/judgment/credentials"}, "credentials_file", "~/.config/judgment/credentials"),
-    ({"command": "cat gcp-service-account-credentials.json"}, "credentials_file", "gcp-service-account-credentials.json"),
-    ({"file_path": "/home/tester/.ssh/id_ed25519"}, "ssh_private_key", "~/.ssh/id_ed25519"),
-    ({"command": "openssl rsa -in server.key -text"}, "key_file", "server.key"),
-    ({"target_file": "certs/client.p12"}, "key_file", "certs/client.p12"),
-    ({"file_path": "deploy/secrets.yaml"}, "secret_file", "deploy/secrets.yaml"),
-    ({"path": "client_secret.json"}, "secret_file", "client_secret.json"),
-    ({"command": "cat ~/.netrc"}, "auth_file", "~/.netrc"),
-    ({"file_path": "/home/tester/.npmrc"}, "auth_file", "~/.npmrc"),
-    ({"command": "cat ~/.git-credentials"}, "auth_file", "~/.git-credentials"),
-    ({"path": "/home/tester/.codex/auth.json"}, "auth_file", "~/.codex/auth.json"),
-    ({"command": "cat ~/.docker/config.json"}, "auth_file", "~/.docker/config.json"),
-    ({"command": "cat /proc/self/environ"}, "proc_environ", "/proc/self/environ"),
-    ({"command": "printenv"}, "env_dump", "cmd:env_dump"),
-    ({"command": "printenv OPENAI_API_KEY"}, "printenv", "cmd:printenv"),
-    ({"command": "env | sort"}, "env_dump", "cmd:env_dump"),
-    ({"command": "cd app && set"}, "env_dump", "cmd:env_dump"),
-    ({"command": "export -p"}, "env_dump", "cmd:env_dump"),
-    ({"command": "gh auth token"}, "secret_cli", "cmd:secret_cli"),
-    ({"command": "kubectl get secret db -o yaml"}, "secret_cli", "cmd:secret_cli"),
-]
-
-NOT_SENSITIVE = [
-    {"command": "cp .env.example .env.sample"},
-    {"file_path": "/home/tester/proj/.env.template"},
-    {"command": "python -m venv .venv && . .venv/bin/activate"},
-    {"command": "node -e 'console.log(process.env.HOME)'"},
-    {"command": "/usr/bin/env python3 script.py"},
-    {"command": "env FOO=1 make test"},
-    {"command": "set -euo pipefail; make"},
-    {"command": "export PATH=$PATH:/opt/bin"},
-    {"file_path": "/home/tester/.ssh/id_ed25519.pub"},
-    {"command": "grep -r secret_key ."},
-    {"file_path": "src/secret_manager.py"},
-    {"file_path": "docs/secrets.md"},
-    {"command": "jq .key data.json"},
-    {"file_path": "src/environment.ts"},
-    {"pattern": "**/.env"},
-]
-
-OVER_BLANKED = [
-    ({"command": "grep -rn credentials src/"}, "credentials_file"),
-    ({"command": 'git commit -m "rotate secrets"'}, "secret_file"),
-]
-
-
-class SensitiveTests(unittest.TestCase):
-    def run_both(self, inputs: list[dict], cfg: dict | None = None) -> tuple[list, list]:
-        events = [tool_event("", tool_input=item) for item in inputs]
-        rs = redact.ruleset(cfg or {})
-        py = [redact.sensitive(event, rs) for event in events]
-        py = [None if hit is None else {**hit, "trigger": redact.show_trigger(hit["trigger"], "/home/tester")} for hit in py]
-        js = [out.get("sensitive_rule") and {"rule": out["sensitive_rule"], "trigger": redact.show_trigger(out["sensitive_trigger"], "/home/tester")} or None
-              for out in jq_sanitize(events, cfg=cfg)]
-        return py, js
-
-    def test_sensitive_paths_and_env_dumps(self):
-        py, js = self.run_both([item for item, _, _ in SENSITIVE])
-        self.assertEqual(py, js)
-        for (item, rule, trigger), hit in zip(SENSITIVE, py):
-            with self.subTest(item=item):
-                self.assertEqual(hit, {"rule": rule, "trigger": trigger})
-
-    def test_lookalikes_are_not_sensitive(self):
-        py, js = self.run_both(NOT_SENSITIVE)
-        self.assertEqual(py, js)
-        for item, hit in zip(NOT_SENSITIVE, py):
-            with self.subTest(item=item):
-                self.assertIsNone(hit)
-
-    def test_known_limit_a_mention_blanks_the_turn(self):
-        """Known limit (mention-blanks): a sensitive file name is a mention wherever it sits in a command, so a search for
-        the word blanks the turn too. It loses that turn's text and never leaks."""
-        py, js = self.run_both([item for item, _ in OVER_BLANKED])
-        self.assertEqual(py, js)
-        self.assertEqual([hit and hit["rule"] for hit in py], [rule for _, rule in OVER_BLANKED])
-
-    def test_sensitive_event_loses_its_text_and_keeps_its_ids(self):
-        event = tool_event("DB_URL=postgres://u:Abc123xyz@h\nPLAIN=value", tool_input={"command": "cat .env"}, duration_ms=12, is_error=False)
-        for out in (py_sanitize([event])[0], jq_sanitize([event])[0]):
-            self.assertNotIn("tool_output", out)
-            self.assertNotIn("tool_input", out)
-            self.assertEqual((out["sensitive"], out["sensitive_rule"], out["sensitive_trigger"]), (True, "dotenv", ".env"))
-            for field in ("tool_call_id", "tool_name", "duration_ms", "is_error", "session_id", "turn_id"):
-                self.assertEqual(out[field], event[field])
-
-    def test_tool_calls_and_prompt_mentions(self):
-        model = {"v": 1, "event": "model", "session_id": "s", "turn_id": "t",
-                 "tool_calls": [{"id": "c", "name": "Read", "arguments": {"file_path": "/srv/app/.env"}}]}
-        prompt = {"v": 1, "event": "turn_start", "session_id": "s", "turn_id": "t", "prompt": "explain @.env.local please, mail me@example.com"}
-        for out in (py_sanitize([model, prompt]), jq_sanitize([model, prompt])):
-            self.assertEqual(out[0]["sensitive_trigger"], "/srv/app/.env")
-            self.assertEqual(out[0]["tool_calls"], [{"id": "c", "name": "Read"}])
-            self.assertEqual(out[1]["sensitive_trigger"], ".env.local")
-            self.assertEqual(out[1].get("prompt", ""), "")
-
-    def test_trigger_never_holds_a_secret(self):
-        secret = SECRETS["github_token"]["core"]
-        event = tool_event("", tool_input={"command": f"cat /tmp/{secret}/.env"})
-        for out in (py_sanitize([event])[0], jq_sanitize([event])[0]):
-            self.assertEqual(out["sensitive_trigger"], "/tmp/[REDACTED:github_token]/.env")
-
-
 class UserRuleTests(unittest.TestCase):
-    def test_redact_patterns_and_paths(self):
-        cfg = {"redactPatterns": ["ACME-[0-9]{6}", "TCK_[A-Z]{4}", ""], "redactPaths": ["vault/*.json", "prod-*.cfg"]}
-        events = [
-            tool_event("id ACME-123456 and TCK_ABCD done"),
-            tool_event("", tool_input={"file_path": "/srv/app/vault/db.json"}),
-            tool_event("", tool_input={"command": "cat conf/prod-eu.cfg"}),
-            tool_event("", tool_input={"command": "cat conf/dev-eu.cfg"}),
-        ]
+    def test_redact_patterns(self):
+        cfg = {"redactPatterns": ["ACME-[0-9]{6}", "TCK_[A-Z]{4}", ""]}
+        events = [tool_event("id ACME-123456 and TCK_ABCD done")]
         py, js = py_sanitize(events, cfg), jq_sanitize(events, cfg)
         self.assertEqual(norm(py), norm(js))
         self.assertEqual(py[0]["tool_output"], "id [REDACTED:custom] and [REDACTED:custom] done")
-        self.assertEqual((py[1]["sensitive_rule"], py[1]["sensitive_trigger"]), ("custom_path", "/srv/app/vault/db.json"))
-        self.assertEqual(py[2]["sensitive_trigger"], "conf/prod-eu.cfg")
-        self.assertNotIn("sensitive", py[3])
 
     def test_invalid_user_regex_fails_closed(self):
         cfg = {"redactPatterns": ["(unclosed"]}
@@ -358,7 +212,7 @@ class UserRuleTests(unittest.TestCase):
             self.assertEqual(out["tool_call_id"], "c1")
 
     def test_user_rules_only_add(self):
-        cfg = {"redactPatterns": [], "redactPaths": [], "redact": True}
+        cfg = {"redactPatterns": [], "redact": True}
         out = py_sanitize([tool_event(SECRETS["openai_key"]["core"])], cfg)[0]
         self.assertEqual(out["tool_output"], "[REDACTED:openai_key]")
 
@@ -422,18 +276,12 @@ class OverlappingFindTests(unittest.TestCase):
 
 
 class ProjectRuleTests(unittest.TestCase):
-    """tracing.json's redactCommands, redactNames, redactAllow, and redactDisable, in both layers. A bad entry fails closed."""
+    """tracing.json's redactNames, redactAllow, and redactDisable, in both layers. A bad entry fails closed."""
 
     def both(self, events: list[dict], cfg: dict) -> list[dict]:
         py, js = py_sanitize(events, cfg), jq_sanitize(events, cfg)
         self.assertEqual(norm(py), norm(js))
         return py
-
-    def test_redact_commands(self):
-        cfg = {"redactCommands": ["mycli[^\\S\\n]+show-secret"]}
-        out = self.both([tool_event("x", tool_input={"command": c}) for c in ("mycli show-secret db", "cd a && mycli show-secret", "mycli show-secret --help",
-                                                                             "echo 'mycli show-secret'", "mycli list")], cfg)
-        self.assertEqual([item.get("sensitive_rule") for item in out], ["custom_command", "custom_command", None, None, None])
 
     def test_redact_names(self):
         value = "pw" + SECRETS["github_token"]["random"][:10]
@@ -455,19 +303,34 @@ class ProjectRuleTests(unittest.TestCase):
 
     def test_redact_disable(self):
         token = SECRETS["github_token"]["core"]
-        cfg = {"redactDisable": ["secret_assignment", "github_token", "dotenv", "env_dump"]}
-        events = [tool_event("password = hunter22 " + token), tool_event("x", tool_input={"command": "cat .env"}),
-                  tool_event("x", tool_input={"command": "env"}), tool_event("x", tool_input={"command": "printenv HOME"}),
-                  tool_event("ok", tool_input={"password": "hunter22"})]
-        out = self.both(events, cfg)
+        cfg = {"redactDisable": ["secret_assignment", "github_token"]}
+        out = self.both([tool_event("password = hunter22 " + token), tool_event("ok", tool_input={"password": "hunter22"})], cfg)
         self.assertEqual(out[0]["tool_output"], "password = hunter22 " + token)
-        self.assertEqual([item.get("sensitive_rule") for item in out[1:4]], [None, None, "printenv"])
-        self.assertEqual(out[4]["tool_input"], {"password": "[REDACTED:secret_field]"})
+        self.assertEqual(out[1]["tool_input"], {"password": "[REDACTED:secret_field]"})
+
+    def test_redact_paths_and_commands_hide_the_call(self):
+        """Only what the project names is hidden: the call's arguments and result. A !glob excepts a file; nothing is
+        built in, and an id older versions had for a built-in file or command rule may still be in redactDisable."""
+        cfg = {"redactPaths": ["data/*", ".env*", "!.env.test"], "redactCommands": ["vaultctl[^\\S\\n]+dump"], "redactDisable": ["dotenv", "env_dump"]}
+        events = [tool_event("rows", tool_input={"file_path": "data/eu/customers.csv"}), tool_event("dump", tool_input={"command": "sudo vaultctl dump"}),
+                  tool_event("A=1", tool_input={"file_path": ".env.test"}), tool_event("B=2", tool_input={"command": "cat app/.env.local"}),
+                  tool_event("usage", tool_input={"command": "vaultctl dump --help"})]
+        blank = lambda rule: (f"[REDACTED:{rule}]", f"[REDACTED:{rule}]")  # noqa: E731
+        out = self.both(events, cfg)
+        self.assertEqual([(event["tool_input"], event["tool_output"]) for event in out],
+                         [blank("custom_path"), blank("custom_command"), ({"file_path": ".env.test"}, "A=1"), blank("custom_path"), ({"command": "vaultctl dump --help"}, "usage")])
+        self.assertEqual(out[0]["redactions"], [{"rule": "custom_path", "field": "tool_input", "count": 1}, {"rule": "custom_path", "field": "tool_output", "count": 1}])
+        # Without the settings every one of these calls is sent, redacted by format and name like any other text.
+        self.assertEqual([(event["tool_input"], event["tool_output"]) for event in self.both(events, {})], [(event["tool_input"], event["tool_output"]) for event in events])
+        # A setting that cannot work fails closed, as every other rule setting does.
+        for bad in ({"redactPaths": {"a": 1}}, {"redactCommands": ["(unclosed"]}):
+            self.assertTrue(redact.ruleset(bad).error, bad)
+            self.assertTrue(self.both([tool_event("x")], bad)[0]["redaction_error"])
 
     def test_bad_entries_fail_closed(self):
         secret = SECRETS["github_token"]["core"]
         event = tool_event("plain text " + secret, prompt="hello")
-        for cfg in ({"redactDisable": ["github_tokn"]}, {"redactNames": ["db pin"]}, {"redactNames": ["pin)|("]}, {"redactCommands": ["(unclosed"]}):
+        for cfg in ({"redactDisable": ["github_tokn"]}, {"redactNames": ["db pin"]}, {"redactNames": ["pin)|("]}):
             with self.subTest(cfg=cfg):
                 self.assertTrue(redact.ruleset(cfg).error)
                 for out in (py_sanitize([event], cfg)[0], jq_sanitize([event], cfg)[0]):
@@ -477,17 +340,16 @@ class ProjectRuleTests(unittest.TestCase):
 
     def test_non_strings_and_non_lists_in_trims_are_skipped(self):
         """A trim that is not a list of strings trims nothing. A rule setting fails closed instead."""
-        cfg = {"redactDisable": "dotenv", "redactAllow": [3, None, ""]}
-        out = self.both([tool_event("pin = abc"), tool_event("x", tool_input={"command": "cat .env"})], cfg)
+        cfg = {"redactDisable": "secret_assignment", "redactAllow": [3, None, ""]}
+        out = self.both([tool_event("pin = abc"), tool_event("password = hunter22")], cfg)
         self.assertEqual(out[0]["tool_output"], "pin = abc")
-        self.assertEqual(out[1]["sensitive_rule"], "dotenv")
+        self.assertEqual(out[1]["tool_output"], "password = [REDACTED:secret_assignment]")
 
     def test_load_project_carries_every_key(self):
         import tempfile
         from pathlib import Path
 
-        settings = {"redactPatterns": ["A"], "redactPaths": ["b"], "redactCommands": ["c"], "redactNames": ["d"], "redactAllow": ["e"],
-                    "redactDisable": ["dotenv"]}
+        settings = {"redactPatterns": ["A"], "redactPaths": ["b/*"], "redactCommands": ["c"], "redactNames": ["d"], "redactAllow": ["e"], "redactDisable": ["github_token"]}
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "tracing.json"
             path.write_text(json.dumps({**settings, "redactAllow": ["e", 4, ""]}))
@@ -531,13 +393,12 @@ class GateTests(unittest.TestCase):
         from fp_report import CORPUS
 
         texts = [text for _, text in CORPUS] + [item["text"] for item in SECRETS.values()] + [secret_blob()]
-        texts += [json.dumps(item) for item, _, _ in SENSITIVE] + [json.dumps(item) for item in NOT_SENSITIVE]
         texts += [text.upper() for text in texts] + [text.lower() for text in texts]
         return texts
 
     def test_every_match_holds_a_needed_literal(self):
         rs = redact.ruleset()
-        for rule in rs.patterns + rs.paths + rs.commands + rs.members:
+        for rule in rs.patterns + rs.members:
             for text in self.corpus():
                 for match in rule.pattern.finditer(text):
                     with self.subTest(rule=rule.id, match=match.group(0)[:40]):
@@ -547,10 +408,10 @@ class GateTests(unittest.TestCase):
         from dataclasses import replace
 
         rs = redact.ruleset()
-        open_rs = redact.Ruleset(tuple(replace(rule, needs=(), pre=None) for rule in rs.patterns), rs.paths, rs.commands,
+        open_rs = redact.Ruleset(tuple(replace(rule, needs=(), pre=None) for rule in rs.patterns),
                                  tuple(replace(rule, needs=(), pre=None) for rule in rs.members), allow=rs.allow)
         for text in self.corpus():
-            self.assertEqual(redact.redact_text(text, rs, []), redact.redact_text(text, open_rs, []))
+            self.assertEqual(redact.scrub_fields({"text": text}, rs, []), redact.scrub_fields({"text": text}, open_rs, []))
 
     def test_member_rule_needs_cover_its_keys(self):
         """Every secret key the member rules take holds a need of the rule that took it, in the JSON the rule sees."""
@@ -677,11 +538,6 @@ def outputs(test: unittest.TestCase, texts: list, cfg: dict | None = None, env: 
     return assert_parity(test, [tool({"command": "x"}, text) for text in texts], cfg, env)[0]
 
 
-def rules_of(test: unittest.TestCase, commands: list[str], cfg: dict | None = None) -> dict:
-    py = assert_parity(test, [tool({"command": command}, "out") for command in commands], cfg)[0]
-    return {command: out.get("sensitive_rule") for command, out in zip(commands, py)}
-
-
 class EscapeBoundaryTests(unittest.TestCase):
     """A secret right after a JSON escape (\\n, \\t, \\r) in JSON nested in a string failed every identifier
     boundary, in both layers and the sender."""
@@ -703,12 +559,65 @@ class EscapeBoundaryTests(unittest.TestCase):
         self.assertEqual([out["tool_output"] for out in py], texts)
 
 
-class EnvDumpThenCommandTests(unittest.TestCase):
-    """env_dump consumed its separator, so the help check read the next command's --version."""
+class HiddenCallTests(unittest.TestCase):
+    """A tool call that names a file in the project's redactPaths is blanked wherever the turn holds it, and only that call."""
 
-    def test_dump_before_another_command(self):
-        commands = ["env; node --version", "set; git --version", "env\ngit --version", "env | grep -h FOO"]
-        self.assertEqual(rules_of(self, commands), {command: "env_dump" for command in commands})
+    CFG = {"redactPaths": [".env*", "secrets.yaml"]}
+    BLANK = "[REDACTED:custom_path]"
+
+    def test_a_patch_counts_by_the_files_it_names(self):
+        head = "*** Begin Patch\n*** Update File: "
+        events = [tool_event("ok", tool_name="apply_patch", tool_input={"input": head + "config/.env.local\n+A=1\n"}),
+                  tool_event("ok", tool_name="apply_patch", tool_input={"input": head + "src/a.ts\n+// values come from .env and secrets.yaml\n"}),
+                  tool_event("ok", tool_input={"patch": "--- a/x.yaml\n+++ b/secrets.yaml\n@@\n+a: 1\n"}),
+                  tool_event("ok", tool_name="Grep", tool_input={"pattern": "TODO", "glob": ".env*"}),
+                  tool_event("ok", tool_name="Grep", tool_input={"pattern": "secrets.yaml", "path": "src"})]
+        py, _ = assert_parity(self, events, self.CFG)
+        self.assertEqual([event["tool_input"] == self.BLANK for event in py], [True, False, True, True, False])
+
+    def test_only_the_call_is_blanked_and_it_is_recorded(self):
+        secret = "Qx7Lm2Tz9Rk4" + "Wp8Hn3Vb6Yc1"
+        py, _ = assert_parity(self, [
+            {"v": 1, "harness": "pi", "event": "model", "session_id": "s", "turn_id": "t", "output": "reading", "tool_calls": [
+                {"id": "a", "name": "read", "arguments": {"path": ".env"}}, {"id": "b", "name": "bash", "arguments": {"command": "ls"}}],
+             "tool_results": [{"id": "a", "response": "COOKIE=" + secret}, {"id": "b", "response": "README.md"}]},
+            tool_event("COOKIE=" + secret, tool_input={"command": "cat .env"}, prompt="why does the cookie fail"),
+            {"v": 1, "harness": "pi", "event": "tool", "session_id": "s", "turn_id": "t", "tool_name": "read", "tool_call_id": "c", "tool_input": {"path": "secrets.yaml"}},
+        ], self.CFG)
+        self.assertEqual(py[0]["tool_calls"], [{"id": "a", "name": "read", "arguments": self.BLANK}, {"id": "b", "name": "bash", "arguments": {"command": "ls"}}])
+        self.assertEqual(py[0]["tool_results"], [{"id": "a", "response": self.BLANK}, {"id": "b", "response": "README.md"}])
+        self.assertEqual(py[0]["redactions"], [{"rule": "custom_path", "field": "tool_calls", "count": 1}, {"rule": "custom_path", "field": "tool_results", "count": 1}])
+        self.assertEqual((py[0]["output"], py[1]["prompt"], py[1]["tool_name"]), ("reading", "why does the cookie fail", "Bash"))
+        self.assertEqual(py[2]["tool_input"], self.BLANK)
+        self.assertNotIn("tool_output", py[2])
+        self.assertNotIn(secret, json.dumps(py))
+
+    def test_the_sender_blanks_a_call_wherever_the_turn_holds_it(self):
+        """What the hook never saw: a transcript's output over the hook's blanked event, and the messages that replay the call."""
+        secret = "Qx7Lm2Tz9Rk4" + "Wp8Hn3Vb6Yc1"
+        call = {"type": "tool_call", "id": "t1", "name": "Read", "arguments": {"file_path": "/app/.env"}}
+        other = {"type": "tool_call", "id": "t2", "name": "Bash", "arguments": {"command": "ls"}}
+        messages = [{"role": "user", "parts": [{"type": "text", "content": "fix the cookie"}]}, {"role": "assistant", "parts": [call, other]},
+                    {"role": "tool", "parts": [{"type": "tool_call_response", "id": "t1", "response": "COOKIE=" + secret}]},
+                    {"role": "tool", "parts": [{"type": "tool_call_response", "id": "t2", "response": "README.md"}]}]
+        events = [
+            # The hook blanked this event; enrichment then put the transcript's output back.
+            tool_event("COOKIE=" + secret, tool_call_id="t1", tool_name="Read", tool_input=self.BLANK),
+            # The two requests share the assistant message, as a transcript reader builds them.
+            {"event": "model", "input_messages": messages[:1], "output_message": messages[1]},
+            {"event": "model", "input_messages": messages, "output_message": {"role": "assistant", "parts": [{"type": "text", "content": "done"}]}},
+        ]
+        rs = redact.ruleset(self.CFG)
+        out = redact.redact_events(events, rs, [])
+        self.assertNotIn(secret, json.dumps(out))
+        self.assertEqual(out[0]["tool_output"], self.BLANK)
+        self.assertEqual([part.get("arguments") for part in out[1]["output_message"]["parts"]], [self.BLANK, {"command": "ls"}])
+        self.assertEqual([message["parts"][0].get("response") for message in out[2]["input_messages"][2:]], [self.BLANK, "README.md"])
+        self.assertEqual(out[2]["redactions"], [{"rule": "custom_path", "field": "input_messages", "count": 2}])
+        self.assertEqual(events[2]["input_messages"][2]["parts"][0]["response"], "COOKIE=" + secret)  # the input is not changed in place
+        self.assertEqual(redact.redact_events(out, rs, []), out)  # a second pass changes and counts nothing
+        # A project that names no file hides no call.
+        self.assertIn(secret, json.dumps(redact.redact_events(events[1:], redact.ruleset(), [])))
 
 
 class NestedParityTests(unittest.TestCase):
@@ -750,36 +659,10 @@ class AssignmentFormTests(unittest.TestCase):
         self.assertEqual([out["tool_output"] for out in py], texts)
 
 
-class WrappedCommandTests(unittest.TestCase):
-    """A command position now reads through shell keywords, assignments, sudo with options, sh -c, and a path."""
-
-    CAUGHT = ['bash -c "env"', "bash -lc 'printenv'", "FOO=1 printenv", "sudo -u root env", "sudo -E env", "/usr/bin/env", "if x; then env; fi",
-              "for a in b; do printenv; done", "{ env; }", "nohup env", "command env"]
-    KEPT = ["which env", "x=$(which env)", "command -v env", "env --help", "bash -c 'make env'", "conda env list", "env FOO=1 make"]
-
-    def test_caught(self):
-        got = rules_of(self, self.CAUGHT)
-        self.assertEqual([command for command, rule in got.items() if rule not in ("env_dump", "printenv")], [])
-
-    def test_kept(self):
-        self.assertEqual({command: rule for command, rule in rules_of(self, self.KEPT).items() if rule}, {})
-
-
-class PathGapTests(unittest.TestCase):
-    """Dotenv files named another way, and secret-named source files."""
-
-    def test_paths(self):
-        blanked = ["cat prod.env", "cat .env-prod", "cat config/.envrc.local"]
-        kept = ["cat example.env", "cat src/secrets.sh", "vim secret.c", "cat templates/secret.html", "cat db/secrets.sql"]
-        got = rules_of(self, blanked + kept)
-        self.assertEqual({c: got[c] for c in blanked}, {c: "dotenv" for c in blanked})
-        self.assertEqual({c: got[c] for c in kept if got[c]}, {})
-
-
 class ConfigTypeTests(unittest.TestCase):
     """A setting that is not a list of strings was skipped, so a rule the project asked for silently did nothing."""
 
-    BAD = [{"redactPatterns": "hunter[0-9]+"}, {"redactPaths": {"a": 1}}, {"redactCommands": ["ok", 5]}, {"redactNames": "pin"}]
+    BAD = [{"redactPatterns": "hunter[0-9]+"}, {"redactPatterns": ["ok", 5]}, {"redactNames": "pin"}]
 
     def test_both_layers_fail_closed(self):
         for cfg in self.BAD:
@@ -799,7 +682,7 @@ class ConfigTypeTests(unittest.TestCase):
 
 
 class TrimBuiltinsTests(unittest.TestCase):
-    """Finding 12: !name drops a built-in name, !glob excepts a path from blanking."""
+    """Finding 12: !name drops a built-in name."""
 
     def test_drop_a_name(self):
         value = "hu" + _rand(12)
@@ -809,10 +692,6 @@ class TrimBuiltinsTests(unittest.TestCase):
     def test_drop_an_unknown_name_fails_closed(self):
         py = outputs(self, ["hello"], {"redactNames": ["!pin"]})
         self.assertTrue(py[0].get("redaction_error"))
-
-    def test_except_a_path(self):
-        got = rules_of(self, ["cat .env.test", "cat app/.env.test", "cat .env"], {"redactPaths": ["!.env.test"]})
-        self.assertEqual(got, {"cat .env.test": None, "cat app/.env.test": None, "cat .env": "dotenv"})
 
 
 if __name__ == "__main__":

@@ -13,9 +13,9 @@ Everything is plain data through pure stages:
     Ruleset        the built-in rules a project kept (redactDisable), its own rules, its names and allowed literals
                    (a project setting that fails: error)
     env_secrets    (name, literal) for each secret-named environment value, and each line of it
-    tool_values    ToolValue(kind, text) for each string under a path, command, or patch key of the tool input
-    words          what path rules read: the tokens of every tool value and the prompt's @mentions, one per line
-    sensitive      the sensitive path or command a tool call names, as {rule, trigger}, or None
+    call_rule      the redactPaths file or redactCommands command one tool call names, as its rule id, or None
+    blank_calls    a turn's events with each such call's arguments and result replaced by [REDACTED:<rule>],
+                   wherever the call appears: its tool event, a model's tool_calls and tool_results, a message part
     findings       Finding(rule, start, end, kept): each rule's matches as spans of the unchanged blob, one
                    finditer per window (linear: no match is searched for twice)
     layers         the strings and keys of JSON nested deeper in a string than the rules read, one list per depth
@@ -27,9 +27,9 @@ Everything is plain data through pure stages:
                    so no number or JSON syntax is ever touched; a Counter of what was replaced, by rule. A found
                    text still there afterwards fails closed
     records        [{rule, field, count}]: the audit, carried on the event as ``redactions``
-    turn_redaction the turn's audit record, and why it was blanked
+    turn_redaction the turn's audit record
 
-Each event ends in one state (``outcome``): clean, redacted, sensitive, or error. The hook allows fewer distinct
+Each event ends in one state (``outcome``): clean, redacted, or error. The hook allows fewer distinct
 finds than the sender (``hook_budget``, ``sender_budget``): jq matches a long window once per distinct find.
 
 A rule set with an error (a user regex that does not compile, a bad name, an unknown rule id) redacts every text to
@@ -38,6 +38,7 @@ nothing. No function records a secret, or a hash, prefix, or length of one.
 
 from __future__ import annotations
 
+import copy
 import functools
 import heapq
 import json
@@ -52,7 +53,6 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, NamedTuple
 BIN = Path(__file__).resolve().parent.parent / "bin"
 RULES_FILE = BIN / "redact-rules.json"
 COMPILED_FILE = BIN / "redact-compiled.json"
-SENSITIVE_REASON = "sensitive_path"
 _NAMED = re.compile(r"\(\?<([A-Za-z_][A-Za-z0-9_]*)>")
 _BACKREF = re.compile(r"\\k<([A-Za-z_][A-Za-z0-9_]*)>")
 # A name a project adds with redactNames: lowercase-able parts joined by _. Anything else fails the rule set closed.
@@ -100,34 +100,22 @@ def name_rules(names: Iterable[str]) -> list[dict]:
     return out
 
 
-def path_glob_re(glob: str) -> str:
-    """A built-in path glob as a regex over one token's last components: * is any run of characters but / and : (a
-    placeholder such as [REDACTED:github_token] counts as one), ? one character but those. Neither crosses a / or a :
-    otherwise, so a rule scans one component from each start, and a token of many colons costs linear work."""
-    star = "(?:[^\\n/:\\[]|\\[(?:REDACTED:[^\\]\\n/]{1,128}\\])?)*"
-    return "".join(star if char == "*" else "[^\\n/:]" if char == "?" else re.escape(char) for char in glob)
-
-
-def path_rule_re(globs: list[str]) -> str:
-    """A path rule's regex over the words (one token per line): from the start of a token's last components (after a
-    newline, / or :), one of its globs to the end of the token, unless one of its ! globs matches there."""
-    keep = [path_glob_re(glob) for glob in globs if not glob.startswith("!")]
-    drop = [path_glob_re(glob[1:]) for glob in globs if glob.startswith("!")]
-    unless = "(?!(?:" + "|".join(drop) + ")(?![^\\n]))" if drop else ""
-    return "(?<![^\\n/:])" + unless + "(?:" + "|".join(keep) + ")(?![^\\n])"
-
-
 def command_re(regex: str, table: Mapping | None = None) -> str:
     """A command regex at a command position, not asking for help or a version (sensitive.command)."""
     command = (table or rules())["sensitive"]["command"]
     return command["prefix"] + "(?:" + regex + ")" + command["unless"]
 
 
+# The rules a tool call is blanked under: a project's redactPaths, and its redactCommands. There is no built-in one.
+CALL_RULES = ("custom_path", "custom_command")
+
+
 def compiled(table: Mapping | None = None) -> dict:
     """What the hook's jq loads: the table with every built-in regex composed and the comments left out, so the hook
     builds no regex for the built-in rules. The name rules also arrive as the text around {names} (``names``), so the
     hook can join a project's redactNames in; a project's redactPatterns, redactPaths, and redactCommands are composed
-    at hook time too. ``ids``: every built-in rule id, the ones redactDisable may name."""
+    at hook time too. ``ids``: every built-in rule id, and every retired one, the ones redactDisable may name.
+    ``sensitive.blanked``: the placeholder a blanked call's arguments are, by rule, so a call blanked once is known again."""
     table = table or rules()
     names = table["secretNames"]
     sensitive = table["sensitive"]
@@ -140,10 +128,8 @@ def compiled(table: Mapping | None = None) -> dict:
         return out
 
     assignment, field, structured = name_rules(names["names"])
-    paths = [rule(item, path_rule_re(item["globs"])) for item in sensitive["paths"]]
-    commands = [rule(item, command_re("|".join(item["re"]), table)) for item in sensitive["commands"]]
     patterns = [rule(item, item["re"]) for item in table["patterns"]]
-    ids = [item["id"] for item in patterns + paths + commands] + [assignment["id"], field["id"]]
+    ids = [item["id"] for item in patterns] + [assignment["id"], field["id"]] + table["retiredIds"]["ids"]
     return {
         "version": table["version"],
         "limits": {key: value for key, value in table["limits"].items() if key != "_comment"},
@@ -159,21 +145,12 @@ def compiled(table: Mapping | None = None) -> dict:
         },
         "allow": names["allow"],
         "sensitive": {
-            "paths": [{**item, "trigger": trigger_re(item["re"])} for item in paths],
-            "commands": commands,
-            "keys": sensitive["keys"],
-            "tools": sensitive["tools"],
-            "command": sensitive["command"],
-            **{key: sensitive[key] for key in ("glob", "split", "mention")},
+            "blanked": {placeholder(rule_id): rule_id for rule_id in CALL_RULES},
+            **{key: sensitive[key] for key in ("keys", "tools", "command", "glob", "split", "patch")},
         },
         "ids": {rule_id: True for rule_id in ids},
         "fields": _field_sets(table["fields"]),
     }
-
-
-def trigger_re(regex: str) -> str:
-    """The word (line) holding the first match of a path rule: what the audit names as the trigger."""
-    return "(?<![^\\n])[^\\n]*?(?:" + regex + ")[^\\n]*"
 
 
 def _field_sets(fields: Mapping) -> dict:
@@ -231,8 +208,7 @@ def _built() -> dict:
     return {
         "patterns": tuple(_rule(item) for item in done["patterns"]),
         "names": tuple(_rule(done["names"][name]) for name in ("assignment", "field", "structured")),
-        "paths": tuple(_rule(item) for item in done["sensitive"]["paths"]),
-        "commands": tuple(_rule(item) for item in done["sensitive"]["commands"]),
+        "blanked": dict(done["sensitive"]["blanked"]),
         "env": (_compile(done["env"]["name_re"]), int(done["env"]["min_length"])),
         "ids": frozenset(done["ids"]),
         "allow": frozenset(done["allow"]),
@@ -275,21 +251,16 @@ def _unredactable(event: Mapping) -> dict:
     return {**strip(event, lambda cls: cls["strip"] and not cls["redact"], names=False), "redaction_error": True}
 
 
-def unblank(event: Mapping) -> dict:
-    """The event without free-form labels, for the spans of a blanked turn."""
-    return {key: value for key, value in event.items() if not field_class(key).get("drop_when_blanked")}
-
-
 @dataclass(frozen=True)
 class Ruleset:
     patterns: tuple  # Rule, ... in table order, then secret_assignment, then user patterns
-    paths: tuple
-    commands: tuple
     members: tuple = ()
     error: str = ""  # a project setting that failed: every text is dropped, never sent raw
     allow: frozenset = frozenset()  # secretNames.allow and redactAllow: a find whose redacted text is one of these is left alone
-    unless: tuple = ()  # redactPaths !globs: a word one of these matches is no path
     structured: tuple = ()
+    paths: tuple = ()  # redactPaths (custom_path): a tool call that names one of these files is blanked
+    commands: tuple = ()  # redactCommands (custom_command): a tool call that runs one of these is blanked
+    unless: tuple = ()  # redactPaths !globs: a word one of these matches is no path
 
 
 def glob_re(glob: str) -> str:
@@ -323,13 +294,13 @@ def ruleset(project: Mapping | None = None) -> Ruleset:
     """The built-in rules a project keeps, plus its own (tracing.json):
 
         redactPatterns  regexes whose matches are redacted (custom)
-        redactPaths     globs over whole paths that blank a turn (custom_path)
-        redactCommands  regexes at a command position that blank a turn (custom_command)
+        redactPaths     globs over whole paths; a tool call that names one is blanked (custom_path)
+        redactCommands  regexes at a command position; a tool call that runs one is blanked (custom_command)
         redactNames     names whose values are redacted, as secretNames; !name drops a built-in name
         redactAllow     literal texts never redacted, on top of secretNames.allow
         redactDisable   built-in rule ids turned off
 
-    A redactPaths glob after ! excepts the paths it matches from every path rule. A regex that does not compile, a name
+    A redactPaths glob after ! excepts the paths it matches from the other globs. A regex that does not compile, a name
     that is not parts joined by _, a !name no built-in has, an id no built-in rule has, or a rule setting that is not a
     list of strings fails the rule set closed (``error``), as an invalid redactPatterns regex always has."""
     built = _built()
@@ -345,7 +316,7 @@ def ruleset(project: Mapping | None = None) -> Ruleset:
         return tuple(item for item in items if item.id not in off)
 
     def failed(error: str) -> Ruleset:
-        return Ruleset(built["patterns"], built["paths"], built["commands"], built["names"][1:2], error=error)
+        return Ruleset(built["patterns"], built["names"][1:2], error=error)
 
     bad = [key for key, kind in settings().items() if kind == "rule" and _malformed(project.get(key))]
     if bad:
@@ -362,9 +333,9 @@ def ruleset(project: Mapping | None = None) -> Ruleset:
         commands = [Rule("custom_command", _compile(command_re(regex))) for regex in _setting(project, "redactCommands")]
     except (re.error, RecursionError, OverflowError) as exc:
         return failed(type(exc).__name__)
-    return Ruleset(kept(built["patterns"] + (assignment,)) + tuple(patterns), kept(built["paths"]) + tuple(paths),
-                   kept(built["commands"]) + tuple(commands), kept((field,)), allow=built["allow"] | frozenset(_setting(project, "redactAllow")),
-                   unless=unless, structured=kept((structured,)))
+    return Ruleset(kept(built["patterns"] + (assignment,)) + tuple(patterns), kept((field,)),
+                   allow=built["allow"] | frozenset(_setting(project, "redactAllow")), structured=kept((structured,)),
+                   paths=tuple(paths), commands=tuple(commands), unless=unless)
 
 
 def env_secrets(env: Mapping[str, str] | None = None, api_key: str = "") -> list[tuple[str, str]]:
@@ -652,6 +623,17 @@ def in_text(json_pairs: list[Pair]) -> bool:
     return not any('"' in pair.found or _OUTSIDE_STRING.fullmatch(pair.found) for pair in json_pairs)
 
 
+def _objects(value: Any) -> Iterator[dict]:
+    """Mirror of jq's ``.. | objects``, in the same order."""
+    if isinstance(value, dict):
+        yield value
+        for item in value.values():
+            yield from _objects(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _objects(item)
+
+
 def _size(value: Any) -> int:
     """Mirror of jq's [.. | objects | length] | add: how many members the value's objects hold in all."""
     return sum(len(obj) for obj in _objects(value))
@@ -851,16 +833,6 @@ def scrub_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]], bud
     return _with_records({**event, **scrubbed}, records)
 
 
-def redact_text(text: str, rs: Ruleset, secrets: list[tuple[str, str]], field: str = "text") -> tuple[str, list[dict]]:
-    """One text, such as a history summary, and the records of what was replaced in it as ``field``.
-    Nothing when the rules failed or hit a limit."""
-    try:
-        scrubbed, records = scrub_fields({field: text}, rs, secrets, sender_budget())
-    except RedactionLimit:
-        return "", []
-    return scrubbed[field], records
-
-
 def redact_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]]) -> dict:
     """The sender's step: scrubbed, with what it replaced added to the records the event already carries, and the env
     values its text held added to its provenance. Its budget is the sender's: its matching is linear."""
@@ -868,9 +840,57 @@ def redact_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]]) ->
     if rs.error:
         return _with_env(_unredactable(event), found)
     try:
-        return _with_env(scrub_event(event, rs, secrets, sender_budget()), found)
+        return _with_env(scrub_event(blank_calls([dict(event)], rs)[0], rs, secrets, sender_budget()), found)
     except RedactionLimit:
         return _with_env(_unredactable(event), found)
+
+
+def redact_events(events: list[dict], rs: Ruleset, secrets: list[tuple[str, str]]) -> list[dict]:
+    """``redact_event`` for each of a turn's events, with its sensitive tool calls blanked across all of them
+    (``blank_calls``) and each input message its requests repeat scrubbed once.
+
+    Every request replays the messages before it, so redacting each event alone costs the square of the turn's length.
+    Here the redacted fields of every event, with each distinct value once (an input message, a system prompt, a tool
+    list), are scrubbed together: a text found anywhere in the turn is replaced everywhere in it. Each event's records
+    count what was replaced in its own fields, an input message as often as the event holds it. When the turn as a whole hits a limit, each event is redacted
+    alone, so one event's limit costs only its own text, as before.
+    """
+    if rs.error:
+        return [redact_event(event, rs, secrets) for event in events]
+    # Before anything is scrubbed: a placeholder in a path could hide what makes its call sensitive.
+    events = blank_calls(events, rs)
+    if not any(isinstance(event.get("input_messages"), list) for event in events):
+        return [redact_event(event, rs, secrets) for event in events]
+    # Each event's redacted fields as the pooled values they are made of: an input message, or a whole other field. A
+    # value two events share (a message every later request replays, the system prompt, the tool list) is scrubbed once.
+    pool: dict[str, str] = {}
+    fields: dict[str, Any] = {}
+    parts: list[dict[str, list[str] | str]] = []
+
+    def pooled(value: Any) -> str:
+        name = pool.setdefault(jq_json(value), f"v{len(pool)}")
+        fields.setdefault(name, value)
+        return name
+
+    for event in events:
+        parts.append({key: [pooled(message) for message in value] if key == "input_messages" and isinstance(value, list) else pooled(value)
+                      for key, value in event.items() if field_class(key)["redact"]})
+    try:
+        scrubbed, records = scrub_fields(fields, rs, secrets, sender_budget())
+    except RedactionLimit:
+        return [redact_event(event, rs, secrets) for event in events]
+    found: dict[str, list[dict]] = {}
+    for item in records:
+        found.setdefault(item["field"], []).append(item)
+    out = []
+    for event, names in zip(events, parts):
+        result = dict(event)
+        own: list[dict] = []
+        for key, name in names.items():
+            result[key] = [scrubbed[item] for item in name] if isinstance(name, list) else scrubbed[name]
+            own += [{**item, "field": key} for one in (name if isinstance(name, list) else [name]) for item in found.get(one, [])]
+        out.append(_with_env(_with_records(result, own), env_found(event, secrets)))
+    return out
 
 
 def metadata_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]]) -> dict:
@@ -888,17 +908,6 @@ def metadata_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]]) 
 # ---------------------------------------------------------------- sensitive tool calls
 
 
-def _objects(value: Any) -> Iterator[dict]:
-    """Mirror of jq's ``.. | objects``, in the same order."""
-    if isinstance(value, dict):
-        yield value
-        for item in value.values():
-            yield from _objects(item)
-    elif isinstance(value, list):
-        for item in value:
-            yield from _objects(item)
-
-
 def _all_strings(value: Any) -> Iterator[str]:
     if isinstance(value, str):
         yield value
@@ -911,42 +920,27 @@ def _all_strings(value: Any) -> Iterator[str]:
 
 
 class ToolValue(NamedTuple):
-    """One string in the tool input under a key sensitive.keys names, as plain data: its kind ("path", "command", or "patch")."""
+    """One string in a call's arguments under a key sensitive.keys names: its kind ("path", "command", or "patch")."""
 
     kind: str
     text: str
 
 
-def tool_values(event: Mapping) -> list[ToolValue]:
-    """Mirror of prepare.jq's walk: each string under a path, command, or patch key in the tool input (and each tool call's
-    arguments and input), at any depth, in document order. A string tool input is a command."""
-    kind_of = rules()["sensitive"]["keys"]
-    raw = [(event.get("tool_name"), event.get("tool_input"))]
-    calls = event.get("tool_calls")
-    for call in calls if isinstance(calls, list) else calls.values() if isinstance(calls, dict) else []:
-        if isinstance(call, dict):
-            name = _alt(call.get("name"), call.get("tool_name"))
-            raw += [(name, call.get("arguments")), (name, call.get("input"))]
-    out: list[ToolValue] = []
-    for name, item in raw:
-        kinds = {**kind_of, **rules()["sensitive"]["tools"].get(name.lower() if isinstance(name, str) else "", {})}
-        if item is None:
-            continue
-        if isinstance(item, str):
-            try:
-                parsed = json.loads(item)
-            except ValueError:
-                parsed = None
-            # jq's (fromjson? // .): JSON that parses to null or false leaves the string as it was.
-            item = item if parsed is None or parsed is False else parsed
-        if isinstance(item, str):
-            item = {"command": item}
-        for obj in _objects(item):
-            for key, value in obj.items():
-                kind = kinds.get(key)
-                if kind:
-                    out += [ToolValue(kind, text) for text in _all_strings(value)]
-    return out
+def tool_values(name: Any, arguments: Any) -> list[ToolValue]:
+    """Mirror of jp_call's walk: each string under a path, command, or patch key of one call's arguments, at any depth,
+    in document order. Arguments that are a string are JSON when it parses, else a command."""
+    table = rules()["sensitive"]
+    kinds = {**table["keys"], **table["tools"].get(name.lower() if isinstance(name, str) else "", {})}
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except ValueError:
+            parsed = None
+        # jq's (fromjson? // .): JSON that parses to null or false leaves the string as it was.
+        arguments = arguments if parsed is None or parsed is False else parsed
+    if isinstance(arguments, str):
+        arguments = {"command": arguments}
+    return [ToolValue(kinds[key], text) for obj in _objects(arguments) for key, value in obj.items() if key in kinds for text in _all_strings(value)]
 
 
 def lines(text: str, at: list[str]) -> str:
@@ -956,91 +950,159 @@ def lines(text: str, at: list[str]) -> str:
     return text
 
 
-def words(event: Mapping, values: list[ToolValue], unless: tuple = ()) -> str:
-    """Mirror of prepare.jq: what path rules see, one token per line: the tokens of every tool value, then the prompt's
-    @mentions, without the tokens a redactPaths !glob matches. More than limits.mentions @ signs in the prompt fail closed."""
+def words(values: list[ToolValue], unless: tuple = ()) -> str:
+    """Mirror of jp_call: what redactPaths globs see, one token per line. A path or a command gives all of its tokens. A
+    patch gives only what follows sensitive.patch on the lines that name a file, so a patch whose body mentions a file
+    is not one that touches it. Without the tokens a redactPaths !glob matches."""
     table = rules()["sensitive"]
-    out = lines("\n".join(value.text for value in values), table["split"]) + "\n"
-    prompt = event.get("prompt")
-    if isinstance(prompt, str) and "@" in prompt:
-        if prompt.count("@") > rules()["limits"]["mentions"]:
-            raise RedactionLimit("mentions")
-        mentions = [lines(word[1:], table["mention"]["end"]).split("\n")[0] for word in lines(prompt, table["mention"]["split"]).split("\n") if word.startswith("@")]
-        out += "\n".join(mention for mention in mentions if mention)
+    texts = []
+    for value in values:
+        if value.kind != "patch":
+            texts.append(value.text)
+            continue
+        for prefix in table["patch"]:
+            texts += [piece.split("\n")[0] for piece in ("\n" + value.text).split("\n" + prefix)[1:]]
+    out = lines("\n".join(texts), table["split"])
     if unless:
         out = "\n".join(word for word in out.split("\n") if not any(glob.search(word) for glob in unless))
     return out
 
 
-@functools.lru_cache(maxsize=64)
-def _whole_word(regex: str) -> re.Pattern:
-    """The word (line) holding the first match of a path rule: what the audit names as the trigger (trigger_re)."""
-    return re.compile(trigger_re(regex))
-
-
-def sensitive(event: Mapping, rs: Ruleset) -> dict | None:
-    """The first sensitive command, then path, the event's tool input names, as {rule, trigger}."""
-    values = tool_values(event)
+def call_rule(name: Any, arguments: Any, rs: Ruleset) -> str | None:
+    """The rule one tool call is blanked under: the first redactCommands command, then redactPaths file, its arguments
+    name. Arguments already blanked give the rule that blanked them, so a call stays blanked through every later pass."""
+    if isinstance(arguments, str) and arguments in _built()["blanked"]:
+        return _built()["blanked"][arguments]
+    values = tool_values(name, arguments)
     # Each command is its own command line: a quote one leaves open never hides the next one's command.
     commands = [value.text for value in values if value.kind == "command"]
     for rule in rs.commands:
         if any(rule.applies(text) and rule.pattern.search(text) for text in commands):
-            return {"rule": rule.id, "trigger": f"cmd:{rule.id}"}
-    blob = words(event, values, rs.unless)
+            return rule.id
+    blob = words(values, rs.unless)
     for rule in rs.paths:
         if rule.applies(blob) and rule.pattern.search(blob):
-            return {"rule": rule.id, "trigger": _whole_word(rule.pattern.pattern).search(blob).group(0)}
+            return rule.id
     return None
 
 
+# Where an event holds messages ({role, parts}): a request's input and output, and earlier turns' kept messages.
+MESSAGE_FIELDS = ("input_messages", "output_message", "history")
+# The members of a tool_calls entry that hold its arguments (spans._calls_of reads the same ones).
+CALL_ARGUMENTS = ("arguments", "input", "tool_input")
+
+
+def _call_sites(event: Mapping) -> Iterator[tuple[str, bool, Any, Any, dict, tuple]]:
+    """Each place the event holds a tool call's arguments or its result, as (field, is_result, call id, tool name,
+    holder, keys): ``holder[key]``, for each key it has, is a value to blank."""
+    call_id = event.get("tool_call_id")
+    if event.get("tool_input") is not None:
+        yield "tool_input", False, call_id, event.get("tool_name"), event, ("tool_input",)
+    if _alt(event.get("tool_output"), "") != "":  # as jq: (.tool_output // "") != ""
+        yield "tool_output", True, call_id, event.get("tool_name"), event, ("tool_output",)
+    for field, is_result, keys in (("tool_calls", False, CALL_ARGUMENTS), ("tool_results", True, ("response",))):
+        items = event.get(field)
+        for item in items if isinstance(items, list) else []:
+            if isinstance(item, dict):
+                yield field, is_result, _alt(item.get("id"), item.get("tool_call_id")), _alt(item.get("name"), item.get("tool_name")), item, keys
+    for field in MESSAGE_FIELDS:
+        messages = event.get(field)
+        for message in messages if isinstance(messages, list) else [messages]:
+            parts = message.get("parts") if isinstance(message, dict) else None
+            for part in parts if isinstance(parts, list) else []:
+                kind = part.get("type") if isinstance(part, dict) else None
+                if kind == "tool_call":
+                    yield field, False, part.get("id"), part.get("name"), part, ("arguments",)
+                elif kind == "tool_call_response":
+                    yield field, True, part.get("id"), None, part, ("response",)
+
+
+def _blanked(events: list[dict], rs: Ruleset) -> list[tuple[dict, list[dict]]]:
+    """``blank_calls``, with each event's new records beside it."""
+    if not rs.paths and not rs.commands:
+        return [(event, []) for event in events]
+    seen: dict[tuple, str | None] = {}
+
+    def judge(name: Any, holder: Mapping, keys: tuple) -> str | None:
+        """The rule the arguments under ``keys`` are sensitive by. The same call is judged once."""
+        for key in keys:
+            if holder.get(key) is None:
+                continue
+            memo = (name if isinstance(name, str) else None, jq_json(holder[key]))
+            if memo not in seen:
+                seen[memo] = call_rule(name, holder[key], rs)
+            if seen[memo]:
+                return seen[memo]
+        return None
+
+    hits: dict[str, str] = {}  # call id -> rule
+    found = False
+    for event in events:
+        for _field, is_result, call_id, name, holder, keys in _call_sites(event):
+            rule = None if is_result else judge(name, holder, keys)
+            if rule:
+                found = True
+                if isinstance(call_id, str) and call_id:
+                    hits.setdefault(call_id, rule)
+    if not found:
+        return [(event, []) for event in events]
+    out = []
+    for event in events:
+        # Copied one event at a time: two requests may share a message, and each counts what it holds.
+        event = copy.deepcopy(event)
+        counts: Counter = Counter()
+        for field, is_result, call_id, name, holder, keys in _call_sites(event):
+            rule = hits.get(call_id) if isinstance(call_id, str) else None
+            if not rule and not is_result:
+                rule = judge(name, holder, keys)
+            if not rule and field == "tool_output":
+                # A tool event holds one call: its output goes with its input.
+                rule = judge(name, event, ("tool_input",))
+            if not rule:
+                continue
+            for key in keys:
+                if holder.get(key) is not None and holder[key] != placeholder(rule):
+                    holder[key] = placeholder(rule)
+                    counts[(field, rule)] += 1
+        out.append((event, [{"rule": rule, "field": field, "count": count} for (field, rule), count in sorted(counts.items())]))
+    return out
+
+
+def blank_calls(events: list[dict], rs: Ruleset) -> list[dict]:
+    """The events with every tool call the project hides blanked: its arguments and its result become
+    ``[REDACTED:<rule>]`` in each place the turn holds them. Mirror of prepare.jq's jp_blank for one hook event (which
+    holds no messages). Nothing is blanked unless the project sets redactPaths or redactCommands.
+
+    A call is hidden by its arguments (``call_rule``). Its other places are found by its id: the tool event of a
+    call the model made, the result a later request replays. A place with no id is judged on its own, and a tool
+    event's output goes with that event's input. Each value replaced is counted in the event's records, by rule and
+    field. A value that is already the placeholder is not counted again, so a second pass changes nothing.
+    """
+    return [_with_records(event, records) if records else event for event, records in _blanked(events, rs)]
+
+
 def sanitize_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]], capture: str = "sanitized") -> dict:
-    """Mirror of prepare.jq's judgment_prepare for one event: capture policy, sensitive check, scrub, records."""
-    # The env values the raw text held, recorded whatever happens next: a rule that swallows one, a sensitive call that
-    # blanks the event, or a failure that drops its text (the sender must not restore that text from a transcript).
+    """Mirror of prepare.jq's judgment_prepare for one event: capture policy, hidden calls, scrub, records."""
+    # The env values the raw text held, recorded whatever happens next: a rule that swallows one, or a failure that drops
+    # its text (the sender must not restore that text from a transcript).
     raw = event = _with_env({key: value for key, value in event.items() if key != "env_found"}, env_found(event, secrets))
     if rs.error:
         return _unredactable(event)
     try:
+        blank: list[dict] = []
         if capture == "metadata":
             event = {**strip(event), "prompt": "", "output": ""}
         else:
-            hit = sensitive(event, rs)
-            if hit is not None:
-                event = {**strip(event), "sensitive": True, "sensitive_rule": hit["rule"], "sensitive_trigger": hit["trigger"]}
+            event, blank = _blanked([event], rs)[0]
         fields = {key: value for key, value in event.items() if field_class(key)["redact"]}
-        if not fields:
-            return dict(event)
-        scrubbed, records = scrub_fields(fields, rs, secrets)
+        scrubbed, records = scrub_fields(fields, rs, secrets) if fields else ({}, [])
         # As jq: what this pass replaced is the event's record. A pass that replaced nothing leaves it as it was.
-        return {**event, **scrubbed, **({"redactions": records} if records else {})}
+        out = {**event, **scrubbed, **({"redactions": records} if records else {})}
+        if blank:
+            out["redactions"] = sorted(blank + list(out.get("redactions") or []), key=lambda item: (item["field"], item["rule"]))
+        return out
     except RedactionLimit:
         return _unredactable(raw)
-
-
-def show_trigger(trigger: str, home: str = "") -> str:
-    """The trigger as the audit shows it: the home folder as ``~``. It was redacted with the event."""
-    if home and home != "/" and trigger.startswith(home.rstrip("/") + "/"):
-        return "~" + trigger[len(home.rstrip("/")) :]
-    return trigger
-
-
-def first_sensitive(events: list[dict], rs: Ruleset, secrets: list[tuple[str, str]], home: str = "") -> dict | None:
-    """Why this turn is blanked: the first event the hook marked, or the first tool call found here.
-
-    Run it on the events before they are redacted: a placeholder can hide what made a path sensitive.
-    """
-    for event in events:
-        if event.get("sensitive"):
-            return {"rule": str(event.get("sensitive_rule") or ""), "trigger": show_trigger(str(event.get("sensitive_trigger") or ""), home)}
-    for event in events:
-        try:
-            hit = sensitive(event, rs)
-        except RedactionLimit:
-            # Too much to check is treated as sensitive: the turn loses its text, never sends it unchecked.
-            return {"rule": "redaction_limit", "trigger": ""}
-        if hit is not None:
-            return {"rule": hit["rule"], "trigger": show_trigger(redact_text(hit["trigger"], rs, secrets)[0], home)}
-    return None
 
 
 def outcome(event: Mapping) -> str:
@@ -1048,39 +1110,25 @@ def outcome(event: Mapping) -> str:
 
         clean      no rule replaced anything
         redacted   records say what was replaced (``redactions``)
-        sensitive  a tool call read a sensitive path or dumped the environment: the text is gone (``sensitive``)
         error      a rule failed or a limit was hit: the text, labels, and tool names are gone (``redaction_error``)
 
-    error wins over sensitive, which wins over redacted. Impossible: text in a sensitive or error event, or a label or
-    tool name in an error event. Those raise ValueError.
+    error wins over redacted. Impossible: text, a label, or a tool name in an error event. That raises ValueError.
     """
-    # tool_calls survive stripping as ids (and names, but not in an error event): checked on their own.
-    text = [key for key, value in event.items() if key != "tool_calls" and not field_class(key)["strip"] and value not in ("", None)]
-    calls = event.get("tool_calls") or []
-
-    def more_than(allowed: set) -> bool:
-        return not isinstance(calls, list) or any(not isinstance(call, Mapping) or set(call) - allowed for call in calls)
-
     if event.get("redaction_error"):
+        # tool_calls survive as ids only: checked on their own.
+        text = [key for key, value in event.items() if key != "tool_calls" and not field_class(key)["strip"] and value not in ("", None)]
         labels = [key for key in event if key != "tool_calls" and field_class(key)["redact"]]
-        if text or labels or more_than({"id"}):
+        calls = event.get("tool_calls") or []
+        if text or labels or not isinstance(calls, list) or any(not isinstance(call, Mapping) or set(call) - {"id"} for call in calls):
             raise ValueError(f"error event keeps {sorted(set(text + labels)) or 'tool calls'}")
         return "error"
-    if event.get("sensitive"):
-        if text or more_than({"id", "name"}):
-            raise ValueError(f"sensitive event keeps {sorted(text) or 'tool calls'}")
-        return "sensitive"
     return "redacted" if event.get("redactions") else "clean"
 
 
-def turn_redaction(events: list[dict], blank: Mapping | None = None, extra: Iterable[Mapping] = ()) -> dict:
+def turn_redaction(events: list[dict], extra: Iterable[Mapping] = ()) -> dict:
     """The turn's audit record: every event's records, and ``extra`` (the history's), summed by rule and field."""
     items = sort_records([item for event in events for item in (event.get("redactions") or [])] + list(extra))
-    record: dict[str, Any] = {"count": sum(item["count"] for item in items), "items": items, "blanked": bool(blank)}
-    if blank:
-        record["reason"] = SENSITIVE_REASON
-        record["rule"] = str(blank.get("rule") or "")
-        record["trigger"] = str(blank.get("trigger") or "")
+    record: dict[str, Any] = {"count": sum(item["count"] for item in items), "items": items}
     if any(event.get("redaction_error") for event in events):
         record["error"] = True
     return record
