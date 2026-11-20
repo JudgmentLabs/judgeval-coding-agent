@@ -79,7 +79,6 @@ def check() -> list[dict]:
                 "py": p.get("tool_output") != text or p.get("prompt") != text,
                 "count": sum(item["count"] for item in j.get("redactions", []) + p.get("redactions", [])),
                 "rules": sorted({item["rule"] for item in j.get("redactions", []) + p.get("redactions", [])}),
-                "sensitive": bool(j.get("sensitive") or p.get("sensitive")),
             }
         )
     return rows

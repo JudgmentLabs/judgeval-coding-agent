@@ -376,19 +376,6 @@ class RedactionTest(HookCase):
             for key in ("gen_ai.system_instructions", "gen_ai.tool.definitions"):
                 self.assertNotIn(key, span)
 
-    def test_a_blanked_turn_sends_none_of_it(self) -> None:
-        path = self.rollout()
-        base = {"v": 1, "harness": "codex", "session_id": "s1", "turn_id": "t1", "cwd": str(self.project), "transcript_path": str(path)}
-        self.hook({**base, "event": "turn_start", "prompt": "first", "ts": 1_000})
-        self.hook({**base, "event": "tool", "tool_name": "Read", "tool_call_id": "r", "tool_input": {"file_path": ".env"}, "tool_output": "A=1", "ts": 2_000})
-        self.hook({**base, "event": "turn_end", "ts": 5_000})
-        self.assertEqual(self.export(), 1)
-        spans = self.llm()
-        self.assertIn("gen_ai.system_instructions", spans[-1])
-        for span in spans:
-            for key in ("gen_ai.system_instructions", "gen_ai.tool.definitions", "judgment.input", "judgment.output"):
-                self.assertEqual(span.get(key, ""), "", key)
-
     def test_history_kept_beside_a_turn_is_redacted_before_it_is_stored_and_replayed(self) -> None:
         base = {"v": 1, "harness": "pi", "session_id": "s1", "cwd": str(self.project)}
         for turn, start, capture in (("t1", 1_000, "full"), ("t2", 2_000, "sanitized"), ("t3", 3_000, "sanitized")):

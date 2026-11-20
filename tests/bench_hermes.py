@@ -16,7 +16,7 @@ Cases (every fake credential is built at runtime; the env is the sandbox's, neve
   turnend      on_session_end with the real sender launch (sink down, so each sender exits quickly)
   handoff      not a callback: ms from on_session_end returning to its records being in the helper's pipe
   rows329k     pre_tool_call, post_tool_call, post_api_request with 329 KB structured arguments, 10,000 rows:
-               over the snapshot budget, omitted whole, the turn blanked
+               over the snapshot budget, omitted whole
   rowsspread   10,000 rows as 100 lists of 100: the budget runs out partway through the walk
   rowsedge     2,040 rows (~8,160 members, 68 KB): just within the budget, the most a callback copies
   rows8x32k    8 threads, each running its own sessions with 32 KB (1,000-row) structured arguments

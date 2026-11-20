@@ -20,7 +20,6 @@ class FalsePositiveTests(unittest.TestCase):
                 self.assertFalse(row["jq"], "the hook changed it")
                 self.assertFalse(row["py"], "the sender changed it")
                 self.assertEqual(row["count"], 0)
-                self.assertFalse(row["sensitive"])
 
     def test_known_limit_references_after_a_name(self):
         rows = [row for row in check() if row["case"] in OVER_REDACTED]
@@ -29,7 +28,6 @@ class FalsePositiveTests(unittest.TestCase):
             with self.subTest(case=row["case"]):
                 self.assertTrue(row["jq"] and row["py"])
                 self.assertEqual(row["rules"], ["secret_assignment"])
-                self.assertFalse(row["sensitive"])
 
     def test_corpus_inside_one_event_is_identical(self):
         text = "\n\n".join(text for name, text in CORPUS if name not in OVER_REDACTED)
