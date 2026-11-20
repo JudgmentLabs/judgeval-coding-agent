@@ -523,12 +523,12 @@ class ClaudeTest(Shared):
         # Only a turn sent with its text to this project may be replayed. Otherwise the main thread's requests are
         # rebuilt, and the subagent's keep their transcript input.
         dest = "https://api.example.com org project"
-        sent = {"replayable": True, "dest": dest}
+        sent = {"replay": "transcript", "dest": dest}
         for earlier, replayed in (
             (None, False),  # never traced
             (sent, True),
             ({**sent, "dest": "https://api.example.com org other"}, False),
-            ({**sent, "replayable": False}, False),  # not sent yet, metadata, or failed rules
+            ({**sent, "replay": "none"}, False),  # not sent yet, metadata, or failed rules
         ):
             with self.subTest(earlier=earlier):
                 index = {} if earlier is None else {"claude-code\ts1\tp1": earlier}
@@ -580,15 +580,15 @@ class ReplayTest(HookCase):
             self.hook({**base, "event": "tool", "tool_name": "Read", "tool_call_id": "toolu_1", "tool_input": {"file_path": ".env"}, "tool_output": ENV, "ts": start + 1_000})
         self.hook({**base, "event": "turn_end", "output": output, "ts": start + 3_000})
 
-    def second_turn(self, harness: str, before: str) -> dict:
+    def second_turn(self, harness: str, before: str, **settings) -> dict:
         """Turn one, which reads .env, traced ``before`` (off, metadata, sanitized), then turn two sanitized: its llm span."""
         path = self.claude(reads_env=True) if harness == "claude-code" else self.codex(reads_env=True)
         first, second = ("p1", "p2") if harness == "claude-code" else ("t1", "t2")
-        self.optin({"enabled": before != "off", "capture": "metadata" if before == "metadata" else "sanitized"})
+        self.optin({"enabled": before != "off", "capture": "metadata" if before == "metadata" else "sanitized", **settings})
         self.turn(harness, path, first, "turn one plan", "done first", T0 + 1_000, reads_env=True)
         self.assertEqual(self.export(), int(before != "off"))
         Collector.bodies = []
-        self.optin({"enabled": True, "capture": "sanitized"})
+        self.optin({"enabled": True, "capture": "sanitized", **settings})
         self.turn(harness, path, second, "turn two ask", "done second", T0 + 5_000)
         self.assertEqual(self.export(), 1)
         spans = [span for body in Collector.bodies for span in llm_spans(body)]
@@ -618,6 +618,18 @@ class ReplayTest(HookCase):
                 self.assertNotIn("hunter2", sent)
                 self.assertIn("[REDACTED:secret_assignment]", sent)
 
+    def test_a_call_the_project_hides_stays_hidden_where_a_later_turn_replays_it(self) -> None:
+        for harness in ("claude-code", "codex"):
+            with self.subTest(harness=harness):
+                self.setUp()  # a fresh state directory and project
+                inputs, _ = io(self.second_turn(harness, "sanitized", redactPaths=[".env"]))
+                parts = [part for message in inputs for part in message["parts"]]
+                self.assertEqual([part.get("arguments", part.get("response")) for part in parts if part["type"].startswith("tool_call")],
+                                 ["[REDACTED:custom_path]"] * 2)
+                # The rest of turn one is replayed: only the call is hidden.
+                self.assertEqual([parts[0]["content"], parts[-1]["content"]], ["turn one plan", "turn two ask"])
+                self.assertNotIn("API_KEY", json.dumps(Collector.bodies))
+
 
 class TailReadTest(Shared):
     """A large transcript is read from its end: back to the last compaction before the turn, and the older rows a reader
@@ -643,6 +655,8 @@ class TailReadTest(Shared):
                 {"type": "api-request-blob", "hash": "unused", "message": old},
                 {"type": "api-request", "id": "r0", "shapeHash": "h", "keep": 0, "tail": ["b0"]},
                 {"type": "user", "uuid": "u0", "promptId": "p0", "timestamp": _at(1), "message": old},
+                # A prompt no hook saw (no promptId): kept, so the request is known to replay a turn nothing vouches for.
+                {"type": "user", "uuid": "ux", "timestamp": _at(1), "message": old},
                 _result("u1", "p0", "toolu_0", "old result", 2),
                 _assistant("a0", "r0", {"type": "text", "text": "old answer"}, "end_turn", 3),
                 # A minute before the turn, inside the margin a turn's rows may start early by: the read stops here.
@@ -659,9 +673,10 @@ class TailReadTest(Shared):
             path = _jsonl(self.tmpdir() / "session.jsonl", rows, spaced=True)
             found = records(path, T0 + 10_000, claude_transcript._is_compaction, claude_transcript._pins)
             # Before the compaction: the shape, blob, and base request r1 needs, and the earlier prompt (in the summary).
-            skipped = (2, 4, 7, 8)
+            skipped = (2, 4, 8, 9)
             with self.subTest(stamped=stamped):
                 self.assertEqual(found, [row for index, row in enumerate(rows) if index not in skipped])
+                self.assertEqual(claude_transcript._earlier_turns(found, len(found), "p1", main=True), ["?", "p0"])
                 self.assertEqual(claude_transcript._exact_requests(found)[0]["r1"]["system"], "You are Claude Code.")
 
     def test_codex(self) -> None:

@@ -511,8 +511,9 @@ def _pins(kept: list[dict]) -> Callable[[bytes], dict | None]:
             if (kind == "api-request-shape" and str(row.get("shapeHash")) in shapes) or (kind == "api-request-blob" and str(row.get("hash")) in blobs):
                 return row
             return None
-        # A tool result row is a user row with a promptId too. An escaped quote inside a string never reads as this key.
-        if b'"promptId"' in line and b'"type":"tool_result"' not in line and b'"type": "tool_result"' not in line:
+        # Every earlier prompt, with a promptId or not: one without names a turn nothing can vouch for, and the reader
+        # must see it to say so. A tool result is a user row too. An escaped quote inside a string never reads as "user".
+        if b'"user"' in line and b'"type":"tool_result"' not in line and b'"type": "tool_result"' not in line:
             row = parse_line(line)
             return row if row is not None and _is_prompt(row) else None
         return None

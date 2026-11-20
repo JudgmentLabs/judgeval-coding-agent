@@ -430,7 +430,7 @@ def read_thread(path: Path | None, *, turn_id: str = "", prompt: str = "", root_
                 continue
             last_total = total
         if usage is not None and is_record == by_record:
-            if is_record and step["input"] is None and step["output"] is None and not step["text"] and not step["tool_calls"]:
+            if is_record and step["input"] is None:
                 # A compaction's request: nothing it wrote is in the model's history, so it is no llm span.
                 continue
             output = history.flush()

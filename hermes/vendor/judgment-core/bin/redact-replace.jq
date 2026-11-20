@@ -73,6 +73,8 @@ def jr_replace:
       | $out + (if $recs == [] then {} else {redactions: ($recs | sort_by(.field, .rule))} end);
 def jr_stamp($frame):
   . + $frame.stamp
+  # What blanking a tool call the project hides replaced (prepare.jq jp_blank), unless a rule then failed.
+  | if ($frame.blanked // []) != [] and .redaction_error != true then .redactions = ($frame.blanked + (.redactions // []) | sort_by(.field, .rule)) else . end
   | if (.model // "") == "" and $frame.default_model != "" then . + {model: $frame.default_model} else . end;
 def jr_resume:
   . as $frame | (try jr_replace catch $frame.error) | jr_stamp($frame);

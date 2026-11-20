@@ -60,7 +60,7 @@ def records(
     rebuild what each of the turn's requests saw. A compaction during the turn does not stop the read: the turn's
     earlier requests saw the rows before it.
 
-    ``pin`` keeps rows from before that compaction that a reader still needs, such as the session's tool definitions.
+    ``pin``, given whenever ``stop`` is, keeps rows from before that compaction that a reader still needs, such as the session's tool definitions.
     It is called with the rows kept so far (oldest last) and returns a test for each older raw line, newest first: the
     row to keep, or None. Only a test that matches pays for parsing the line.
     """
@@ -104,8 +104,6 @@ def records(
                     kept.append(row)
                     passed = passed or (stamp is not None and stamp < since_ms)
                     if passed and stop(row):
-                        if pin is None:
-                            return first + list(reversed(kept))
                         wanted = pin(kept)
                     continue
                 if stamp is not None and stamp < cutoff:

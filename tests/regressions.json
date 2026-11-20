@@ -859,6 +859,36 @@
       "input": "SESSION_COOKIE=<<opaque>>",
       "expect": "leaks",
       "limit": "unnamed-value"
+    },
+    {
+      "id": "redact-paths-hides-the-call",
+      "route": "input",
+      "input": {
+        "file_path": "/app/.env"
+      },
+      "output": "SESSION_COOKIE=<<opaque>>",
+      "cfg": {
+        "redactPaths": [
+          ".env*"
+        ]
+      },
+      "layers_only": true,
+      "expect": "redacted",
+      "source": "the dotenv-cookie leak, closed by the project naming the file"
+    },
+    {
+      "id": "redact-commands-hides-the-call",
+      "route": "command",
+      "input": "aws configure get aws_secret_access_key",
+      "output": "<<opaque>>",
+      "cfg": {
+        "redactCommands": [
+          "aws[^\\S\\n]+configure[^\\S\\n]+get"
+        ]
+      },
+      "layers_only": true,
+      "expect": "redacted",
+      "source": "the aws-configure-get-secret leak, closed by the project naming the command"
     }
   ],
   "limits": [

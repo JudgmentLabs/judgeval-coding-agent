@@ -5,16 +5,16 @@ events through ``assemble.Fold`` in the order they happened, appends each to
 its turn's file under ``turns/``, and sends every turn the fold marked ready.
 Persistent state is the fold's small routing table (``fold.json``) and one
 record per turn (``index.json``): its file, whether it is waiting to be
-sent, the last ``judgment.update_id`` sent, when it started, and whether a
-later turn may replay its text (``replayable``). A turn whose llm inputs were
-not read from a transcript also keeps the messages it added to the thread
+sent, the last ``judgment.update_id`` sent, when it started, and what a later
+turn may replay of it (``replay``, one of REPLAY). A turn whose llm inputs were
+not read from a transcript keeps the messages it added to the thread
 (``<turn>.messages.json``), so later turns replay them whole.
 
 A transcript replays every earlier turn of the session in each request,
 including turns this sender never saw (traced off) or sent without text
 (metadata). A request read from a transcript names the earlier turns
 it holds (``replay_turns``); it keeps its transcript input only when each of
-them is replayable and went to the same project. Otherwise it is rebuilt from
+them may be replayed and went to the same project. Otherwise it is rebuilt from
 the turn's own events and the kept messages of earlier turns, as for a harness
 without a transcript.
 
@@ -82,6 +82,11 @@ REQUEST_BYTES = 2 * 1024 * 1024
 # only the newest whole turns that fit are replayed.
 HISTORY_BYTES = 1024 * 1024
 _LOG_MAX = 64 * 1024
+# What a later turn of the session may replay of a sent turn (``replay`` in its index record; absent reads as none):
+#   none        nothing: it was sent without its text (metadata capture, failed rules, an unchecked environment)
+#   transcript  its text where a transcript replays it; its own inputs were read from the transcript
+#   kept        that, and the messages it added to the thread, kept in <turn>.messages.json
+REPLAY = ("none", "transcript", "kept")
 
 
 # The state holds prompts, answers, and tool output. Only its owner may read it.
@@ -212,12 +217,13 @@ def _messages_file(state: Path, key: str) -> Path:
     return _turn_file(state, key).with_suffix(".messages.json")
 
 
-def _forget(state: Path, key: str, item: dict) -> None:
-    """No later turn replays this one: not its kept messages, nor its text in a transcript."""
-    item.pop("summary", None)  # written by earlier versions
-    item["messages"] = False
-    item["replayable"] = False
-    _messages_file(state, key).unlink(missing_ok=True)
+def _set_replay(state: Path, key: str, item: dict, replay: bool, messages: list[dict] | None = None) -> None:
+    """Record what later turns may replay of this one (REPLAY), and keep or remove its messages file to match."""
+    item["replay"] = "none" if not replay else "transcript" if messages is None else "kept"
+    if item["replay"] == "kept":
+        _private_write(_messages_file(state, key), json.dumps(messages, ensure_ascii=False))
+    else:
+        _messages_file(state, key).unlink(missing_ok=True)
 
 
 def _inbox(state: Path) -> list[tuple[Path, dict, list]]:
@@ -434,22 +440,13 @@ class _Redactor:
     def redact(self, event: dict) -> dict:
         return redact.redact_event(event, self.rules([event]), self.secrets)
 
-    def history(self, messages: list[dict], rs: redact.Ruleset) -> tuple[list[dict], list[dict]]:
-        """One earlier turn's messages redacted, and what that replaced as field history. None of them at a limit."""
-        try:
-            scrubbed, records = redact.scrub_fields({"history": messages}, rs, self.secrets, redact.sender_budget())
-        except redact.RedactionLimit:
-            return [], []
-        return scrubbed["history"], records
 
-
-def _sanitize(state: Path, key: str, events: list[dict], prepared: list[dict], redactor: _Redactor) -> tuple[list[dict], bool]:
-    """Redact the enriched turn, and whether this process could check it: the environment the hook redacted with is the
-    one here. When it is not, every event loses its text, as when its rules fail. The turn file is rewritten when this
-    changes what it holds, so the redacted version is all that stays on disk.
+def _sanitize(state: Path, key: str, events: list[dict], prepared: list[dict], redactor: _Redactor, checked: bool) -> list[dict]:
+    """Redact the enriched turn. ``checked``: the environment the hook redacted with is the one here. When it is not,
+    every event loses its text, as when its rules fail. The turn file is rewritten when this changes what it holds, so
+    the redacted version is all that stays on disk.
     """
     rs = redactor.rules(events)
-    checked = redactor.checked_environment(events)
     prepared = redact.redact_events(carry_records(events, prepared, redactor.names), rs, redactor.secrets)
     if not checked:
         # Last, so carry_records cannot put the hook's text back.
@@ -457,7 +454,7 @@ def _sanitize(state: Path, key: str, events: list[dict], prepared: list[dict], r
     stored = [redact.redact_event(event, rs, redactor.secrets) for event in events]
     if stored != events:
         _private_write(_turn_file(state, key), "".join(json.dumps(event, ensure_ascii=False, default=str) + "\n" for event in stored))
-    return prepared, checked
+    return prepared
 
 
 def carry_records(stored: list[dict], prepared: list[dict], names: Iterable[str] | None = None) -> list[dict]:
@@ -514,12 +511,17 @@ def _env_refs(event: dict) -> set[tuple[str, str]]:
 
 
 def _redact_history(history: list[list[dict]], rs: redact.Ruleset, redactor: _Redactor) -> tuple[list[list[dict]], list[dict]]:
-    """Earlier turns' messages redacted, and the records of what that replaced, as field history."""
+    """Earlier turns' messages with the tool calls the project hides blanked and their secrets redacted, and the records
+    of what that replaced, as field history. A turn that hits a limit is left out whole."""
     out, records = [], []
     for turn in history:
-        messages, found = redactor.history(turn, rs)
-        out.append(messages)
-        records += found
+        blanked = redact.blank_calls([{"history": turn}], rs)[0]
+        try:
+            scrubbed, found = redact.scrub_fields({"history": blanked["history"]}, rs, redactor.secrets, redact.sender_budget())
+        except redact.RedactionLimit:
+            continue
+        out.append(scrubbed["history"])
+        records += redact.census(blanked) + found
     return out, records
 
 
@@ -606,7 +608,7 @@ def _untraced(index: dict, key: str, dest: str, turns: list) -> bool:
     harness, session, _turn = key.split("\t")
     for turn in turns:
         item = index.get(f"{harness}\t{session}\t{turn}")
-        if item is None or not item.get("replayable") or item.get("dest") != dest:
+        if item is None or item.get("replay") not in ("transcript", "kept") or item.get("dest") != dest:
             return True
     return False
 
@@ -634,7 +636,7 @@ def _history(state: Path, index: dict, key: str, dest: str) -> list[list[dict]]:
     earlier = sorted(
         (int(item.get("start") or 0), other)
         for other, item in index.items()
-        if other != key and other.startswith(prefix) and item.get("messages") and item.get("dest") == dest and int(item.get("start") or 0) < start
+        if other != key and other.startswith(prefix) and item.get("replay") == "kept" and item.get("dest") == dest and int(item.get("start") or 0) < start
     )
     turns: list[list[dict]] = []
     budget = HISTORY_BYTES
@@ -642,13 +644,11 @@ def _history(state: Path, index: dict, key: str, dest: str) -> list[list[dict]]:
     # Newest first: a long session keeps its latest turns whole and leaves out the oldest.
     for _start, other in reversed(earlier):
         try:
-            turn = json.loads(_messages_file(state, other).read_text(encoding="utf-8"))
+            text = _messages_file(state, other).read_text(encoding="utf-8")
+            messages = json.loads(text)
         except (OSError, ValueError):
             continue
-        if not isinstance(turn, list):
-            continue
-        messages = [message for message in turn if isinstance(message, dict)]
-        size = len(json.dumps(messages, ensure_ascii=False))
+        size = len(text)
         if skipped or size > budget:
             skipped += 1
             continue
@@ -721,7 +721,8 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
             prepared = _enrich(events)
             # Transcript events carry no stamp. The hook's events say how the turn was recorded.
             capture = turn_capture(events)
-            checked = True
+            # Whether the environment the hook redacted with is the one here. Full capture redacted with none.
+            checked = capture == "full" or redactor.checked_environment(events)
             redaction = None
             rs = redactor.rules(events)
             assert creds is not None
@@ -731,15 +732,15 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
             if capture == "metadata":
                 # Transcript enrichment has already run, so this is what gets sent and kept.
                 prepared = [redact.metadata_event(event, rs, redactor.secrets) for event in carry_records(events, prepared, redactor.names)]
-                if not redactor.checked_environment(events):
+                if not checked:
                     prepared = [redact._unredactable(event) for event in prepared]
             elif capture == "sanitized":
-                prepared, checked = _sanitize(state, key, events, prepared, redactor)
+                prepared = _sanitize(state, key, events, prepared, redactor, checked)
             # A metadata turn is no later turn's context. Nor is one whose rules failed or whose environment did not check.
             quiet = capture == "metadata" or (capture != "full" and (bool(rs.error) or not checked))
-            if quiet and (item.get("messages") or item.get("replayable")):
+            if quiet and item.get("replay", "none") != "none":
                 # Settled before any send, so a failed post cannot leave the old text as context.
-                _forget(state, key, item)
+                _set_replay(state, key, item, False)
                 _private_write(state / "index.json", json.dumps(index))
             started = turn_start(prepared)
             if started is not None:
@@ -782,16 +783,7 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
             return -1
         item["update_id"] = 0 if update_id is None else update_id
         item["ready"] = False
-        if quiet:
-            _forget(state, key, item)
-        else:
-            item.pop("summary", None)  # written by earlier versions
-            item["replayable"] = True
-            item["messages"] = turn.messages is not None
-            if turn.messages is None:
-                _messages_file(state, key).unlink(missing_ok=True)
-            else:
-                _private_write(_messages_file(state, key), json.dumps(turn.messages, ensure_ascii=False))
+        _set_replay(state, key, item, not quiet, turn.messages)
         item["dest"] = dest
         _private_write(state / "index.json", json.dumps(index))
         if not taken:

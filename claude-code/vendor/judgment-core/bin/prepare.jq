@@ -1,10 +1,15 @@
 # Shared by adapter maps. One jq applies the map and this filter.
 # Commands pass through so a session toggle still runs when tracing is off.
 #
-# An event goes map -> capture policy -> redact -> inbox. The rules are data: redact-rules.json is the source, and
-# scripts/gen_redact.py composes it into redact-compiled.json, which this loads. judgment_core/redact.py reads the same
-# source, and its functions mirror the steps below (tests/test_redact.py checks they agree). A project's tracing.json adds
-# to or trims the built-in rules (jp_rules): redactPatterns, redactNames, redactAllow, redactDisable.
+# An event goes map -> capture policy -> hidden calls -> redact -> inbox. The rules are data: redact-rules.json is
+# the source, and scripts/gen_redact.py composes it into redact-compiled.json, which this loads. judgment_core/redact.py
+# reads the same source, and its functions mirror the steps below (tests/test_redact.py checks they agree). A project's
+# tracing.json adds to or trims the built-in rules (jp_rules): redactPatterns, redactPaths, redactCommands, redactNames,
+# redactAllow, redactDisable.
+#
+# Hidden calls (jp_blank): a tool call that names a file the project's redactPaths matches, or runs a command its
+# redactCommands matches, keeps its tool name and loses its arguments and its result, each replaced by [REDACTED:<rule>].
+# Nothing else in the turn changes, and nothing is hidden unless the project asks.
 #
 # Redaction: one blob of every string and key in the event's text fields gives the pairs (found text, replacement, rule):
 # env values, then each rule, every one a complete match on the unchanged blob, one pair per found text, longest first.
@@ -31,6 +36,8 @@ def jp_join($x): .[:1] + (.[1:] | map($x + .)) | add // "";
 def jp_test($re): _match_impl($re; null; true);
 # Any of the literals is in the input. No literals (null) means any text.
 def jp_holds($needs): . as $t | $needs == null or ([$needs[] as $n | $t | contains($n) | if . then 1 else empty end] != []);
+# Split at each of the literals: the pieces, one per line.
+def jp_lines($at): reduce $at[] as $c (.; split($c) | jp_join("\n"));
 # Every string and key, in order: the items of the blob rules run over, one per line.
 def jp_items: [.. | if type == "string" then . elif type == "object" then keys_unsorted[] else empty end];
 def jp_blob: jp_items | jp_join("\n");
@@ -106,12 +113,15 @@ def jp_pairs($rules; $l; $allow):
 # A project's redactNames name as secretNames spells a name: each part lower, UPPER, or Capitalized, joined by _, -, ., or nothing.
 def jp_word: ascii_downcase | split("_") | map("(?:" + . + "|" + ascii_upcase + "|" + (.[:1] | ascii_upcase) + .[1:] + ")") | jp_join("[_.-]?");
 # The rules this event runs (redact.ruleset): the built-in rules redactDisable keeps, the name rules over the built-in names
-# redactNames keeps (!name drops one) and its own, and the project's redactPatterns; secretNames.allow and redactAllow as
-# a set. A disabled id or a !name no built-in has, a name that is not parts joined by _, or a rule setting that is not a
-# list of strings fails closed, as a regex that does not compile does.
+# redactNames keeps (!name drops one) and its own, and the project's redactPatterns, redactPaths, and redactCommands; a
+# redactPaths !glob excepts the words it matches from the other globs; secretNames.allow and redactAllow as a set. A
+# disabled id or a !name no built-in has, a name that is not parts joined by _, or a rule setting that is not a list of
+# strings fails closed, as a regex that does not compile does.
 def jp_rules($c; $r):
   # A list setting's nonempty strings. Anything else in a trim (redactAllow, redactDisable) is skipped.
   def setting($k): $c[$k] | if type == "array" then [.[] | strings | if . == "" then empty else . end] else [] end;
+  def glob: "(?<![^\\n/:])" + ([explode[] | [.] | implode | $r.sensitive.glob[.] // .] | jp_join("")) + "(?![^\\n])";
+  def command: $r.sensitive.command.prefix + "(?:" + . + ")" + $r.sensitive.command.unless;
   if [$r.strict[] as $k | $c[$k]
       | if . == null or (type == "array" and ([.[] | strings] | length) == length) then empty else 1 end] != [] then error("redaction limit") else . end
   | (setting("redactDisable") | map({(.): true}) | add // {}) as $off
@@ -123,14 +133,77 @@ def jp_rules($c; $r):
     then error("redaction limit") else . end
   | ($entries == []) as $builtin
   | (if $builtin then $r.names.builtin else $r.names.list - $dropped + $names | map(jp_word) | jp_join("|") end) as $alt
-  | reduce setting("redactPatterns")[] as $re (.; ("" | jp_test($re)) as $valid | .)
+  | setting("redactPaths") as $globs
+  | reduce (setting("redactPatterns")[], (setting("redactCommands")[] | command), ($globs[] | ltrimstr("!") | glob)) as $re
+      (.; ("" | jp_test($re)) as $valid | .)
   | def named($n): $n | {id, placeholder, re: (.parts[0] + "(?:" + $alt + ")" + .parts[1])} + if $builtin then {needs} else {} end;
     def kept: [.[] | if $off[.id] then empty else . end];
     {patterns: (($r.patterns + [named($r.names.assignment)] | kept)
                 + [setting("redactPatterns")[] | {id: "custom", re: ., placeholder: "[REDACTED:custom]"}]),
      members: ([named($r.names.field)] | kept),
      structured: ([named($r.names.structured)] | kept),
+     paths: [$globs[] | if startswith("!") then empty else {id: "custom_path", re: glob} end],
+     unless: [$globs[] | if startswith("!") then .[1:] | glob else empty end],
+     commands: [setting("redactCommands")[] | {id: "custom_command", re: command}],
      allow: ($r.allow + setting("redactAllow") | map({(.): true}) | add // {})};
+# The rule one tool call is blanked under (redact.call_rule): the first redactCommands command, then redactPaths file,
+# its arguments name, or null. The input is the arguments, $name the tool. Arguments already blanked give the rule that blanked them.
+# Path rules see one token per line: the tokens of every path and command value, and of a patch only what follows
+# sensitive.patch on the lines that name a file. Command rules see each command value on its own.
+def jp_call($name; $x; $r):
+  $r.sensitive as $s
+  | if type == "string" and $s.blanked[.] then $s.blanked[.] else
+      ($s.keys + ($s.tools[($name | strings | ascii_downcase) // ""] // {})) as $keys
+      # [kind, value]: the kind of the key the string sits under. A string is JSON when it parses (as something other
+      # than null or false), else a command. One walk.
+      | [(fromjson? // .) | ((strings | {command: .}) // .)
+         | .. | objects | . as $o | keys_unsorted[] | $keys[.] as $kind | if $kind then $o[.] | .. | strings | [$kind, .] else empty end] as $kv
+      # Split, not a global match: jq counts each match's offset from the start of the string, so many matches cost its square.
+      | ([$kv[] | if .[0] == "patch" then ("\n" + .[1]) as $t | $s.patch[] as $p | $t | split("\n" + $p) | .[1:][] | split("\n")[0] // "" else .[1] end]
+         | jp_join("\n") | jp_lines($s.split)
+         # Without the words a redactPaths !glob matches.
+         | if $x.unless == [] then . else split("\n") | [.[] | . as $w | if [$x.unless[] as $u | $w | jp_test($u) | if . then 1 else empty end] != [] then empty else . end] | jp_join("\n") end) as $words
+      | first(
+          # Each command is its own command line: a quote one leaves open never hides the next one's command.
+          ($x.commands[] | . as $p | if [$kv[] | if .[0] == "command" then .[1] else empty end | if jp_holds($p.needs) and jp_test($p.re) then 1 else empty end] != []
+             then $p.id else empty end),
+          ($x.paths[] | . as $p | if ($words | jp_holds($p.needs)) and ($words | jp_test($p.re)) then $p.id else empty end),
+          null)
+    end;
+# [event, records]: the event with each tool call the project hides blanked (redact.blank_calls for one event), and what
+# that replaced. An event passes through untouched unless the project sets redactPaths or redactCommands. The call's own event (tool_input, tool_output), a model's tool_calls, and the tool_results with a blanked
+# call's id. A value that is already the placeholder is not counted.
+def jp_blank($x; $r):
+  def ph: "[REDACTED:" + . + "]";
+  def hit($hits): if type == "string" then $hits[.] else null end;
+  if $x.paths == [] and $x.commands == [] then [., []] else
+  . as $e
+  | (if .tool_input != null then .tool_input | jp_call($e.tool_name; $x; $r) else null end) as $own
+  | (if (.tool_calls | type) == "array" then .tool_calls else [] end) as $calls
+  | (if (.tool_results | type) == "array" then .tool_results else [] end) as $results
+  | [$calls[] | if type == "object" then . as $c | (.name // .tool_name) as $n
+       | first((("arguments", "input", "tool_input") as $k | $c[$k] | values | jp_call($n; $x; $r) | values), null) else null end] as $rules
+  | if $own == null and [$rules[] | values] == [] then [., []] else
+      # call id -> rule, the first call with an id winning.
+      ([(range(0; $calls | length) as $i | $rules[$i] | values | . as $rule | $calls[$i] | (.id // .tool_call_id) | if type == "string" and . != "" then {(.): $rule} else empty end),
+        (if $own and ($e.tool_call_id | type) == "string" and $e.tool_call_id != "" then {($e.tool_call_id): $own} else empty end)]
+       | reverse | add // {}) as $hits
+      | (($e.tool_call_id | hit($hits)) // $own) as $mine
+      | [., []]
+      | if $mine and $e.tool_input != null and $e.tool_input != ($mine | ph) then [(.[0] | .tool_input = ($mine | ph)), .[1] + [["tool_input", $mine]]] else . end
+      | if $mine and ($e.tool_output // "") != "" and $e.tool_output != ($mine | ph) then [(.[0] | .tool_output = ($mine | ph)), .[1] + [["tool_output", $mine]]] else . end
+      | reduce range(0; $calls | length) as $i (.;
+          $calls[$i] as $c
+          | (if ($c | type) == "object" then (($c.id // $c.tool_call_id) | hit($hits)) // $rules[$i] else null end) as $rule
+          | if $rule then reduce ("arguments", "input", "tool_input") as $k (.;
+              if $c[$k] != null and $c[$k] != ($rule | ph) then [(.[0] | .tool_calls[$i][$k] = ($rule | ph)), .[1] + [["tool_calls", $rule]]] else . end)
+            else . end)
+      | reduce range(0; $results | length) as $i (.;
+          $results[$i] as $c
+          | (if ($c | type) == "object" then ($c.id // $c.tool_call_id) | hit($hits) else null end) as $rule
+          | if $rule and $c.response != null and $c.response != ($rule | ph) then [(.[0] | .tool_results[$i].response = ($rule | ph)), .[1] + [["tool_results", $rule]]] else . end)
+      | [.[0], (.[1] | group_by(.) | map({rule: .[0][1], field: .[0][0], count: length}))]
+    end end;
 # [value, placeholder, rule] for each secret-named env value (and each line of one that spans lines) the text holds.
 def jp_env($text; $r):
   [$ENV | keys_unsorted[] as $k | $ENV[$k] | (., (if contains("\n") then split("\n")[] | rtrimstr("\r") else empty end))
@@ -197,11 +270,14 @@ def jp_redact($c; $capture; finish):
   | jp_env_found($r) as $found
   | delpaths([["env_found"]]) + (if $found == [] then {} else {env_found: $found} end)
   | . as $raw
-  # Metadata capture drops the text: only the strip fields and the tool calls' ids and names stay.
+  # Metadata capture drops the text: only the strip fields and the tool calls' ids and names stay. Otherwise a tool call
+  # the project hides is blanked, and what that replaced joins the records the scrub makes (in redact-replace.jq for a frame).
   | try (jp_rules($c; $r) as $x
-         | if $capture == "metadata" then jp_pick($r.fields.strip) + jp_calls(true) + {prompt: "", output: ""} else . end
-         | jp_scrub($x; $r; finish)
-         | if type == "array" then .[0].error = ($raw | jp_pick($r.fields.bare) + jp_calls(false) + {redaction_error: true}) else . end)
+         | (if $capture == "metadata" then [jp_pick($r.fields.strip) + jp_calls(true) + {prompt: "", output: ""}, []] else jp_blank($x; $r) end) as $b
+         | $b[0] | jp_scrub($x; $r; finish)
+         | if type == "array" then .[0].error = ($raw | jp_pick($r.fields.bare) + jp_calls(false) + {redaction_error: true}) | .[0].blanked = $b[1]
+           elif $b[1] == [] then .
+           else .redactions = ($b[1] + (.redactions // []) | sort_by(.field, .rule)) end)
     catch ($raw | jp_pick($r.fields.bare) + jp_calls(false) + {redaction_error: true});
 
 def jp_prepare($cfg; $mode; $root; $model; finish):

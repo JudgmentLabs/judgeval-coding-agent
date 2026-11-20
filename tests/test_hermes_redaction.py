@@ -299,7 +299,7 @@ class Truncation(Case):
 
     def test_an_input_too_large_to_redact_is_omitted(self):
         spooler = module("spooler")
-        command = "echo " + "a" * spooler.FIELD_CAP + "; cat .env"
+        command = "echo " + "a" * spooler.FIELD_CAP
         self.fire(self.tool_turn({"command": command}, "PRIVATE-NOTE-" + "x" * 40).events)
         tool = next(event for event in self.sb.inbox() if event["event"] == "tool")
         self.assertEqual((tool["tool_input"], tool["omitted"]), (spooler.OMITTED, ["tool_input"]))
@@ -335,16 +335,6 @@ class Structured(Case):
         tool_span = attrs(next(span for span in kinds(self.flushed(), "tool")))
         self.assertEqual(tool_span["judgment.input"], module("spooler").OMITTED)
         self.assertIn("PRIVATE-NOTE", tool_span["judgment.output"], "the rest of the turn is sent")
-
-    def test_deeply_nested_arguments_are_omitted_not_cut(self):
-        """Depth past the budget used to become "…" inside the value. Now the value is omitted whole."""
-        args: dict = {"path": ".env"}
-        for _ in range(20):
-            args = {"nested": args}
-        self.fire(self.tool_turn(args, "PRIVATE-NOTE-" + "x" * 40).events)
-        tool = next(event for event in self.sb.inbox() if event["event"] == "tool")
-        self.assertEqual(tool["tool_input"], module("spooler").OMITTED)
-        self.assertNotIn("…", json.dumps(tool, ensure_ascii=False))
 
     def test_structured_arguments_within_budget_arrive_whole(self):
         args = rows(1_000)

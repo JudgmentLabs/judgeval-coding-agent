@@ -56,7 +56,7 @@ The Pi plugin requires Pi >= 0.80.5, installed with `npm install -g @earendil-wo
    mkdir -p .judgment && printf '{"enabled": true}\n' > .judgment/tracing.json
    ```
 
-   [Turn tracing on for a project](#turn-tracing-on-for-a-project) lists the other settings.
+   Before the first traced session, add the project's secret files and commands to that file. [List what to hide](#list-what-to-hide) has the steps, for you or for the coding agent that sets tracing up. [Turn tracing on for a project](#turn-tracing-on-for-a-project) lists the other settings.
 
 4. Start a new agent session in that project and send a prompt. The trace appears in the project's **Traces** view a few seconds after the turn ends.
 
@@ -78,22 +78,49 @@ Tracing is on in a directory when `.judgment/tracing.json` is in it or in a pare
 | `capture` | `sanitized`, `full`, `metadata` | `sanitized`, the default, sends prompt, response, and tool text with secrets redacted. `full` sends the text raw. `metadata` sends only names, models, token counts, cost, timing, and ids. [What gets sent](#what-gets-sent) has the details. |
 | `sessionDefault` | `on`, `off` | `off` leaves each new session untraced until you turn that session on. |
 | `redactPatterns` | regexes | More text to redact. A match becomes `[REDACTED:custom]`. When the regex starts with a group named `p`, as in `(?<p>ticket=)[0-9]+`, the text `p` matched stays before the placeholder. |
+| `redactPaths` | globs | Files whose tool calls are hidden, such as `".env*"` or `"secrets/*"`. A call that names one keeps its tool name and loses its input and its result, each replaced by `[REDACTED:custom_path]`. `*` matches any characters, `/` included. A glob after `!`, such as `"!.env.example"`, excepts the files it matches. |
+| `redactCommands` | regexes | Commands whose tool calls are hidden the same way, as `[REDACTED:custom_command]`, such as `"aws[^\\S\\n]+configure[^\\S\\n]+get"`. A regex matches where a command starts. |
 | `redactNames` | names | More secret names, such as `"pin"`. A value after one is redacted as a value after `password` is. Write lowercase parts joined by `_`: `vault_pin` also matches `VAULT_PIN`, `vault-pin`, and `vaultPin`. A built-in name after `!`, such as `"!token"`, is no longer a secret name. |
 | `redactAllow` | strings | Text that is never redacted, such as `"changeme"`. A find whose redacted part is exactly one of these stays. |
 | `redactDisable` | rule ids | Built-in rules to turn off, such as `"secret_assignment"` or `"github_token"`. |
 
-Each `redact*` field is a list of strings. A setting that cannot work makes every event in the project lose its text: a `redactPatterns` or `redactNames` value that is not a list of strings, a regex that does not compile, a name that is not letters and digits joined by `_`, a `!name` or an id that no built-in rule has. In `redactAllow` and `redactDisable`, anything that is not a string is ignored. A turn already recorded also loses its text when the sender can no longer read the file, because it was deleted or cut off: the project's rules are then unknown. `judgment-trace status` says when a setting cannot work.
+Each `redact*` field is a list of strings. A setting that cannot work makes every event in the project lose its text: a `redactPatterns`, `redactPaths`, `redactCommands`, or `redactNames` value that is not a list of strings, a regex that does not compile, a name that is not letters and digits joined by `_`, a `!name` or an id that no built-in rule has. In `redactAllow` and `redactDisable`, anything that is not a string is ignored. A turn already recorded also loses its text when the sender can no longer read the file, because it was deleted or cut off: the project's rules are then unknown. `judgment-trace status` says when a setting cannot work.
 
-A regex runs in both Oniguruma (the hook's jq) and Python's `re` (the sender), so write one both accept: a named group is `(?<p>...)`, not `(?P<p>...)`, and a POSIX class such as `[[:alpha:]]` is refused. A regex runs over all of an event's text joined into one, each string on its own line, so `^` and `$` match only at the start and end of that whole text, not of a field or a line. Leave them out. This file adds one name, keeps one placeholder, and turns off one rule:
+A regex runs in both Oniguruma (the hook's jq) and Python's `re` (the sender), so write one both accept: a named group is `(?<p>...)`, not `(?P<p>...)`, and a POSIX class such as `[[:alpha:]]` is refused. A regex runs over all of an event's text joined into one, each string on its own line, so `^` and `$` match only at the start and end of that whole text, not of a field or a line. Leave them out. This file hides every call that touches a `.env` file, adds one name, keeps one placeholder, and turns off one rule:
 
 ```json
 {
   "enabled": true,
+  "redactPaths": [".env*", "!.env.example"],
   "redactNames": ["pin"],
   "redactAllow": ["changeme"],
   "redactDisable": ["jwt"]
 }
 ```
+
+### List what to hide
+
+Judgment redacts known token formats, values after secret names, and secret environment values without any setup. It doesn't know which of a project's files or commands hold secrets. So a secret with no known format and no secret name before it, such as `SESSION_COOKIE=...` in a `.env` file, is sent unless the project says where it lives.
+
+List those places when you create `.judgment/tracing.json`. A coding agent that sets tracing up does these steps too, and shows the person the list before it writes the file:
+
+1. Find the files that hold secrets: `.env` files, key and certificate files, credential files, and local config with passwords in it. The project's `.gitignore` names most of them. Add a glob for each to `redactPaths`.
+2. Find the commands the project runs that print a secret, such as a secrets manager CLI or a cloud CLI that prints credentials. Add a regex for each to `redactCommands`.
+3. Find the names the project gives its secrets that the built-in names miss, such as `session_cookie`. Add them to `redactNames`.
+4. Run `judgment-trace status`. It says when a setting cannot work.
+
+This file hides every call that reads a `.env` file, a `.pem` file, or anything under `secrets/`, and every call that prints a credential with the AWS or 1Password CLI:
+
+```json
+{
+  "enabled": true,
+  "redactPaths": [".env*", "!.env.example", "*.pem", "secrets/*"],
+  "redactCommands": ["aws[^\\S\\n]+configure[^\\S\\n]+get", "op[^\\S\\n]+read"],
+  "redactNames": ["session_cookie"]
+}
+```
+
+A hidden call keeps its tool name in the trace. Its input and its result become `[REDACTED:custom_path]` or `[REDACTED:custom_command]`, and the rest of the turn is sent.
 
 `sessionDefault` set to `off` is how a long traced session and a side chat share one project. The side chat stays quiet until you turn it on.
 
@@ -156,6 +183,7 @@ With `capture` set to `sanitized`, the default, secrets are removed from the tex
 
 - **Known formats** become `[REDACTED:<rule>]`: OpenAI and Anthropic `sk-` keys, AWS access key ids, GitHub tokens, Slack tokens and webhooks, Google API keys, Stripe keys, JWTs, `Bearer` and `Authorization` header values, private key blocks, and passwords in URLs. A URL password that is a whole placeholder, such as `${DB_PASS}`, `****`, or `password`, stays.
 - **A value after a secret name** becomes `[REDACTED:secret_assignment]` in text. The names are `password`, `passwd`, `pwd`, `passphrase`, `secret`, `secret_key`, `client_secret`, `token`, `api_key`, `access_key`, `private_key`, `credential`, and `credentials`, each part lowercase, UPPERCASE, or Capitalized, with `_`, `-`, `.`, or nothing between the parts (`API_KEY`, `apiKey`). A name also counts as the end of a longer one (`db_password`, `smtpPassword`). The name is followed by an optional closing quote, backtick, or Markdown `**`, then `:` or `=`, then the value, which may be quoted with `"`, `'`, or a backtick. So `**Password:** hunter2` loses its value too. Only the value goes: `password: "hunter2"` becomes `password: "[REDACTED:secret_assignment]"`. A quoted value runs to its closing quote, a bare one to the next blank. A value that is a type or a constant, such as `str`, `Optional[str`, `None`, `null`, or `true`, stays: `password: str` and `token = None` are not changed. In a tool's structured input or output, a value under a key that ends in one of these names becomes `[REDACTED:secret_field]`, as in `{"DB Password": ...}` or `{"spring:datasource:password": ...}`. A number, list, or object under such a key is replaced whole. `key`, `auth`, and `authorization` are not names: a value after them goes only when it has a known format. One exception: `KEY` as an uppercase name or the last part of one, followed by `=` with no blank, as in a `.env` file or a shell (`ENCRYPTION_KEY=...`, `export JWT_SIGNING_KEY=...`), loses its value as `[REDACTED:key_assignment]`.
+- **A tool call the project hides** keeps its tool name and loses its input and its result: a call that names a file in `redactPaths`, or runs a command in `redactCommands` ([Turn tracing on for a project](#turn-tracing-on-for-a-project)). The rest of the turn is sent, and the call stays hidden where a later request replays it. Nothing is hidden this way unless the project lists it.
 - **Your environment's secrets**: the value of every environment variable whose name holds `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `CREDENTIAL`, `PRIVATE`, or `AUTH`, and your Judgment API key, becomes `[REDACTED:env:<NAME>]` wherever it appears: the whole value, and each line of a value that spans lines, whatever its shape. Names that end in a location or setting suffix such as `_PATH`, `_FILE`, `_DIR`, `_SOCK`, `_URL`, `_HOST`, or `_ID` are left out. Values are replaced in text and keys, never inside a JSON number. The hook redacts with the environment of the agent it runs in, and the sender may have been started by another agent. So where the hook replaced an environment value, the sender keeps the hook's text over the transcript's. The hook also records the names of the variables it could have replaced, and one fingerprint of their values. When the sender lacks one of them, or holds a different value, it sends the turn without its text, as when a rule fails.
 
 Each redaction is recorded on the turn's root span: which rule, in which field, and how many times. The secret itself, and any hash of it, is never recorded. [Trace format](docs/trace-format.md#redaction) lists the attributes. Add, trim, or turn off rules in `.judgment/tracing.json` ([Turn tracing on for a project](#turn-tracing-on-for-a-project)). If a rule fails, or an event needs more redaction than the limits allow, the event's text, labels, and tool names are dropped instead of sent. The limits are more than 128 different secrets in one event at the hook, more than 4,096 in the text the sender reads, a find longer than 8 KB (one can fail from 8 KB up, depending on where it starts), and JSON nested in a string more than four levels deep.
@@ -168,11 +196,12 @@ Not caught:
 
 - A quoted value is redacted up to its closing quote, a newline, a comma, or a backslash. A bare value is redacted up to a blank, a quote, a comma, `;`, `)`, `]`, `}`, or a backslash. The rest of a value that holds one of these stays: the second line of a multiline password, or the part after a backslash. A value that starts with one of these characters, or a bare value that starts with `=`, `[`, `{`, `(`, or `:`, is not redacted at all. A default after a type annotation is not read either: in `password: str = "hunter2"` the value is the type `str`, which stays, and so does the default. (`value-stops`)
 - A value given without `:` or `=`, such as `--password hunter2`, is not redacted. (`space-separated`)
-- A secret with neither a known format nor a secret name before it is sent: what `aws configure get aws_secret_access_key` or `security find-generic-password -w` prints, or `SESSION_COOKIE=...` in a `.env` file. Which file a tool read or which command printed a text does not matter. An environment variable's value is still redacted when its name looks secret ([Your environment's secrets](#secrets-are-redacted-by-default)). (`unnamed-value`)
+- A secret with neither a known format nor a secret name before it is sent: what `aws configure get aws_secret_access_key` or `security find-generic-password -w` prints, or `SESSION_COOKIE=...` in a `.env` file. No file or command is treated as secret unless the project names it: add the file to `redactPaths`, the command to `redactCommands`, or the name to `redactNames`. An environment variable's value is still redacted when its name looks secret ([Your environment's secrets](#secrets-are-redacted-by-default)). (`unnamed-value`)
+- `redactPaths` and `redactCommands` read a tool call's input, not the shell. A command that only mentions a listed file, such as `echo .env`, hides its call too, and a command behind a wrapper the command prefix does not read, such as `timeout 5 aws configure get x`, is not seen. A file attached to a prompt with `@` is not a tool call, so its contents are redacted by format and name only.
 - A value after `key`, `auth`, or `authorization`, in text or as a structured member, goes only when it has a known format, or for `KEY`, when it is written as in a `.env` file (`key_assignment`). `key = ...`, `"key": ...`, `--key=...`, and `AUTH=...` stay. `"Authorization": "Basic ..."` in structured input stays, as does an `Authorization: Basic` or `Bearer` value with no digit, `+`, `=`, or `/` in it, and the password in `curl -u user:pass`. (`key-auth-unformatted`)
 - A secret shorter than 8 characters in an environment variable is not replaced, because replacing every `2024` in all text would destroy ordinary text. Keep short secrets out of the environment, or add a `redactPatterns` rule.
 - The control characters U+001C to U+001F count as blanks in the sender (Python) and not in the hook (jq). A value that holds one ends there in text the sender reads from a transcript.
-- A `redactPatterns` entry runs as written, so one with catastrophic backtracking, such as `(a+)+$`, can stall the sender on matching text and hold back the turns after it. The built-in rules do linear work (`tests/test_latency.py`).
+- A `redactPatterns`, `redactCommands`, or `redactPaths` entry runs as written, so one with catastrophic backtracking, such as `(a+)+$`, can stall the sender on matching text and hold back the turns after it. The built-in rules do linear work (`tests/test_latency.py`).
 
 Removed although not secret:
 

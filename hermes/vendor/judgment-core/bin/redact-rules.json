@@ -2,7 +2,8 @@
   "_comment": [
     "Secret redaction rules, shared by the hook (core/bin/prepare.jq) and the sender (judgment_core/redact.py). This file is the source.",
     "scripts/gen_redact.py derives core/bin/redact-compiled.json (what jq loads: every regex composed) from it.",
-    "Redaction is by format, plus secretNames (a value after one of these names). Nothing here parses code, shell, or patches.",
+    "Redaction is by format, plus secretNames (a value after one of these names). A project can also hide whole tool calls",
+    "(sensitive: redactPaths, redactCommands). Nothing here parses code, shell, or patches.",
     "Regexes use what Oniguruma and Python re agree on: (?<name>...) for a named group (p, when it is the first group: the text",
     "it holds is kept, when it starts the match);",
     "An identifier boundary also holds right after an escape a JSON string or a terminal writes before a word: \\n \\r \\t \\b \\f,",
@@ -44,10 +45,11 @@
       "The redaction settings a project's tracing.json may hold, and what a malformed one does. Each is a list of strings.",
       "rule: it adds rules, so a value that is not a list of strings fails the rule set closed (every event loses its text).",
       "trim: it only takes rules or finds away, so anything that is not a nonempty string in a list is skipped.",
-      "Both layers, and every adapter that forwards a project's settings, read the keys from here. Any other key is ignored,",
-      "such as redactPaths and redactCommands, which older versions read."
+      "Both layers, and every adapter that forwards a project's settings, read the keys from here."
     ],
     "redactPatterns": "rule",
+    "redactPaths": "rule",
+    "redactCommands": "rule",
     "redactNames": "rule",
     "redactAllow": "trim",
     "redactDisable": "trim"
@@ -276,8 +278,98 @@
     "name_re": "(?<![^\\n])(?:JUDGMENT_API_KEY(?![^\\n])|(?=[^\\n]*?(?:token|TOKEN|Token|secret|SECRET|Secret|password|PASSWORD|Password|passwd|PASSWD|Passwd|credential|CREDENTIAL|Credential|private|PRIVATE|Private|auth(?!or(?!iz))|AUTH(?!OR(?!IZ))|Auth(?!or(?!iz))|(?<![Mm][Oo][Nn])(?<![Tt][Uu][Rr])(?:key|KEY|Key)(?![Bb][Oo][Aa][Rr][Dd]|[Mm][Aa][Pp]|[Cc][Hh][Aa][Ii][Nn])))(?![^\\n]*(?:_PATH|_path|_FILE|_file|_DIR|_dir|_SOCK|_sock|_SOCKET|_socket|_HOST|_host|_PORT|_port|_URL|_url|_URI|_uri|_ID|_id|_MODE|_mode|_TYPE|_type|_NAME|_name|_USER|_user|_USERNAME|_username|_ENABLED|_enabled|_DISABLED|_disabled|_TIMEOUT|_timeout|_TOKENS|_tokens|_LIMIT|_limit|_REGION|_region)(?![^\\n]))[^\\n]+)",
     "min_length": 8
   },
+  "sensitive": {
+    "_comment": [
+      "Hiding a whole tool call is the project's decision, never a built-in guess: a call that names a file redactPaths matches,",
+      "or runs a command redactCommands matches, is blanked. Its arguments and its result become [REDACTED:custom_path] or",
+      "[REDACTED:custom_command] (commands are checked first). The rest of its turn is redacted as any other text.",
+      "keys: the tool input members (at any depth) whose strings are read: paths, commands, and patches (Codex's apply_patch",
+      "arrives as {\"input\": patch}). A string tool input is a command. tools: more path keys, by tool name.",
+      "Paths: every string under a path or command key is split into tokens at the split characters. Of a patch, only the",
+      "lines that name a file are read (patch: the prefixes such a line starts with), so a patch whose body mentions a file is kept.",
+      "A token matches a glob from the start of the token or after a / or : in it, to its end. In a command a token is a mention:",
+      "the shell is not parsed, so `cat data/x.csv` and `echo data/x.csv` both count.",
+      "glob: how a redactPaths glob becomes a regex, one character at a time. * is any run of characters, / included.",
+      "Commands: each command string is matched on its own. A command counts at the start of the string or after ; & | ( { `",
+      "or a newline, behind an optional sudo (command.prefix). One with --help, -h, or --version before the next ; & | ( ) { `",
+      "or newline does not count (command.unless): the help check stops where a command can start, so it is linear."
+    ],
+    "keys": {
+      "file_path": "path",
+      "filePath": "path",
+      "path": "path",
+      "paths": "path",
+      "file": "path",
+      "files": "path",
+      "filename": "path",
+      "notebook_path": "path",
+      "target_file": "path",
+      "target_notebook": "path",
+      "absolute_path": "path",
+      "relative_path": "path",
+      "source": "path",
+      "destination": "path",
+      "command": "command",
+      "cmd": "command",
+      "commands": "command",
+      "script": "command",
+      "input": "patch",
+      "patch": "patch",
+      "diff": "patch"
+    },
+    "tools": {
+      "grep": {"glob": "path"},
+      "glob": {"pattern": "path"},
+      "find": {"pattern": "path"}
+    },
+    "split": [
+      " ",
+      "\t",
+      "\n",
+      "\r",
+      "\f",
+      "\u000b",
+      "\"",
+      "'",
+      "`",
+      ";",
+      "|",
+      "&",
+      "<",
+      ">",
+      "(",
+      ")",
+      "="
+    ],
+    "patch": [
+      "*** ",
+      "+++ ",
+      "--- ",
+      "diff --git "
+    ],
+    "glob": {
+      "*": "[^\\n]*",
+      "?": "[^\\n]",
+      ".": "\\.",
+      "\\": "\\\\",
+      "+": "\\+",
+      "^": "\\^",
+      "$": "\\$",
+      "(": "\\(",
+      ")": "\\)",
+      "[": "\\[",
+      "]": "\\]",
+      "{": "\\{",
+      "}": "\\}",
+      "|": "\\|"
+    },
+    "command": {
+      "prefix": "(?:(?<![\\s\\S])|(?<=[;&|\\n(`{]))[^\\S\\n]*(?:(?:then|do|else|time|exec|command|nohup|!)[^\\S\\n]+)?(?:[A-Za-z_][A-Za-z0-9_]*=[^\\s;&|`(){\"']*[^\\S\\n]+)*(?:sudo(?:[^\\S\\n]+-[A-Za-z]+(?:[^\\S\\n]+[^\\s;&|`)-][^\\s;&|`)]*)?)*[^\\S\\n]+)?(?:(?:/(?:usr/)?(?:local/)?bin/)?(?:ba|z|da|k)?sh[^\\S\\n]+-[A-Za-z]*c[^\\S\\n]+[\"']?)?(?:[^\\s;&|`(){\"']*/)?",
+      "unless": "(?![^;&|\\n)`({]*[^\\S\\n](?:--help|-h|--version)(?![^\\s;&|)`\"']))"
+    }
+  },
   "retiredIds": {
-    "_comment": ["Rule ids older versions had. redactDisable may still name them; they disable nothing."],
+    "_comment": ["Rule ids older versions had, for the files and commands they blanked a turn over. redactDisable may still name them; they disable nothing."],
     "ids": ["dotenv", "ssh_private_key", "key_file", "credentials_file", "secret_file", "auth_file", "proc_environ", "env_dump", "printenv", "secret_cli"]
   },
   "fields": {

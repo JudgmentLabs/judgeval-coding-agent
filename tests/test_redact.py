@@ -308,14 +308,24 @@ class ProjectRuleTests(unittest.TestCase):
         self.assertEqual(out[0]["tool_output"], "password = hunter22 " + token)
         self.assertEqual(out[1]["tool_input"], {"password": "[REDACTED:secret_field]"})
 
-    def test_settings_older_versions_read_change_nothing(self):
-        """redactPaths and redactCommands are ignored, malformed or not, and redactDisable may name a retired rule id."""
-        cfg = {"redactPaths": {"a": 1}, "redactCommands": ["(unclosed", 5], "redactDisable": ["dotenv", "env_dump"]}
-        self.assertEqual(redact.ruleset(cfg).error, "")
-        token = SECRETS["github_token"]["core"]
-        out = self.both([tool_event("gh " + token, tool_input={"command": "cat .env"})], cfg)
-        self.assertEqual(out[0]["tool_output"], "gh [REDACTED:github_token]")
-        self.assertEqual(out[0]["tool_input"], {"command": "cat .env"})
+    def test_redact_paths_and_commands_hide_the_call(self):
+        """Only what the project names is hidden: the call's arguments and result. A !glob excepts a file; nothing is
+        built in, and an id older versions had for a built-in file or command rule may still be in redactDisable."""
+        cfg = {"redactPaths": ["data/*", ".env*", "!.env.test"], "redactCommands": ["vaultctl[^\\S\\n]+dump"], "redactDisable": ["dotenv", "env_dump"]}
+        events = [tool_event("rows", tool_input={"file_path": "data/eu/customers.csv"}), tool_event("dump", tool_input={"command": "sudo vaultctl dump"}),
+                  tool_event("A=1", tool_input={"file_path": ".env.test"}), tool_event("B=2", tool_input={"command": "cat app/.env.local"}),
+                  tool_event("usage", tool_input={"command": "vaultctl dump --help"})]
+        blank = lambda rule: (f"[REDACTED:{rule}]", f"[REDACTED:{rule}]")  # noqa: E731
+        out = self.both(events, cfg)
+        self.assertEqual([(event["tool_input"], event["tool_output"]) for event in out],
+                         [blank("custom_path"), blank("custom_command"), ({"file_path": ".env.test"}, "A=1"), blank("custom_path"), ({"command": "vaultctl dump --help"}, "usage")])
+        self.assertEqual(out[0]["redactions"], [{"rule": "custom_path", "field": "tool_input", "count": 1}, {"rule": "custom_path", "field": "tool_output", "count": 1}])
+        # Without the settings every one of these calls is sent, redacted by format and name like any other text.
+        self.assertEqual([(event["tool_input"], event["tool_output"]) for event in self.both(events, {})], [(event["tool_input"], event["tool_output"]) for event in events])
+        # A setting that cannot work fails closed, as every other rule setting does.
+        for bad in ({"redactPaths": {"a": 1}}, {"redactCommands": ["(unclosed"]}):
+            self.assertTrue(redact.ruleset(bad).error, bad)
+            self.assertTrue(self.both([tool_event("x")], bad)[0]["redaction_error"])
 
     def test_bad_entries_fail_closed(self):
         secret = SECRETS["github_token"]["core"]
@@ -339,7 +349,7 @@ class ProjectRuleTests(unittest.TestCase):
         import tempfile
         from pathlib import Path
 
-        settings = {"redactPatterns": ["A"], "redactNames": ["d"], "redactAllow": ["e"], "redactDisable": ["github_token"]}
+        settings = {"redactPatterns": ["A"], "redactPaths": ["b/*"], "redactCommands": ["c"], "redactNames": ["d"], "redactAllow": ["e"], "redactDisable": ["github_token"]}
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "tracing.json"
             path.write_text(json.dumps({**settings, "redactAllow": ["e", 4, ""]}))
@@ -547,6 +557,67 @@ class EscapeBoundaryTests(unittest.TestCase):
         texts = ["C:\\new\\tokenizer.py", "a\\nmax_tokens=5"]
         py = outputs(self, texts)
         self.assertEqual([out["tool_output"] for out in py], texts)
+
+
+class HiddenCallTests(unittest.TestCase):
+    """A tool call that names a file in the project's redactPaths is blanked wherever the turn holds it, and only that call."""
+
+    CFG = {"redactPaths": [".env*", "secrets.yaml"]}
+    BLANK = "[REDACTED:custom_path]"
+
+    def test_a_patch_counts_by_the_files_it_names(self):
+        head = "*** Begin Patch\n*** Update File: "
+        events = [tool_event("ok", tool_name="apply_patch", tool_input={"input": head + "config/.env.local\n+A=1\n"}),
+                  tool_event("ok", tool_name="apply_patch", tool_input={"input": head + "src/a.ts\n+// values come from .env and secrets.yaml\n"}),
+                  tool_event("ok", tool_input={"patch": "--- a/x.yaml\n+++ b/secrets.yaml\n@@\n+a: 1\n"}),
+                  tool_event("ok", tool_name="Grep", tool_input={"pattern": "TODO", "glob": ".env*"}),
+                  tool_event("ok", tool_name="Grep", tool_input={"pattern": "secrets.yaml", "path": "src"})]
+        py, _ = assert_parity(self, events, self.CFG)
+        self.assertEqual([event["tool_input"] == self.BLANK for event in py], [True, False, True, True, False])
+
+    def test_only_the_call_is_blanked_and_it_is_recorded(self):
+        secret = "Qx7Lm2Tz9Rk4" + "Wp8Hn3Vb6Yc1"
+        py, _ = assert_parity(self, [
+            {"v": 1, "harness": "pi", "event": "model", "session_id": "s", "turn_id": "t", "output": "reading", "tool_calls": [
+                {"id": "a", "name": "read", "arguments": {"path": ".env"}}, {"id": "b", "name": "bash", "arguments": {"command": "ls"}}],
+             "tool_results": [{"id": "a", "response": "COOKIE=" + secret}, {"id": "b", "response": "README.md"}]},
+            tool_event("COOKIE=" + secret, tool_input={"command": "cat .env"}, prompt="why does the cookie fail"),
+            {"v": 1, "harness": "pi", "event": "tool", "session_id": "s", "turn_id": "t", "tool_name": "read", "tool_call_id": "c", "tool_input": {"path": "secrets.yaml"}},
+        ], self.CFG)
+        self.assertEqual(py[0]["tool_calls"], [{"id": "a", "name": "read", "arguments": self.BLANK}, {"id": "b", "name": "bash", "arguments": {"command": "ls"}}])
+        self.assertEqual(py[0]["tool_results"], [{"id": "a", "response": self.BLANK}, {"id": "b", "response": "README.md"}])
+        self.assertEqual(py[0]["redactions"], [{"rule": "custom_path", "field": "tool_calls", "count": 1}, {"rule": "custom_path", "field": "tool_results", "count": 1}])
+        self.assertEqual((py[0]["output"], py[1]["prompt"], py[1]["tool_name"]), ("reading", "why does the cookie fail", "Bash"))
+        self.assertEqual(py[2]["tool_input"], self.BLANK)
+        self.assertNotIn("tool_output", py[2])
+        self.assertNotIn(secret, json.dumps(py))
+
+    def test_the_sender_blanks_a_call_wherever_the_turn_holds_it(self):
+        """What the hook never saw: a transcript's output over the hook's blanked event, and the messages that replay the call."""
+        secret = "Qx7Lm2Tz9Rk4" + "Wp8Hn3Vb6Yc1"
+        call = {"type": "tool_call", "id": "t1", "name": "Read", "arguments": {"file_path": "/app/.env"}}
+        other = {"type": "tool_call", "id": "t2", "name": "Bash", "arguments": {"command": "ls"}}
+        messages = [{"role": "user", "parts": [{"type": "text", "content": "fix the cookie"}]}, {"role": "assistant", "parts": [call, other]},
+                    {"role": "tool", "parts": [{"type": "tool_call_response", "id": "t1", "response": "COOKIE=" + secret}]},
+                    {"role": "tool", "parts": [{"type": "tool_call_response", "id": "t2", "response": "README.md"}]}]
+        events = [
+            # The hook blanked this event; enrichment then put the transcript's output back.
+            tool_event("COOKIE=" + secret, tool_call_id="t1", tool_name="Read", tool_input=self.BLANK),
+            # The two requests share the assistant message, as a transcript reader builds them.
+            {"event": "model", "input_messages": messages[:1], "output_message": messages[1]},
+            {"event": "model", "input_messages": messages, "output_message": {"role": "assistant", "parts": [{"type": "text", "content": "done"}]}},
+        ]
+        rs = redact.ruleset(self.CFG)
+        out = redact.redact_events(events, rs, [])
+        self.assertNotIn(secret, json.dumps(out))
+        self.assertEqual(out[0]["tool_output"], self.BLANK)
+        self.assertEqual([part.get("arguments") for part in out[1]["output_message"]["parts"]], [self.BLANK, {"command": "ls"}])
+        self.assertEqual([message["parts"][0].get("response") for message in out[2]["input_messages"][2:]], [self.BLANK, "README.md"])
+        self.assertEqual(out[2]["redactions"], [{"rule": "custom_path", "field": "input_messages", "count": 2}])
+        self.assertEqual(events[2]["input_messages"][2]["parts"][0]["response"], "COOKIE=" + secret)  # the input is not changed in place
+        self.assertEqual(redact.redact_events(out, rs, []), out)  # a second pass changes and counts nothing
+        # A project that names no file hides no call.
+        self.assertIn(secret, json.dumps(redact.redact_events(events[1:], redact.ruleset(), [])))
 
 
 class NestedParityTests(unittest.TestCase):
