@@ -10,8 +10,7 @@ llm inputs were not read from a transcript also keeps the messages it added to
 the thread (``<turn>.messages.json``), so later turns replay them whole.
 
 Each turn's events pass through plain stages: inbox -> fold -> turn file -> enrich (transcript
-text) -> capture policy (metadata strips text; sanitized redacts it, and blanks the whole turn
-when a tool call touched a sensitive file) -> spans -> post. The turn file and the index keep
+text) -> capture policy (metadata strips text; sanitized redacts it) -> spans -> post. The turn file and the index keep
 only what the policy allows, so no secret the rules know stays on disk after a send.
 """
 
@@ -238,11 +237,7 @@ def _inbox(state: Path) -> list[tuple[Path, dict, list]]:
 
 
 def ingest(state: Path, env: dict | None = None) -> dict[str, dict]:
-    """Fold new inbox events into turns. Return the turn index.
-
-    A turn is blanked here, as the event that makes it sensitive is stored: before any wait, history, or send. See
-    ``_store``.
-    """
+    """Fold new inbox events into turns. Return the turn index."""
     legacy = _Redactor(env)
     index = _load_json(state / "index.json")
     fold = Fold(_load_json(state / "fold.json"))
@@ -273,13 +268,13 @@ def ingest(state: Path, env: dict | None = None) -> dict[str, dict]:
         for number, item in enumerate(extra):
             item["_id"] = f"{event['_id']}.close{number}"
         for item in extra + ([routed] if routed else []):
-            _store(state, index, fold, item, legacy)
+            _store(state, index, fold, item)
         for key in ready:
             if key in index and not index[key].get("ready"):
                 index[key]["ready"] = True
                 index[key]["ready_at"] = int(time.time() * 1000)
         for child in set(fold.s["child"]) - children:
-            _adopt(state, index, fold, child, legacy)
+            _adopt(state, index, fold, child)
         consumed.append(path)
     retained = []
     for ident in done | set(folded):
@@ -300,19 +295,10 @@ def ingest(state: Path, env: dict | None = None) -> dict[str, dict]:
     return index
 
 
-def _store(state: Path, index: dict, fold: Fold, event: dict, redactor: "_Redactor") -> None:
-    """Append one event to its turn's file.
-
-    A turn's sensitivity is sticky and set as soon as one of its events shows it: the turn is marked blanked, its
-    messages dropped, and its file rewritten without text, before any wait or history. A later event of a blanked turn,
-    such as a child's that arrives after the turn was sent, is stored without text.
-    """
+def _store(state: Path, index: dict, fold: Fold, event: dict) -> None:
+    """Append one event to its turn's file."""
     key = turn_key(event)
     path = _turn_file(state, key)
-    item = index.get(key)
-    blank = None if (item and item.get("blanked")) or event.get("capture") in ("full", "metadata") else _sensitive(event, redactor)
-    if (item and item.get("blanked")) or blank:
-        event = redact.strip_text(event)
     line = json.dumps(event, ensure_ascii=False, default=str) + "\n"
     try:
         with open(path, "rb") as handle:
@@ -328,44 +314,19 @@ def _store(state: Path, index: dict, fold: Fold, event: dict, redactor: "_Redact
     index[key]["last"] = _stamp(event)
     # Event times come from the agent and can sit in the future (a tool's end). Grace counts from arrival here.
     index[key]["stored_at"] = int(time.time() * 1000)
-    if blank:
-        _blank(state, index, key, blank)
 
 
-def _sensitive(event: dict, redactor: "_Redactor") -> dict | None:
-    """Why this event blanks its turn: the hook's mark, or the sender's own check of its tool input."""
-    return redact.first_sensitive([event], redactor.rules([event]), redactor.secrets, redactor.home)
-
-
-def _blank(state: Path, index: dict, key: str, blank: dict) -> None:
-    """Mark a turn blanked, for good: no messages for later turns, and a turn file without text. Safe to repeat."""
-    item = index[key]
-    if not item.get("blanked"):
-        item["blanked"] = blank
-    _forget(state, key, item)
-    path = _turn_file(state, key)
-    events = _read_jsonl(path)
-    stripped = [redact.strip_text(event) for event in events]
-    if stripped != events:
-        _private_write(path, "".join(json.dumps(event, ensure_ascii=False, default=str) + "\n" for event in stripped))
-
-
-def _adopt(state: Path, index: dict, fold: Fold, child: str, redactor: "_Redactor") -> None:
+def _adopt(state: Path, index: dict, fold: Fold, child: str) -> None:
     """A Cursor child conversation stored before its Task bound it moves onto the parent turn."""
     parent_session, parent_turn = fold.s["child"][child][0], fold.s["child"][child][1]
     prefix = f"cursor\t{child}\t"
     moved = False
     for key in [key for key in index if key.startswith(prefix)]:
-        blank = index[key].get("blanked")
         for event in _read_jsonl(_turn_file(state, key)):
             event.update(session_id=parent_session, turn_id=parent_turn)
             event["agent_id"] = event.get("agent_id") or child
-            _store(state, index, fold, event, redactor)
+            _store(state, index, fold, event)
             moved = True
-        parent_key = f"cursor\t{parent_session}\t{parent_turn}"
-        if blank and parent_key in index:
-            # A child conversation blanked before its Task bound it blanks the parent it joins.
-            _blank(state, index, parent_key, blank)
         _turn_file(state, key).unlink(missing_ok=True)
         index.pop(key, None)
         fold.unsent_keys.discard(key)
@@ -432,10 +393,6 @@ class _Redactor:
         """The secret env names this process holds a value for."""
         return {name for name, _value in self.secrets}
 
-    @property
-    def home(self) -> str:
-        return str(self.env.get("HOME") or "")
-
     def rules(self, events: list[dict]) -> redact.Ruleset:
         root = next((str(event.get("project_root")) for event in events if event.get("project_root")), "")
         if root not in self._rules:
@@ -472,29 +429,20 @@ class _Redactor:
         return scrubbed["history"], records
 
 
-def _sanitize(state: Path, key: str, item: dict, events: list[dict], prepared: list[dict], redactor: _Redactor) -> tuple[list[dict], dict | None]:
-    """Find whether the enriched turn touched a sensitive file, then redact it. A blanked turn stays blanked.
-
-    Detection runs first, on the text as read: a placeholder can hide what made a path sensitive
-    (.env.<token> becomes .env.[REDACTED:...]). The turn file is rewritten when this changes what
-    it holds, so the redacted or blanked version is all that stays on disk.
+def _sanitize(state: Path, key: str, events: list[dict], prepared: list[dict], redactor: _Redactor) -> tuple[list[dict], bool]:
+    """Redact the enriched turn, and whether this process could check it: the environment the hook redacted with is the
+    one here. When it is not, every event loses its text, as when its rules fail. The turn file is rewritten when this
+    changes what it holds, so the redacted version is all that stays on disk.
     """
     rs = redactor.rules(events)
-    unchecked = not redactor.checked_environment(events)
-    blank = item.get("blanked") or ({"rule": "redaction_error", "trigger": ""} if unchecked else None) or redact.first_sensitive(prepared, rs, redactor.secrets, redactor.home)
-    if unchecked:
+    checked = redactor.checked_environment(events)
+    if not checked:
         prepared = [redact._unredactable(event) for event in prepared]
     prepared = [redact.redact_event(event, rs, redactor.secrets) for event in carry_records(events, prepared, redactor.names)]
     stored = [redact.redact_event(event, rs, redactor.secrets) for event in events]
-    if blank:
-        item["blanked"] = blank
-        _forget(state, key, item)
-        stored = [redact.strip_text(event) for event in stored]
-        # Spans are built from the whole turn and lose their text there. A free-form name would be a span name.
-        prepared = [redact.unblank(event) for event in prepared]
     if stored != events:
         _private_write(_turn_file(state, key), "".join(json.dumps(event, ensure_ascii=False, default=str) + "\n" for event in stored))
-    return prepared, blank
+    return prepared, checked
 
 
 def carry_records(stored: list[dict], prepared: list[dict], names: Iterable[str] | None = None) -> list[dict]:
@@ -596,29 +544,15 @@ def _requests(payload: dict) -> list[bytes]:
     return bodies
 
 
-def _after_blanked(index: dict, key: str) -> bool:
-    """Whether an earlier turn of the same session was blanked."""
-    harness, session, _turn = key.split("\t")
-    prefix = f"{harness}\t{session}\t"
-    start = int(index[key].get("start") or index[key].get("first") or 0)
-    return any(
-        other != key and other.startswith(prefix) and item.get("blanked") and int(item.get("start") or item.get("first") or 0) < start
-        for other, item in index.items()
-    )
-
-
 def _history(state: Path, index: dict, key: str, dest: str) -> list[list[dict]]:
     """The messages each earlier turn of the same session, sent to the same project, added to the thread. Oldest first."""
     harness, session, _turn = key.split("\t")
     prefix = f"{harness}\t{session}\t"
     start = int(index[key].get("start") or index[key].get("first") or 0)
-    # A turn with events not yet sent (ready again: a late child, a failed resend) is left out: those events can still
-    # blank it.
     earlier = sorted(
         (int(item.get("start") or 0), other)
         for other, item in index.items()
-        if other != key and other.startswith(prefix) and item.get("messages") and not item.get("blanked") and not item.get("ready")
-        and item.get("dest") == dest and int(item.get("start") or 0) < start
+        if other != key and other.startswith(prefix) and item.get("messages") and item.get("dest") == dest and int(item.get("start") or 0) < start
     )
     turns: list[list[dict]] = []
     for _start, other in earlier:
@@ -692,27 +626,21 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
             prepared = _enrich(events)
             # Transcript events carry no stamp. The hook's events say how the turn was recorded.
             capture = turn_capture(events)
-            blank = None
+            checked = True
             redaction = None
             rs = redactor.rules(events)
-            if capture == "sanitized" and _after_blanked(index, key):
-                # A transcript replays every earlier request whole, the blanked turn's included. Build this turn's inputs
-                # from its own events and the unblanked turns' kept messages instead.
-                prepared = [{name: value for name, value in event.items() if name != "input_messages"} for event in prepared]
             if capture == "metadata":
                 # Transcript enrichment has already run, so this is what gets sent and kept.
                 if not redactor.checked_environment(events):
                     prepared = [redact._unredactable(event) for event in prepared]
                 prepared = [redact.metadata_event(event, rs, redactor.secrets) for event in carry_records(events, prepared, redactor.names)]
             elif capture == "sanitized":
-                prepared, blank = _sanitize(state, key, item, events, prepared, redactor)
-            # A blanked or metadata turn is no later turn's context. Nor is one whose rules failed.
-            quiet = capture == "metadata" or bool(blank) or (capture != "full" and bool(rs.error))
+                prepared, checked = _sanitize(state, key, events, prepared, redactor)
+            # A metadata turn is no later turn's context. Nor is one whose rules failed or whose environment did not check.
+            quiet = capture == "metadata" or (capture != "full" and (bool(rs.error) or not checked))
             if quiet and item.get("messages"):
                 # Settled before any send, so a failed post cannot leave the old text as context.
                 _forget(state, key, item)
-                _private_write(state / "index.json", json.dumps(index))
-            elif blank:
                 _private_write(state / "index.json", json.dumps(index))
             started = turn_start(prepared)
             if started is not None:
@@ -727,7 +655,7 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
                 # Earlier turns may have been captured in full, or stored by an older build. What is replaced in them now
                 # is this request's redaction, so it joins the root's audit as field history.
                 history, extra = _redact_history(history, rs, redactor)
-                redaction = redact.turn_redaction(prepared, blank, extra)
+                redaction = redact.turn_redaction(prepared, extra)
             turn = build_request(prepared, update_id=update_id, history=[message for messages in history for message in messages], redaction=redaction)
         except (OSError, ValueError) as exc:
             # A ValueError's message can quote the transcript value it choked on.

@@ -540,48 +540,20 @@ _TEXT_KEYS = ("judgment.input", "judgment.output", "gen_ai.system_instructions",
 _PLACEHOLDER = "[REDACTED:"
 
 
-def _blank_calls(value: str) -> str:
-    """Tool calls with their arguments gone: only each call's id and name."""
-    try:
-        calls = json.loads(value)
-    except ValueError:
-        return "[]"
-    if not isinstance(calls, list):
-        return "[]"
-    return json.dumps([{"id": call.get("id", ""), "name": call.get("name", "tool")} for call in calls if isinstance(call, dict)])
-
-
 def _apply_redaction(spans: list[dict], root: dict, redaction: dict) -> None:
-    """Record the turn's redactions on its root. A blanked turn loses every span's text, and keeps every span.
-
-    Spans are built from the unblanked events and blanked here, so span count, ids, tokens, cost,
-    and timing match the same turn sent unblanked.
-    """
-    blanked = bool(redaction.get("blanked"))
+    """Record the turn's redactions on its root, and on each other span the placeholders its text holds."""
     for span in spans:
-        attrs = span["attributes"]
-        if blanked:
-            for attr in attrs:
-                if attr["key"] in _TEXT_KEYS:
-                    attr["value"] = {"stringValue": ""}
-                elif attr["key"] == "judgment.llm.tool_calls":
-                    attr["value"] = {"stringValue": _blank_calls(attr["value"].get("stringValue", ""))}
-        elif span is not root:
+        if span is not root:
+            attrs = span["attributes"]
             found = sum(str(attr["value"].get("stringValue", "")).count(_PLACEHOLDER) for attr in attrs if attr["key"] in _TEXT_KEYS)
             if found:
                 attrs.append(_attr("judgment.redaction_count", found))
     items = redaction.get("items") or []
     pairs: list[tuple[str, Any]] = [
-        ("judgment.redacted", blanked or int(redaction.get("count") or 0) > 0),
+        ("judgment.redacted", int(redaction.get("count") or 0) > 0),
         ("judgment.redaction_count", int(redaction.get("count") or 0)),
         ("judgment.redactions", json.dumps(items, separators=(",", ":")) if items else None),
     ]
-    if blanked:
-        pairs += [
-            ("judgment.redacted_reason", str(redaction.get("reason") or "")),
-            ("judgment.redacted_rule", str(redaction.get("rule") or "")),
-            ("judgment.redacted_trigger", str(redaction.get("trigger") or "")),
-        ]
     if redaction.get("error"):
         pairs.append(("judgment.redaction_error", True))
     root["attributes"].extend(_attrs(pairs))

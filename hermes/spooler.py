@@ -143,7 +143,7 @@ def bound(record: dict) -> tuple[dict, int]:
 
     A field over FIELD_CAP, or one that would take the record past RECORD_CAP, or one the snapshot already
     found over its budget (snapshot.Omitted, here or inside a tool call), becomes OMITTED and is named in
-    ``omitted``. prepare treats an omitted input as sensitive (its turn is blanked). No Omitted leaves here.
+    ``omitted``. No Omitted leaves here.
     """
     budget = RECORD_CAP
     out: dict = {}
@@ -177,14 +177,6 @@ class Entry:
 
 _outboxes: "weakref.WeakSet[Outbox]" = weakref.WeakSet()
 _spawn_lock = threading.Lock()
-
-
-def _turn_key(gate: Any, body: dict) -> int:
-    return hash((gate.state, body.get("harness"), body.get("session_id"), body.get("turn_id")))
-
-
-def _lost_record(body: dict) -> dict:
-    return {**core.redact.strip_text(body), "sensitive": True, "sensitive_rule": "queue_loss", "sensitive_trigger": ""}
 
 
 def _after_fork() -> None:
@@ -222,8 +214,6 @@ class Outbox:
         self.seq = 0
         self.buffered = 0  # bytes encoded but not yet in the pipe
         self.dropped: dict = {}  # reason -> count, not yet logged
-        self.tainted: set[int] = set()
-        self.taint_all = False
         self.drop_state = ""  # where to log them
         self.phase = "open"  # open | running | closing | closed
         self.thread: threading.Thread | None = None
@@ -251,13 +241,9 @@ class Outbox:
                 if kind == "rec":
                     body, size = bound(body)
                 if self.phase in ("closing", "closed"):
-                    if kind == "rec":
-                        self._taint(gate, body)
                     self._drop("after exit", gate)
                     continue
                 if len(self.unsent) + len(self.inflight) >= QUEUE_ENTRIES or self.bytes + size > QUEUE_BYTES:
-                    if kind == "rec":
-                        self._taint(gate, body)
                     self._drop("queue full", gate)
                     continue
                 self.seq += 1
@@ -274,12 +260,6 @@ class Outbox:
         state = getattr(gate, "state", "")
         if state:
             self.drop_state = state
-
-    def _taint(self, gate: Any, body: dict) -> None:
-        if len(self.tainted) >= QUEUE_ENTRIES:
-            self.taint_all = True
-        else:
-            self.tainted.add(_turn_key(gate, body))
 
     def handed_over(self) -> bool:
         """Every queued entry is in the helper's pipe (or there is none)."""
@@ -398,8 +378,6 @@ class Outbox:
             for entry in self.inflight:
                 entry.tries += 1
                 if entry.tries >= HELPER_TRIES:
-                    if entry.kind == "rec":
-                        self._taint(entry.gate, entry.body)
                     self.bytes -= entry.size
                     self._drop("the helper died on it", entry.gate)
                 else:
@@ -432,10 +410,7 @@ class Outbox:
                     parts.append(frame({"t": "forget"}))
                 number = gates[entry.gate] = len(gates) + 1
                 parts.append(frame({"t": "gate", "id": number, "gate": entry.gate.to_json()}))
-            body = entry.body
-            if self.taint_all or _turn_key(entry.gate, body) in self.tainted:
-                body = _lost_record(body)
-            parts.append(frame({"t": "rec", "s": entry.seq, "g": number, "r": body}))
+            parts.append(frame({"t": "rec", "s": entry.seq, "g": number, "r": entry.body}))
         else:
             state, env = entry.body
             parts.append(frame({"t": "flush", "s": entry.seq, "state": str(state), "env": env}))
@@ -534,8 +509,6 @@ class Outbox:
         with self.lock:
             if self.unsent:
                 entry = self.unsent.popleft()
-                if entry.kind == "rec":
-                    self._taint(entry.gate, entry.body)
                 self.bytes -= entry.size
                 self._drop("no helper could start", entry.gate)
 
@@ -609,8 +582,6 @@ class Helper:
         self.gates: dict = {}
         self.ledgers: dict = {}
         self.logged: set = set()
-        self.tainted: set[int] = set()
-        self.taint_all = False
 
     def ledger(self, state: str) -> Ledger:
         if state not in self.ledgers:
@@ -631,10 +602,7 @@ class Helper:
                 if gate.withheld and gate not in self.logged:
                     self.logged.add(gate)
                     core.log_line(gate.state, "hermes: redaction changed these stamps: " + ", ".join(gate.withheld))
-                record = snapshot.unpack(message["r"])
-                if self.taint_all or _turn_key(gate, record) in self.tainted:
-                    record = _lost_record(record)
-                core.stage(core.prepare(record, gate), gate.state, name)
+                core.stage(core.prepare(snapshot.unpack(message["r"]), gate), gate.state, name)
                 ledger.commit(seq)
             core.publish(gate.state, name)
         elif kind == "flush":
@@ -671,15 +639,6 @@ class Helper:
                 if self.ack_fd >= 0:
                     return
                 print("hermes spooler: skip failed frame after parent exit", file=sys.stderr, flush=True)
-                if message.get("t") == "rec":
-                    try:
-                        key = _turn_key(self.gates[message["g"]], message["r"])
-                        if len(self.tainted) >= QUEUE_ENTRIES:
-                            self.taint_all = True
-                        else:
-                            self.tainted.add(key)
-                    except (KeyError, TypeError, AttributeError):
-                        self.taint_all = True
                 continue
             if message.get("s"):
                 self.ack(message["s"])

@@ -14,12 +14,11 @@ Budgets are data (``Budget``); ``CALLBACK`` is the one a callback spends. One fi
     a tree with other types (provider objects, tuples, non-str keys)
         --copy--> the same budget, spent by a plain Python copy (unknown objects as their str), then marshal
 
-Every budget dimension ends the same way, in Omitted: a tree nested too deep is not cut at its depth (a
-deep ``{"path": ".env"}`` would lose the evidence that makes its turn sensitive), it is omitted whole.
+Every budget dimension ends the same way, in Omitted: a tree nested too deep is not cut at its depth, it is
+omitted whole.
 
 Impossible: a snapshot over its budget; part of a value (a cut, at any budget, depth included); a reference to Hermes's object in a record;
-an Omitted crossing the pipe (spooler.bound turns it into the OMITTED marker, named in ``omitted``, and the
-helper treats an omitted input as sensitive: its turn is blanked, as for a .env read).
+an Omitted crossing the pipe (spooler.bound turns it into the OMITTED marker, named in ``omitted``).
 
 A record field holding ``bytes`` is a snapshot: records hold no other bytes. ``unpack`` (in the helper) turns
 it back into the value, with the rest of the normalization callbacks no longer do (tool call arguments as JSON).
