@@ -819,6 +819,54 @@ def redact_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]]) ->
         return _with_env(_unredactable(event), found)
 
 
+def redact_events(events: list[dict], rs: Ruleset, secrets: list[tuple[str, str]]) -> list[dict]:
+    """``redact_event`` for each of a turn's events, with each input message its requests repeat scrubbed once.
+
+    Every request replays the messages before it, so redacting each event alone costs the square of the turn's length.
+    Here the redacted fields of every event, with each distinct input message once, are scrubbed together: a text found
+    anywhere in the turn is replaced everywhere in it. Each event's records count what was replaced in its own fields,
+    an input message as often as the event holds it. When the turn as a whole hits a limit, each event is redacted
+    alone, so one event's limit costs only its own text, as before.
+    """
+    if rs.error or not any(isinstance(event.get("input_messages"), list) for event in events):
+        return [redact_event(event, rs, secrets) for event in events]
+    pool: dict[str, str] = {}
+    fields: dict[str, Any] = {}
+    for number, event in enumerate(events):
+        for key, value in event.items():
+            if not field_class(key)["redact"]:
+                continue
+            if key == "input_messages" and isinstance(value, list):
+                for message in value:
+                    pool.setdefault(jq_json(message), f"input_messages.{len(pool)}")
+                    fields.setdefault(pool[jq_json(message)], message)
+            else:
+                fields[f"{number}.{key}"] = value
+    try:
+        scrubbed, records = scrub_fields(fields, rs, secrets, sender_budget())
+    except RedactionLimit:
+        return [redact_event(event, rs, secrets) for event in events]
+    found: dict[str, list[dict]] = {}
+    for item in records:
+        found.setdefault(item["field"], []).append(item)
+    out = []
+    for number, event in enumerate(events):
+        result = dict(event)
+        own: list[dict] = []
+        for key, value in event.items():
+            if not field_class(key)["redact"]:
+                continue
+            if key == "input_messages" and isinstance(value, list):
+                names = [pool[jq_json(message)] for message in value]
+                result[key] = [scrubbed[name] for name in names]
+                own += [{**item, "field": key} for name in names for item in found.get(name, [])]
+            else:
+                result[key] = scrubbed[f"{number}.{key}"]
+                own += [{**item, "field": key} for item in found.get(f"{number}.{key}", [])]
+        out.append(_with_env(_with_records(result, own), env_found(event, secrets)))
+    return out
+
+
 def metadata_event(event: Mapping, rs: Ruleset, secrets: list[tuple[str, str]]) -> dict:
     """What metadata capture sends: the fields its class keeps, with labels redacted."""
     kept = strip(event, lambda cls: cls["metadata"])

@@ -5,9 +5,18 @@ events through ``assemble.Fold`` in the order they happened, appends each to
 its turn's file under ``turns/``, and sends every turn the fold marked ready.
 Persistent state is the fold's small routing table (``fold.json``) and one
 record per turn (``index.json``): its file, whether it is waiting to be
-sent, the last ``judgment.update_id`` sent, and when it started. A turn whose
-llm inputs were not read from a transcript also keeps the messages it added to
-the thread (``<turn>.messages.json``), so later turns replay them whole.
+sent, the last ``judgment.update_id`` sent, when it started, and whether a
+later turn may replay its text (``replayable``). A turn whose llm inputs were
+not read from a transcript also keeps the messages it added to the thread
+(``<turn>.messages.json``), so later turns replay them whole.
+
+A transcript replays every earlier turn of the session in each request,
+including turns this sender never saw (traced off) or sent without text
+(metadata). A request read from a transcript names the earlier turns
+it holds (``replay_turns``); it keeps its transcript input only when each of
+them is replayable and went to the same project. Otherwise it is rebuilt from
+the turn's own events and the kept messages of earlier turns, as for a harness
+without a transcript.
 
 Each turn's events pass through plain stages: inbox -> fold -> turn file -> enrich (transcript
 text) -> capture policy (metadata strips text; sanitized redacts it) -> spans -> post. The turn file and the index keep
@@ -45,6 +54,7 @@ from judgment_core.claude_transcript import enrich_claude_events
 from judgment_core.codex_transcript import enrich_codex_events
 from judgment_core.cursor_transcript import enrich_cursor_events
 from judgment_core.config import DEFAULT_API_URL, load_credentials, traces_url
+from judgment_core.messages import text_message
 from judgment_core.optin import load_project, safe_id, state_dir, tracing_forced_off
 from judgment_core.spans import build_request, turn_start
 
@@ -68,6 +78,9 @@ STALE_MS = 24 * 3600 * 1000
 KEEP_SECONDS = 7 * 24 * 3600
 # One request stays well under the server's body limit. A larger turn goes out in several, root last.
 REQUEST_BYTES = 2 * 1024 * 1024
+# Earlier turns' kept messages ride along in every llm input of a turn, and nothing compacts them. Past this size,
+# only the newest whole turns that fit are replayed.
+HISTORY_BYTES = 1024 * 1024
 _LOG_MAX = 64 * 1024
 
 
@@ -200,9 +213,10 @@ def _messages_file(state: Path, key: str) -> Path:
 
 
 def _forget(state: Path, key: str, item: dict) -> None:
-    """No later turn replays this one's messages."""
+    """No later turn replays this one: not its kept messages, nor its text in a transcript."""
     item.pop("summary", None)  # written by earlier versions
     item["messages"] = False
+    item["replayable"] = False
     _messages_file(state, key).unlink(missing_ok=True)
 
 
@@ -438,7 +452,7 @@ def _sanitize(state: Path, key: str, events: list[dict], prepared: list[dict], r
     checked = redactor.checked_environment(events)
     if not checked:
         prepared = [redact._unredactable(event) for event in prepared]
-    prepared = [redact.redact_event(event, rs, redactor.secrets) for event in carry_records(events, prepared, redactor.names)]
+    prepared = redact.redact_events(carry_records(events, prepared, redactor.names), rs, redactor.secrets)
     stored = [redact.redact_event(event, rs, redactor.secrets) for event in events]
     if stored != events:
         _private_write(_turn_file(state, key), "".join(json.dumps(event, ensure_ascii=False, default=str) + "\n" for event in stored))
@@ -521,27 +535,94 @@ def _post(url: str, body: bytes, headers: dict[str, str]) -> int:
         return exc.code
 
 
-def _requests(payload: dict) -> list[bytes]:
-    """The turn as gzipped request bodies of at most REQUEST_BYTES each before compression.
-
-    Spans keep their order, so the root, listed last, goes in the last request after every child.
-    """
-    resource = payload["resourceSpans"][0]
-    scope = resource["scopeSpans"][0]
+def _batches(spans: list[dict]) -> list[list[dict]]:
+    """The turn's spans in batches of at most REQUEST_BYTES of JSON each, in order, so the root, listed last, goes in
+    the last request after every child. A span larger than that is alone in its batch."""
     batches: list[list[dict]] = [[]]
     size = 0
-    for span in scope["spans"]:
+    for span in spans:
         span_size = len(json.dumps(span))
         if batches[-1] and size + span_size > REQUEST_BYTES:
             batches.append([])
             size = 0
         batches[-1].append(span)
         size += span_size
-    bodies = []
-    for spans in batches:
-        body = {"resourceSpans": [{"resource": resource["resource"], "scopeSpans": [{"scope": scope["scope"], "spans": spans}]}]}
-        bodies.append(gzip.compress(json.dumps(body).encode("utf-8"), compresslevel=5))
-    return bodies
+    return batches
+
+
+def _body(payload: dict, spans: list[dict]) -> bytes:
+    resource = payload["resourceSpans"][0]
+    scope = resource["scopeSpans"][0]
+    body = {"resourceSpans": [{"resource": resource["resource"], "scopeSpans": [{"scope": scope["scope"], "spans": spans}]}]}
+    return gzip.compress(json.dumps(body).encode("utf-8"), compresslevel=5)
+
+
+def _post_retrying(state: Path, url: str, body: bytes, headers: dict[str, str]) -> int:
+    status = 0
+    for attempt in range(ATTEMPTS):
+        try:
+            status = _post(url, body, headers)
+        except (urllib.error.URLError, TimeoutError, socket.timeout, OSError, ValueError) as exc:
+            _log(state, f"post attempt {attempt + 1}: {type(exc).__name__}")
+            status = 0
+        if status == 200 or status in (400, 401, 403, 404, 413):
+            break
+        _log(state, f"post status {status}")
+        time.sleep(0.2 * (2**attempt))
+    return status
+
+
+def _send(state: Path, url: str, headers: dict[str, str], payload: dict) -> tuple[int, int]:
+    """Post the turn's spans, root last. Return the status that stopped the send (200 when it went through) and how
+    many requests the server took.
+
+    A request the server refuses as too large (413) is split in two and each half sent, so one large span does not
+    cost the spans that shared its request. A span refused on its own is dropped, and only it.
+    """
+    spans = payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
+    root = spans[-1] if spans else None
+    queue = _batches(spans)
+    taken = 0
+    while queue:
+        batch = queue.pop(0)
+        status = _post_retrying(state, url, _body(payload, batch), headers)
+        if status == 413 and len(batch) > 1:
+            half = len(batch) // 2
+            queue[:0] = [batch[:half], batch[half:]]
+            continue
+        if status == 413:
+            _log(state, "drop the turn's root span: post status 413" if batch[0] is root else "drop a span: post status 413")
+            continue
+        if status != 200:
+            return status, taken
+        taken += 1
+    return 200, taken
+
+
+def _untraced(index: dict, key: str, dest: str, turns: list) -> bool:
+    """Whether any of these earlier turns of the session is not one a later turn may replay into this project: traced
+    off (no record), sent without text (metadata, failed rules), not sent yet, or sent to another project."""
+    harness, session, _turn = key.split("\t")
+    for turn in turns:
+        item = index.get(f"{harness}\t{session}\t{turn}")
+        if item is None or not item.get("replayable") or item.get("dest") != dest:
+            return True
+    return False
+
+
+def _replayable(index: dict, key: str, dest: str, prepared: list[dict]) -> list[dict]:
+    """The events, each request read from a transcript keeping its input only when every earlier turn it replays may be
+    replayed. One that may not is rebuilt from the turn's own events and the kept messages of earlier turns.
+
+    A subagent's requests are checked on their own: its transcript holds only the turns that gave it a task.
+    """
+    out = []
+    for event in prepared:
+        turns = event.get("replay_turns")
+        if "input_messages" in event and (not isinstance(turns, list) or _untraced(index, key, dest, turns)):
+            event = {name: value for name, value in event.items() if name != "input_messages"}
+        out.append({name: value for name, value in event.items() if name != "replay_turns"})
+    return out
 
 
 def _history(state: Path, index: dict, key: str, dest: str) -> list[list[dict]]:
@@ -555,13 +636,26 @@ def _history(state: Path, index: dict, key: str, dest: str) -> list[list[dict]]:
         if other != key and other.startswith(prefix) and item.get("messages") and item.get("dest") == dest and int(item.get("start") or 0) < start
     )
     turns: list[list[dict]] = []
-    for _start, other in earlier:
+    budget = HISTORY_BYTES
+    skipped = 0
+    # Newest first: a long session keeps its latest turns whole and leaves out the oldest.
+    for _start, other in reversed(earlier):
         try:
             turn = json.loads(_messages_file(state, other).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if isinstance(turn, list):
-            turns.append([message for message in turn if isinstance(message, dict)])
+        if not isinstance(turn, list):
+            continue
+        messages = [message for message in turn if isinstance(message, dict)]
+        size = len(json.dumps(messages, ensure_ascii=False))
+        if skipped or size > budget:
+            skipped += 1
+            continue
+        budget -= size
+        turns.append(messages)
+    turns.reverse()
+    if skipped:
+        turns.insert(0, [text_message("system", f"[{skipped} earlier turns omitted]")])
     return turns
 
 
@@ -629,6 +723,10 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
             checked = True
             redaction = None
             rs = redactor.rules(events)
+            assert creds is not None
+            dest = f"{creds['JUDGMENT_API_URL']} {creds['JUDGMENT_ORG_ID']} {creds['JUDGMENT_PROJECT_ID']}"
+            # A request keeps its transcript input only when every earlier turn it replays may be replayed here.
+            prepared = _replayable(index, key, dest, prepared)
             if capture == "metadata":
                 # Transcript enrichment has already run, so this is what gets sent and kept.
                 if not redactor.checked_environment(events):
@@ -638,7 +736,7 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
                 prepared, checked = _sanitize(state, key, events, prepared, redactor)
             # A metadata turn is no later turn's context. Nor is one whose rules failed or whose environment did not check.
             quiet = capture == "metadata" or (capture != "full" and (bool(rs.error) or not checked))
-            if quiet and item.get("messages"):
+            if quiet and (item.get("messages") or item.get("replayable")):
                 # Settled before any send, so a failed post cannot leave the old text as context.
                 _forget(state, key, item)
                 _private_write(state / "index.json", json.dumps(index))
@@ -646,9 +744,6 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
             if started is not None:
                 item["start"] = started
             update_id = None if item.get("update_id") is None else int(item["update_id"]) + 1
-            # Earlier turns may hold text from before the project switched to metadata.
-            assert creds is not None
-            dest = f"{creds['JUDGMENT_API_URL']} {creds['JUDGMENT_ORG_ID']} {creds['JUDGMENT_PROJECT_ID']}"
             # Rules that failed drop every text in the request, the earlier turns' included.
             history = [] if quiet else _history(state, index, key, dest)
             if capture != "full":
@@ -673,24 +768,7 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
         if creds["JUDGMENT_ORG_ID"]:
             headers["X-Organization-Id"] = creds["JUDGMENT_ORG_ID"]
         url = traces_url(creds["JUDGMENT_API_URL"])
-        status = 200
-        for body in _requests(turn.payload):
-            for attempt in range(ATTEMPTS):
-                try:
-                    status = _post(url, body, headers)
-                except (urllib.error.URLError, TimeoutError, socket.timeout, OSError, ValueError) as exc:
-                    _log(state, f"post attempt {attempt + 1}: {type(exc).__name__}")
-                    status = 0
-                if status == 200 or status in (400, 401, 403, 404, 413):
-                    break
-                _log(state, f"post status {status}")
-                time.sleep(0.2 * (2**attempt))
-            if status == 413:
-                # A span bigger than the server takes is sent whole and alone in its request. Only that request is lost.
-                _log(state, "drop a request: post status 413")
-                status = 200
-            if status != 200:
-                break
+        status, taken = _send(state, url, headers, turn.payload)
         if status == 400:
             # The server will never take this turn as built. Retrying it would hold back every turn after it.
             _log(state, f"skip a turn: post status {status}")
@@ -703,14 +781,22 @@ def export_once(state: Path | None = None, env: dict | None = None) -> int:
             return -1
         item["update_id"] = 0 if update_id is None else update_id
         item["ready"] = False
-        if quiet or turn.messages is None:
+        if quiet:
             _forget(state, key, item)
         else:
             item.pop("summary", None)  # written by earlier versions
-            item["messages"] = True
-            _private_write(_messages_file(state, key), json.dumps(turn.messages, ensure_ascii=False))
+            item["replayable"] = True
+            item["messages"] = turn.messages is not None
+            if turn.messages is None:
+                _messages_file(state, key).unlink(missing_ok=True)
+            else:
+                _private_write(_messages_file(state, key), json.dumps(turn.messages, ensure_ascii=False))
         item["dest"] = dest
         _private_write(state / "index.json", json.dumps(index))
+        if not taken:
+            # Nothing of the turn is in Judgment. Later turns may still replay it: what decides that is how it was captured.
+            _log(state, "drop a turn: post status 413 for every span")
+            continue
         sent += 1
     return sent
 

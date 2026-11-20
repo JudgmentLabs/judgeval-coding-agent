@@ -48,17 +48,19 @@ A model call that failed, when the agent reports one (Hermes Agent does), is its
 
 ## Model input
 
-A model span's input is the messages array the model was sent, whole and in order. Nothing is truncated.
+A model span's input is the messages array the model was sent, whole and in order. No message is truncated.
 
 - **Claude Code and Codex** read it from the agent's transcript: every earlier message since the session started or was last compacted, including earlier turns' answers, reasoning, tool calls, and results. After a compaction the input restarts from the compacted history. Codex encrypts its compaction summary, so the start of that history holds the user message `[Earlier conversation compacted by Codex; summary is encrypted by OpenAI]` in its place.
 - **Claude Code** requests logged in the transcript are replayed exactly, with the system prompt in `gen_ai.system_instructions` and the tool list in `gen_ai.tool.definitions`. **Codex** sets `gen_ai.system_instructions` from the session's base instructions, and `gen_ai.tool.definitions` when the rollout lists its tools.
-- **Cursor, Pi, Hermes Agent**, and any turn without a usable transcript: every message the session's earlier turns added, then the user prompt, then each tool call and result that came before the request. Those messages are kept next to the turn's file (`<turn>.messages.json`) after it is sent, already redacted under `sanitized`, and are never kept under `metadata`.
+- **Cursor, Pi, Hermes Agent**, and any turn without a usable transcript: every message the session's earlier turns added, then the user prompt, then each tool call and result that came before the request. Those messages are kept next to the turn's file (`<turn>.messages.json`) after it is sent, already redacted under `sanitized`, and are never kept under `metadata`. A turn with no model request keeps its prompt, its tool calls and results, and its final answer. Past 1 MiB of earlier turns' messages, the oldest whole turns are left out and a system message, `[N earlier turns omitted]`, stands in their place.
 
 A tool result is the text the model read, not the agent's raw tool response. The output is the assistant message, including reasoning and tool calls, and, for Claude Code, the stop reason as `finish_reason`. Reasoning is the readable text only. Encrypted reasoning, redacted thinking, and signatures are never sent.
 
 The system prompt, the tool definitions, and the earlier messages are redacted like any other text under `sanitized`, and dropped under `metadata`.
 
-A span larger than the server accepts is dropped alone, and the rest of the turn is still sent.
+A transcript holds every earlier turn of the session, including turns that were never traced (tracing was off for them), were sent under `metadata`, went to another project, or have not been sent yet. Each request read from a transcript names the earlier turns its input holds, a compacted summary's included. It keeps that input only when every one of them was sent to the same project with its text. Otherwise its input is built as for an agent without a transcript: the messages kept for earlier turns, then its own turn's prompt, tool calls, and results. Each request is checked on its own, so a subagent, whose transcript holds only the tasks it was given, keeps its input. A request whose input hits a redaction limit is rebuilt the same way, and the turn's other requests keep theirs.
+
+A request the server refuses as too large is split in two and each half sent again. A span the server refuses on its own is dropped alone, and the rest of the turn is still sent.
 
 ## Agent differences
 
@@ -86,4 +88,4 @@ Secrets are redacted twice: by the hook, before an event reaches the queue, and 
 
 The hook starts the sender in the background and waits, at most about 40 ms, until `/proc` shows it outside the hook's process group, so an agent that kills that group the moment the hook returns does not kill the sender. With job control (bash, zsh, and macOS's `/bin/sh`) that holds before `&` returns. Under dash it is `setsid(1)`, usually within a millisecond; without `setsid(1)` the sender calls `setsid()` as Python starts. When no acknowledgement comes in time, a second sender is started by bash with job control. Without bash, a sender killed with the agent leaves its turns on disk for the next one to send.
 
-A turn being sent stays on disk until the send succeeds, so a crash or a failed send retries the whole turn on the next run. A large turn goes out in several compressed requests, with the root last. A turn the server rejects as invalid is skipped, and a request it rejects as too large is dropped alone. Both are noted in `flush.log` and never hold back later turns.
+A turn being sent stays on disk until the send succeeds, so a crash or a failed send retries the whole turn on the next run. A large turn goes out in several compressed requests, with the root last. A turn the server rejects as invalid is skipped, and a request it rejects as too large is split until only the spans it refuses on their own are dropped. Both are noted in `flush.log` and never hold back later turns.

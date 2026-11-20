@@ -11,12 +11,11 @@ import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from judgment_core.messages import assistant_message, media_part, tool_message
+from judgment_core.rows import parse_line
 from judgment_core.rows import records as _records
-
-# Rows before the last compaction are not in the model's history. Transcript rows are compact JSON.
-_COMPACT = b'"subtype":"compact_boundary"'
 
 
 def _tool_uses(message: dict) -> list[dict]:
@@ -332,8 +331,10 @@ def _result_value(content: object) -> object:
             parts.append({"type": "text", "content": block})
         elif isinstance(block, dict) and block.get("type") == "text":
             parts.append({"type": "text", "content": str(block.get("text") or "")})
-        elif isinstance(block, dict) and _media(block):
-            parts.append(_media(block))
+        elif isinstance(block, dict):
+            media = _media(block)
+            if media:
+                parts.append(media)
     return parts
 
 
@@ -374,8 +375,10 @@ def _converted(message: dict) -> list[dict]:
             out.append(tool_message(str(block.get("tool_use_id") or ""), _result_value(block.get("content"))))
         elif block.get("type") == "text":
             parts.append({"type": "text", "content": str(block.get("text") or "")})
-        elif _media(block):
-            parts.append(_media(block))
+        else:
+            media = _media(block)
+            if media:
+                parts.append(media)
     if parts:
         out.append({"role": "user", "parts": parts})
     return out
@@ -420,27 +423,38 @@ def _exact_requests(rows: list[dict]) -> tuple[dict[str, dict], dict[tuple[str, 
             blobs.setdefault(hashlib.sha256(text.encode("utf-8")).hexdigest(), message)
     built: dict[str, list[dict] | None] = {}
 
-    def messages(request_id: str, depth: int = 0) -> list[dict] | None:
-        if request_id in built:
-            return built[request_id]
-        row = logged.get(request_id)
-        if row is None or depth > 10_000:
-            return None
-        built[request_id] = None  # a cycle reads as missing
-        base: list[dict] = []
-        if row.get("base"):
-            found = messages(str(row["base"]), depth + 1)
-            if found is None:
-                return None
-            base = found
+    def own(row: dict, base: list[dict]) -> list[dict] | None:
+        """The request's messages from its base's: the first ``keep`` of them, then its new ones."""
         try:
             keep = int(row.get("keep") or 0)
         except (TypeError, ValueError):
             return None
         tail = [blobs.get(str(key)) for key in row.get("tail") or []]
-        if keep > len(base) or any(blob is None for blob in tail):
+        if keep < 0 or keep > len(base) or any(blob is None for blob in tail):
             return None
-        built[request_id] = base[:keep] + tail
+        return base[:keep] + tail
+
+    def messages(request_id: str) -> list[dict] | None:
+        """Walk the chain of bases down to a built or base-less request, then build back up. A long session chains
+        thousands of requests, so this is a loop, not recursion. A missing base, or a cycle, leaves the chain missing."""
+        chain: list[str] = []
+        seen: set[str] = set()
+        current = request_id
+        while current not in built:
+            row = logged.get(current)
+            if row is None or current in seen:
+                built.update(dict.fromkeys(chain))
+                return None
+            seen.add(current)
+            chain.append(current)
+            if not row.get("base"):
+                break
+            current = str(row["base"])
+        base = built[current] if current in built else []
+        for ident in reversed(chain):
+            found = own(logged[ident], base) if base is not None else None
+            built[ident] = found
+            base = found
         return built[request_id]
 
     found = {}
@@ -449,7 +463,7 @@ def _exact_requests(rows: list[dict]) -> tuple[dict[str, dict], dict[tuple[str, 
         shape = shapes.get(str(row.get("shapeHash")))
         if sent is None or shape is None:
             continue
-        system = "\n".join(str(block.get("text") or "") for block in shape.get("system") or [] if isinstance(block, dict) and block.get("type") == "text")
+        system = _system_text(shape.get("system"))
         found[request_id] = {
             "messages": sent,
             "system": system,
@@ -458,21 +472,92 @@ def _exact_requests(rows: list[dict]) -> tuple[dict[str, dict], dict[tuple[str, 
     return found, sent_replies
 
 
-def _replayed(rows: list[dict], before: dict, side: bool) -> list[dict]:
-    """Without a logged request, the transcript's messages before ``before`` since the last compaction, as the request replayed them."""
+def _system_text(system: object) -> str:
+    """A request's system prompt: a string, or a list of text blocks."""
+    if isinstance(system, str):
+        return system
+    return "\n".join(str(block.get("text") or "") for block in system or [] if isinstance(block, dict) and block.get("type") == "text") if isinstance(system, list) else ""
+
+
+def _is_compaction(row: dict) -> bool:
+    """Where the model's history restarts. Rows before the last one are not in a request."""
+    return row.get("type") == "system" and row.get("subtype") == "compact_boundary"
+
+
+def _pins(kept: list[dict]) -> Callable[[bytes], dict | None]:
+    """Rows from before the compaction a large transcript is read back to that a reader still needs: the shapes, blobs,
+    and base requests the kept logged requests point to, and every earlier prompt (the compaction summary holds its turn)."""
+    shapes: set[str] = set()
+    blobs: set[str] = set()
+    requests: set[str] = set()
+
+    def want(row: dict) -> None:
+        shapes.add(str(row.get("shapeHash")))
+        blobs.update(str(key) for key in row.get("tail") or [])
+        if row.get("base"):
+            requests.add(str(row["base"]))
+
+    for row in kept:
+        if row.get("type") == "api-request":
+            want(row)
+
+    def test(line: bytes) -> dict | None:
+        if b'"api-request' in line:
+            row = parse_line(line)
+            kind = row.get("type") if row else None
+            if kind == "api-request" and str(row.get("id")) in requests:
+                want(row)
+                return row
+            if (kind == "api-request-shape" and str(row.get("shapeHash")) in shapes) or (kind == "api-request-blob" and str(row.get("hash")) in blobs):
+                return row
+            return None
+        # A tool result row is a user row with a promptId too. An escaped quote inside a string never reads as this key.
+        if b'"promptId"' in line and b'"type":"tool_result"' not in line and b'"type": "tool_result"' not in line:
+            row = parse_line(line)
+            return row if row is not None and _is_prompt(row) else None
+        return None
+
+    return test
+
+
+def _earlier_turns(rows: list[dict], before: int, turn_id: str, *, main: bool) -> list[str]:
+    """The turns whose prompts come before ``rows[before]``: what the request replays, its compaction summary included.
+
+    Each is named by its prompt id, which is the hook's turn id. A main-thread prompt with no id names a turn nothing can
+    find, as "?". A subagent's file holds only the tasks its parent gave it, each stamped with that turn's prompt id.
+    """
+    found: set[str] = set()
+    for row in rows[:before]:
+        if not _is_prompt(row):
+            continue
+        prompt_id = str(row.get("promptId") or "")
+        if prompt_id:
+            if prompt_id != turn_id:
+                found.add(prompt_id)
+        elif main and not row.get("isMeta"):
+            found.add("?")
+    return sorted(found)
+
+
+def _replayed(rows: list[dict], before: dict, side: bool, agent: str) -> list[dict]:
+    """Without a logged request, the transcript's messages before ``before`` since the last compaction, as the request
+    replayed them. A sidechain sees only its own agent's rows."""
     messages: list[dict] = []
     current = ""
     for row in rows:
         if row is before:
             break
-        if row.get("type") == "system" and row.get("subtype") == "compact_boundary":
+        if _is_compaction(row):
             messages, current = [], ""
             continue
         if _role(row) not in ("user", "assistant") or (row.get("isSidechain") is True) != side:
             continue
+        if side and str(row.get("agentId") or "") != agent:
+            continue
         message = _message(row)
         if _role(row) == "assistant":
-            content = message.get("content") if isinstance(message.get("content"), list) else []
+            content = message.get("content")
+            content = [{"type": "text", "text": content}] if isinstance(content, str) else content if isinstance(content, list) else []
             mid = _message_id(row)
             if mid and mid == current and messages and messages[-1].get("content") is not None:
                 messages[-1]["content"].extend(content)
@@ -485,9 +570,11 @@ def _replayed(rows: list[dict], before: dict, side: bool) -> list[dict]:
     return messages
 
 
-def _add_context(rows: list[dict], groups: list[dict]) -> None:
-    """Set each request's exact input messages, output message, system prompt, tools, and stop reason."""
+def _add_context(rows: list[dict], groups: list[dict], turn_id: str, *, main: bool) -> None:
+    """Set each request's exact input messages, output message, system prompt, tools, and stop reason, and the earlier
+    turns those input messages hold (``replay_turns``): the sender checks each was traced before it sends them."""
     exact, sent_replies = _exact_requests(rows) if any(row.get("type") == "api-request" for row in rows) else ({}, {})
+    position = {id(row): index for index, row in enumerate(rows)}
     for group in groups:
         own = group.get("rows") or []
         if not own:
@@ -506,8 +593,9 @@ def _add_context(rows: list[dict], groups: list[dict]) -> None:
             if logged["tools"]:
                 group["tool_definitions"] = logged["tools"]
         else:
-            sent = _replayed(rows, own[0], own[0].get("isSidechain") is True)
+            sent = _replayed(rows, own[0], own[0].get("isSidechain") is True, str(own[0].get("agentId") or ""))
         group["input_messages"] = [converted for message in sent for converted in _converted(message)]
+        group["replay_turns"] = _earlier_turns(rows, position.get(id(own[0]), len(rows)), turn_id, main=main)
 
 
 def _model_event(seed: dict, assistant: dict, *, prompt: str) -> dict:
@@ -536,6 +624,8 @@ def _model_event(seed: dict, assistant: dict, *, prompt: str) -> dict:
     for key in ("input_messages", "output_message", "system_instructions", "tool_definitions", "finish_reason"):
         if assistant.get(key):
             item[key] = assistant[key]
+    if "input_messages" in item:
+        item["replay_turns"] = list(assistant.get("replay_turns") or [])
     start_ms = assistant.get("start_ms")
     end_ms = assistant.get("end_ms")
     if start_ms is not None:
@@ -589,7 +679,7 @@ def enrich_claude_events(
         rows: list[dict] = []
         since = min((_as_int(event.get("ts")) or 0 for event in source), default=0) or None
         for attempt in range(max(attempts, 1)):
-            rows = _records(path, since, _COMPACT)
+            rows = _records(path, since, _is_compaction, _pins)
             found = _assistant_after(rows, prompt, anchor_ms=_as_int(anchor), end_ms=_as_int(end_ms), turn_id=turn_id)
             if found and (not final or _contains(rows, final)):
                 break
@@ -602,7 +692,7 @@ def enrich_claude_events(
         ]
         results.update(_tool_results(rows))
         _attach_results(assistants, {**_agent_answers(assistants, source), **results})
-        _add_context(rows, assistants)
+        _add_context(rows, assistants, turn_id, main=True)
         first_main = True
         for assistant in assistants:
             text = prompt if first_main else ""
@@ -669,7 +759,7 @@ def enrich_claude_events(
         sub_results = _tool_results(sub_rows)
         results.update(sub_results)
         _attach_results(groups, sub_results)
-        _add_context(sub_rows, groups)
+        _add_context(sub_rows, groups, turn_id, main=False)
         for index, assistant in enumerate(groups):
             assistant["agent_id"] = assistant.get("agent_id") or agent_id
             added.append(_model_event(seed, assistant, prompt=task if index == 0 else ""))

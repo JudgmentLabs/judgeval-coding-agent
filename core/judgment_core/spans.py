@@ -324,32 +324,27 @@ def _thread_io(
     *,
     context: list[dict] | None = None,
     tools_in_input: bool = False,
+    final: str = "",
 ) -> tuple[list[_Rendered], list[dict] | None]:
     """Each llm request's messages, and the messages this turn added to the thread.
 
     A request read from a transcript carries the exact ``input_messages`` it
     sent and its ``output_message``. Those are used as they are, and the turn's
     messages are None: the next turn reads its history from the transcript too.
+    A request that lost them (its redaction hit a limit, or an earlier turn it
+    replays was not traced) is rebuilt as below; the others keep theirs.
 
     Otherwise the input is ``context`` (the session's earlier turns, whole),
     the user prompt, and every tool call and result that came before the
     request. The output is the assistant message, including tool_call parts
     when this request invoked tools. A result the model saw (``tool_results``
-    on the request) wins over the hook's tool output.
+    on the request) wins over the hook's tool output. A turn with no request
+    still adds its prompt, its tools, and its ``final`` answer to the thread.
 
     ``tools_in_input`` is for a harness that reports one span for many
     requests (Cursor, one per stop). The tools that ran before the span ends go
     in its input with their results, and the output is the final text.
     """
-    if models and all(isinstance(model.get("input_messages"), list) for model in models):
-        return [
-            _Rendered(
-                model["input_messages"],
-                model.get("output_message") or assistant_message(_text(model.get("output")), _calls_of(model), model.get("reasoning")),
-                _calls_of(model),
-            )
-            for model in models
-        ], None
     context = list(context or [])
     by_id = {}
     for tool in tools:
@@ -424,7 +419,36 @@ def _thread_io(
             if response is None:
                 response = _text(tool.get("tool_output")) if tool is not None and tool.get("tool_output") is not None else ""
             history.append(tool_message(call["id"], response))
-    return rendered, history
+    if not models:
+        for tool in pending:
+            call = _call_from_tool(tool)
+            if _fresh(call["id"]):
+                history.append(assistant_message("", [call]))
+                history.append(tool_message(call["id"], _text(tool.get("tool_output")) if tool.get("tool_output") is not None else ""))
+        if final:
+            history.append(assistant_message(final, []))
+    exact = [isinstance(model.get("input_messages"), list) for model in models]
+    if not any(exact):
+        return rendered, history
+    rendered = [
+        _Rendered(model["input_messages"], _exact_output(model), _calls_of(model)) if exact[index] else rendered[index]
+        for index, model in enumerate(models)
+    ]
+    return rendered, None
+
+
+def _exact_output(model: dict) -> dict:
+    """A transcript request's output message. Text the transcript lacked but the turn's end reported is added to it."""
+    text = _text(model.get("output"))
+    message = model.get("output_message")
+    if not isinstance(message, dict):
+        return assistant_message(text, _calls_of(model), model.get("reasoning"))
+    parts = list(message.get("parts") or [])
+    if text and not any(part.get("type") == "text" for part in parts if isinstance(part, dict)):
+        # Text goes after reasoning and before tool calls, as assistant_message orders them.
+        at = next((index for index, part in enumerate(parts) if isinstance(part, dict) and part.get("type") != "reasoning"), len(parts))
+        parts.insert(at, {"type": "text", "content": text})
+    return {**message, "parts": parts}
 
 
 def _contain(spans: list[dict]) -> None:
@@ -954,6 +978,7 @@ def build_request(
         prompt,
         context=history,
         tools_in_input=harness == "cursor",
+        final=final,
     )
     for index, event in enumerate(timed_models):
         rendered = main_io[index] if index < len(main_io) else None

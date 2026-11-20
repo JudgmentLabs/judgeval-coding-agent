@@ -24,16 +24,16 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 from judgment_core.messages import assistant_message, media_part, text_message, tool_message
+from judgment_core.rows import parse_line
 from judgment_core.rows import records as _records
 
 ENCRYPTED = "[encrypted]"
 # Stands in for the encrypted compaction item at the start of the history after a compaction.
 COMPACTION_PLACEHOLDER = "[Earlier conversation compacted by Codex; summary is encrypted by OpenAI]"
 _CALLS = ("function_call", "custom_tool_call", "local_shell_call")
-# The model's history restarts at a compaction. Rollout rows are compact JSON.
-_COMPACTED = b'"type":"compacted"'
 _DELEGATED = re.compile(r"<codex_delegation>.*?<input>(.*?)</input>", re.S)
 
 
@@ -269,16 +269,16 @@ class _History:
         else:
             self.calls.append(_call(payload))
 
-    def item(self, payload: dict) -> None:
-        """One history item that is not model output."""
+    def item(self, payload: dict) -> dict | None:
+        """One history item. Returns the assistant message it completed, if any: an input item ends the model's output."""
         kind = payload.get("type")
         if kind == "additional_tools":
             self.tools = _tool_definitions(payload)
-            return
+            return None
         if kind in ("reasoning", *_CALLS) or (kind == "message" and payload.get("role") == "assistant"):
             self.output(payload)
-            return
-        self.flush()
+            return None
+        flushed = self.flush()
         if kind == "message":
             role = {"developer": "system", "system": "system"}.get(str(payload.get("role") or ""), "user")
             self.messages.append({"role": role, "parts": _parts(payload.get("content"))})
@@ -289,6 +289,7 @@ class _History:
         elif kind == "compaction":
             self.messages.append(text_message("user", COMPACTION_PLACEHOLDER))
         # Ghost snapshots never reach the model.
+        return flushed
 
     def compact(self, payload: dict) -> None:
         self.reasoning, self.text, self.calls = [], [], []
@@ -304,6 +305,66 @@ class _History:
             self.messages.append(text_message("user", str(payload["message"])))
 
 
+def _is_compaction(row: dict) -> bool:
+    """Where the model's history restarts."""
+    return row.get("type") == "compacted"
+
+
+def _turn_marker(row: dict) -> str:
+    """The turn a ``task_started`` or ``turn_context`` row opens, or ""."""
+    payload = _payload(row)
+    if row.get("type") == "turn_context" or payload.get("type") == "task_started":
+        return str(payload.get("turn_id") or "")
+    return ""
+
+
+def _is_tools(row: dict) -> bool:
+    return row.get("type") == "response_item" and _payload(row).get("type") == "additional_tools"
+
+
+def _pins(kept: list[dict]) -> Callable[[bytes], dict | None]:
+    """Rows from before the compaction a large rollout is read back to that a reader still needs: the session's metadata,
+    the latest tool list, and every turn's start (the compaction carries those turns forward)."""
+    found = {"tools": False, "meta": False}
+
+    def test(line: bytes) -> dict | None:
+        markers = (b'"additional_tools"', b'"session_meta"', b'"task_started"', b'"turn_context"')
+        if not any(marker in line for marker in markers):
+            return None
+        row = parse_line(line)
+        if row is None:
+            return None
+        if _is_tools(row) and not found["tools"]:
+            found["tools"] = True
+            return row
+        if row.get("type") == "session_meta" and not found["meta"]:
+            found["meta"] = True
+            return row
+        return row if _turn_marker(row) else None
+
+    return test
+
+
+def _earlier_turns(rows: list[dict], mine: set[int], turn_id: str, root_turn_id: str) -> list[str]:
+    """The turns before this one that its requests replay, by the turn id the hook reports for them (a child's turn
+    counts as the parent turn it ran for). A child rollout's history from before its first turn was copied from its
+    parent; nothing names that turn, so it reads as "?"."""
+    last = max((index for index, row in enumerate(rows) if id(row) in mine), default=-1)
+    found: set[str] = set()
+    current = ""
+    for row in rows[:last]:
+        if id(row) in mine:
+            continue
+        own = _turn_marker(row)
+        if own:
+            current = _root_turn(_payload(row)) or own
+            if current not in (turn_id, root_turn_id):
+                found.add(current)
+        elif not current and root_turn_id and row.get("type") == "response_item" and _payload(row).get("type") in ("message", "reasoning", "agent_message", *_CALLS):
+            found.add("?")
+    return sorted(found)
+
+
 def read_thread(path: Path | None, *, turn_id: str = "", prompt: str = "", root_turn_id: str = "", since_ms: int | None = None) -> dict:
     """The model requests of one turn in one rollout.
 
@@ -312,7 +373,7 @@ def read_thread(path: Path | None, *, turn_id: str = "", prompt: str = "", root_
     ``spawned`` maps a spawn call id to the child thread id. ``complete`` turns
     true at ``task_complete``.
     """
-    rows = _records(path, since_ms, _COMPACTED)
+    rows = _records(path, since_ms, _is_compaction, _pins)
     meta = next((_payload(row) for row in rows if row.get("type") == "session_meta"), {})
     agent_path = str(meta.get("agent_path") or "")
     base = meta.get("base_instructions") if isinstance(meta.get("base_instructions"), dict) else {}
@@ -328,6 +389,7 @@ def read_thread(path: Path | None, *, turn_id: str = "", prompt: str = "", root_
         "spawned": {},
         "complete": False,
         "instructions": instructions,
+        "replay_turns": _earlier_turns(rows, mine, turn_id, root_turn_id),
     }
     by_record = not any(_usage(row) is not None and row.get("type") != "token_usage_record" for row in chunk)
     history = _History()
@@ -351,7 +413,10 @@ def read_thread(path: Path | None, *, turn_id: str = "", prompt: str = "", root_
                     history.flush()
                     step["input"] = list(history.messages)
                     step["tools"] = history.tools
-            history.item(payload)
+            flushed = history.item(payload)
+            # A tool output ends the request's output before its token_count arrives, when there is no token_usage_record.
+            if flushed is not None and id(row) in mine and step["input"] is not None and step["output"] is None:
+                step["output"] = flushed
         if id(row) not in mine:
             if kind == "token_count":
                 last_total = (payload.get("info") or {}).get("total_token_usage") if isinstance(payload.get("info"), dict) else last_total
@@ -365,6 +430,9 @@ def read_thread(path: Path | None, *, turn_id: str = "", prompt: str = "", root_
                 continue
             last_total = total
         if usage is not None and is_record == by_record:
+            if is_record and step["input"] is None and step["output"] is None and not step["text"] and not step["tool_calls"]:
+                # A compaction's request: nothing it wrote is in the model's history, so it is no llm span.
+                continue
             output = history.flush()
             if output is not None:
                 step["output"] = output
@@ -457,6 +525,7 @@ def _model_events(thread: dict, seed: dict, agent_id: str, model: str) -> list[d
             item["received"] = step["received"]
         if step["input"] is not None:
             item["input_messages"] = step["input"]
+            item["replay_turns"] = thread["replay_turns"]
             item["output_message"] = step["output"] or assistant_message(step["text"], step["tool_calls"])
             if step["tools"]:
                 item["tool_definitions"] = step["tools"]
